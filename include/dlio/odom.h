@@ -190,7 +190,6 @@ private:
   // Submap
   pcl::PointCloud<PointType>::ConstPtr submap_cloud;
   std::shared_ptr<const nano_gicp::CovarianceList> submap_normals;
-  std::shared_ptr<const nanoflann::KdTreeFLANN<PointType>> submap_kdtree;
 
   std::vector<int> submap_kf_idx_curr;
   std::vector<int> submap_kf_idx_prev;

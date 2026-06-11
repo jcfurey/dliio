@@ -109,41 +109,70 @@ void NanoGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceCo
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setInputTarget(const PointCloudTargetConstPtr& cloud) {
+  registerInputTarget(cloud);
+
+  auto covs = std::make_shared<CovarianceList>();
+  calculate_covariances(cloud, *target_kdtree_, *covs);
+  target_covs_ = covs;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::registerInputTarget(const PointCloudTargetConstPtr& cloud) {
   pcl::Registration<PointSource, PointTarget>::setInputTarget(cloud);
 
-  target_kdtree_.reset(new nanoflann::KdTreeFLANN<PointTarget>(false));
-  target_kdtree_->setInputCloud(cloud);
+  auto kdtree = std::make_shared<nanoflann::KdTreeFLANN<PointTarget>>(false);
+  kdtree->setInputCloud(cloud);
+  target_kdtree_ = kdtree;
 
-  calculate_covariances(cloud, *target_kdtree_, target_covs_);
-  
+  // covariances are NOT computed here; supply them via setTargetCovariances
+  // (computeTransformation falls back to computing them if they are missing)
+  target_covs_.reset();
+
   // Only calculate intensity gradients if photometric weight is enabled
   if (photometric_weight_ > 1e-8) {
       calculate_target_intensity_gradients();
   } else {
-      target_intensity_gradients_.clear();
-      gradient_valid_.clear();
+      target_intensity_gradients_.reset();
+      gradient_valid_.reset();
   }
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setTargetCovariances(const std::shared_ptr<const CovarianceList>& covs) {
+  target_covs_ = covs;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::shareTargetDataFrom(const NanoGICP& other) {
+  pcl::Registration<PointSource, PointTarget>::setInputTarget(other.target_);
+  target_kdtree_ = other.target_kdtree_;
+  target_covs_ = other.target_covs_;
+  target_intensity_gradients_ = other.target_intensity_gradients_;
+  gradient_valid_ = other.gradient_valid_;
 }
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::calculate_target_intensity_gradients() {
     if (!target_) {
-        target_intensity_gradients_.clear();
-        gradient_valid_.clear();
+        target_intensity_gradients_.reset();
+        gradient_valid_.reset();
         return;
     }
-    
-    target_intensity_gradients_.assign(target_->size(), Eigen::Vector3f::Zero());
-    gradient_valid_.assign(target_->size(), false);
-    
+
+    auto gradients = std::make_shared<GradientList>(target_->size(), Eigen::Vector3f::Zero());
+    auto valid = std::make_shared<std::vector<bool>>(target_->size(), false);
+
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
     for (int i = 0; i < target_->size(); ++i) {
         Eigen::Vector3f gradient;
         if(estimate_spatial_intensity_gradient(i, gradient)) {
-            target_intensity_gradients_[i] = gradient;
-            gradient_valid_[i] = true;
+            (*gradients)[i] = gradient;
+            (*valid)[i] = true;
         }
     }
+
+    target_intensity_gradients_ = gradients;
+    gradient_valid_ = valid;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -234,6 +263,14 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     Eigen::Isometry3f trans = Eigen::Isometry3f::Identity();
     trans.matrix() = guess;
 
+    // Fallback: if the target was registered without precomputed covariances
+    // (or with a mismatched set), compute them here.
+    if (!target_covs_ || target_covs_->size() != target_->size()) {
+        auto covs = std::make_shared<CovarianceList>();
+        calculate_covariances(target_, *target_kdtree_, *covs);
+        target_covs_ = covs;
+    }
+
     this->converged_ = false;
 
     for (int i = 0; i < this->max_iterations_; ++i) {
@@ -296,7 +333,7 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
             sq_distances_[i] = k_sq_dists[0];
             
             const Eigen::Matrix4f& source_cov = source_covs_[i];
-            const Eigen::Matrix4f& target_cov = target_covs_[k_indices[0]];
+            const Eigen::Matrix4f& target_cov = (*target_covs_)[k_indices[0]];
             Eigen::Matrix4f RCR = (source_cov + target_cov);
             RCR(3, 3) = 1.0;
             
@@ -318,7 +355,8 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     std::vector<Eigen::Matrix<float, 6, 6>> H_private(num_threads_, Eigen::Matrix<float, 6, 6>::Zero());
     std::vector<Eigen::Matrix<float, 6, 1>> b_private(num_threads_, Eigen::Matrix<float, 6, 1>::Zero());
     
-    bool use_photometric = (photometric_weight_ > 1e-8) && !target_intensity_gradients_.empty();
+    bool use_photometric = (photometric_weight_ > 1e-8)
+        && target_intensity_gradients_ && !target_intensity_gradients_->empty();
     
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
     for(int i = 0; i < input_->size(); ++i) {
@@ -348,11 +386,11 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         b_private[thread_num] += J_geometric.transpose() * M * residual;
         
         // Photometric term
-        if (use_photometric && gradient_valid_[target_index]) {
+        if (use_photometric && (*gradient_valid_)[target_index]) {
             float src_val = photometric_use_reflectivity_ ? source_pt.reflectivity : source_pt.intensity;
             float tgt_val = photometric_use_reflectivity_ ? target_pt.reflectivity : target_pt.intensity;
             float intensity_diff = src_val - tgt_val;
-            Eigen::Vector3f gradient = target_intensity_gradients_[target_index];
+            Eigen::Vector3f gradient = (*target_intensity_gradients_)[target_index];
             
             if (gradient.norm() > 1e-6 && gradient.norm() < 100.0f) {
                 // Residual is (I_src - I_tgt); its Jacobian w.r.t. the (left-perturbation)
@@ -380,7 +418,7 @@ template <typename PointSource, typename PointTarget>
 template <typename PointT>
 void NanoGICP<PointSource, PointTarget>::calculate_covariances(
     const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
-    nanoflann::KdTreeFLANN<PointT>& kdtree,
+    const nanoflann::KdTreeFLANN<PointT>& kdtree,
     CovarianceList& covs,
     float* density) {
 

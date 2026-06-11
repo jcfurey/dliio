@@ -59,6 +59,12 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->gicp.setPhotometricWeight(photometricWeight);
   this->gicp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp.setPhotometricChannel(this->use_reflectivity_);
+
+  // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
+  // the background thread, so it needs the same photometric configuration.
+  this->gicp_temp.setPhotometricWeight(photometricWeight);
+  this->gicp_temp.setGradientKNeighbors(gradientKNeighbors);
+  this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
   
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
@@ -815,9 +821,6 @@ void dlio::OdomNode::initializeInputTarget() {
   // keep history of keyframes
   this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
   this->keyframe_timestamps.push_back(this->scan_header_stamp);
-  // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_transformations.push_back(this->T_corr);
 
@@ -825,7 +828,6 @@ void dlio::OdomNode::initializeInputTarget() {
 
 void dlio::OdomNode::setInputSource() {
   this->gicp.setInputSource(this->current_scan);
-  // this->gicp.calculateSourceCovariances();
 }
 
 void dlio::OdomNode::initializeDLIO() {
@@ -1100,16 +1102,12 @@ void dlio::OdomNode::getNextPose() {
 
   if (this->new_submap_is_ready && this->submap_hasChanged) {
 
-    // Set the current global submap as the target cloud
-    // this->gicp.registerInputTarget(this->submap_cloud);
-    this->gicp.setInputTarget(this->submap_cloud);
-
-
-    // Set submap kdtree
-    // this->gicp.target_kdtree_ = this->submap_kdtree;
-
-    // Set target cloud's normals as submap normals
-    // this->gicp.setTargetCovariances(this->submap_normals);
+    // Adopt the submap target prepared in the background by buildSubmap():
+    // cloud + kd-tree + photometric gradients from gicp_temp, plus the
+    // keyframe-derived covariances assembled alongside the submap. Nothing
+    // expensive is recomputed here on the registration hot path.
+    this->gicp.shareTargetDataFrom(this->gicp_temp);
+    this->gicp.setTargetCovariances(this->submap_normals);
 
     this->submap_hasChanged = false;
   }
@@ -1700,9 +1698,6 @@ void dlio::OdomNode::updateKeyframes() {
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
     this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
-    // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_transformations.push_back(this->T_corr);
     lock.unlock();
@@ -1848,8 +1843,11 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    this->gicp_temp.setInputTarget(this->submap_cloud);
-    // this->submap_kdtree = this->gicp_temp.target_kdtree_;
+    // Prepare the new target in the background: builds the kd-tree and the
+    // photometric gradients without blocking the main loop. Covariances come
+    // from the keyframe normals assembled above (submap_normals), shared with
+    // the registration instance in getNextPose().
+    this->gicp_temp.registerInputTarget(this->submap_cloud);
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }

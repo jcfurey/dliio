@@ -14,6 +14,7 @@ using Covariance = Eigen::Matrix4f;
 using CovarianceList = std::vector<Covariance, Eigen::aligned_allocator<Covariance>>;
 using Mahalanobis = Eigen::Matrix4f;
 using MahalanobisList = std::vector<Mahalanobis, Eigen::aligned_allocator<Mahalanobis>>;
+using GradientList = std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>;
 
 enum class RegularizationMethod { NONE, MIN_EIG, NORMALIZED_MIN_EIG, PLANE, FROBENIUS };
 
@@ -55,6 +56,15 @@ public:
   virtual void setInputSource(const PointCloudSourceConstPtr& cloud) override;
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
 
+  // Background-preparation API: registerInputTarget() sets the target cloud and
+  // builds the kd-tree + photometric gradients but does NOT compute covariances
+  // (supply precomputed ones with setTargetCovariances). shareTargetDataFrom()
+  // adopts a target prepared on another instance without recomputing anything,
+  // so the expensive work can run off the registration hot path.
+  void registerInputTarget(const PointCloudTargetConstPtr& cloud);
+  void setTargetCovariances(const std::shared_ptr<const CovarianceList>& covs);
+  void shareTargetDataFrom(const NanoGICP& other);
+
   float source_density_ = 0.0f;
 
 protected:
@@ -65,7 +75,7 @@ protected:
 
   template<typename PointT>
   void calculate_covariances(const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
-                             nanoflann::KdTreeFLANN<PointT>& kdtree,
+                             const nanoflann::KdTreeFLANN<PointT>& kdtree,
                              CovarianceList& covariances,
                              float* density = nullptr);
 
@@ -90,11 +100,11 @@ protected:
   float lambda_factor_;
   float intensity_gradient_threshold_;
 
-  std::unique_ptr<nanoflann::KdTreeFLANN<PointSource>> input_kdtree_;
-  std::unique_ptr<nanoflann::KdTreeFLANN<PointTarget>> target_kdtree_;
+  std::shared_ptr<nanoflann::KdTreeFLANN<PointSource>> input_kdtree_;
+  std::shared_ptr<const nanoflann::KdTreeFLANN<PointTarget>> target_kdtree_;
 
   CovarianceList source_covs_;
-  CovarianceList target_covs_;
+  std::shared_ptr<const CovarianceList> target_covs_;
 
   std::vector<int> correspondences_;
   std::vector<float> sq_distances_;
@@ -104,8 +114,8 @@ protected:
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
   
-  std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> target_intensity_gradients_;
-  std::vector<bool> gradient_valid_;
+  std::shared_ptr<const GradientList> target_intensity_gradients_;
+  std::shared_ptr<const std::vector<bool>> gradient_valid_;
 };
 
 } // namespace nano_gicp
