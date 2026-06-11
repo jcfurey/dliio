@@ -59,6 +59,12 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->gicp.setPhotometricWeight(photometricWeight);
   this->gicp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp.setPhotometricChannel(this->use_reflectivity_);
+
+  // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
+  // the background thread, so it needs the same photometric configuration.
+  this->gicp_temp.setPhotometricWeight(photometricWeight);
+  this->gicp_temp.setGradientKNeighbors(gradientKNeighbors);
+  this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
   
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
@@ -123,7 +129,7 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
 
   this->first_scan_stamp = 0.;
   this->elapsed_time = 0.;
-  this->length_traversed;
+  this->length_traversed = 0.;
 
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
@@ -135,14 +141,14 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->gicp.setMaximumIterations(this->gicp_max_iter_);
   this->gicp.setTransformationEpsilon(this->gicp_transformation_ep_);
   this->gicp.setRotationEpsilon(this->gicp_rotation_ep_);
-  // this->gicp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
+  this->gicp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
 
   this->gicp_temp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
   this->gicp_temp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
   this->gicp_temp.setMaximumIterations(this->gicp_max_iter_);
   this->gicp_temp.setTransformationEpsilon(this->gicp_transformation_ep_);
   this->gicp_temp.setRotationEpsilon(this->gicp_rotation_ep_);
-  // this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
+  this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
 
   pcl::Registration<PointType, PointType>::KdTreeReciprocalPtr temp;
   this->gicp.setSearchMethodSource(temp, true);
@@ -502,15 +508,7 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   this->kf_pose_pub->publish(this->kf_pose_ros);
 
   // publish keyframe scan for map
-  if (this->vf_use_) {
-    if (kf.second->points.size() == kf.second->width * kf.second->height) {
-      sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
-      pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
-      keyframe_cloud_ros.header.stamp = timestamp;
-      keyframe_cloud_ros.header.frame_id = this->odom_frame;
-      this->kf_cloud_pub->publish(keyframe_cloud_ros);
-    }
-  } else {
+  if (kf.second->points.size() == kf.second->width * kf.second->height) {
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
     keyframe_cloud_ros.header.stamp = timestamp;
@@ -594,10 +592,12 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
     } else if (field.name == "time") {
       this->sensor = dlio::SensorType::VELODYNE;
       break;
-    } else if (field.name == "timestamp" && original_scan_->points[0].timestamp < 1e14) {
+    } else if (field.name == "timestamp" && !original_scan_->points.empty()
+               && original_scan_->points[0].timestamp < 1e14) {
       this->sensor = dlio::SensorType::HESAI;
       break;
-    } else if (field.name == "timestamp" && original_scan_->points[0].timestamp > 1e14) {
+    } else if (field.name == "timestamp" && !original_scan_->points.empty()
+               && original_scan_->points[0].timestamp > 1e14) {
       this->sensor = dlio::SensorType::LIVOX;
       break;
     }
@@ -673,8 +673,18 @@ void dlio::OdomNode::preprocessPoints() {
 
 void dlio::OdomNode::deskewPointcloud() {
 
-  pcl::PointCloud<PointType>::Ptr deskewed_scan_ = std::make_shared<pcl::PointCloud<PointType>>(1, this->original_scan->points.size());
-  // deskewed_scan_->points.resize(this->original_scan->points.size());
+  // an empty scan (e.g. fully cropped) would otherwise crash on the
+  // first-point/median-timestamp lookups below
+  if (this->original_scan->points.empty()) {
+    this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
+    this->deskewed_scan = this->original_scan;
+    this->deskew_status = false;
+    return;
+  }
+
+  // pcl::PointCloud(width, height): N points wide, 1 row tall (unorganized)
+  pcl::PointCloud<PointType>::Ptr deskewed_scan_ =
+      std::make_shared<pcl::PointCloud<PointType>>(this->original_scan->points.size(), 1);
   // individual point timestamps should be relative to this time
   double sweep_ref_time = rclcpp::Time(this->scan_header_stamp).seconds();
 
@@ -812,9 +822,6 @@ void dlio::OdomNode::initializeInputTarget() {
   // keep history of keyframes
   this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
   this->keyframe_timestamps.push_back(this->scan_header_stamp);
-  // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_transformations.push_back(this->T_corr);
 
@@ -822,7 +829,6 @@ void dlio::OdomNode::initializeInputTarget() {
 
 void dlio::OdomNode::setInputSource() {
   this->gicp.setInputSource(this->current_scan);
-  // this->gicp.calculateSourceCovariances();
 }
 
 void dlio::OdomNode::initializeDLIO() {
@@ -1049,6 +1055,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
       this->imu_calibrated = true;
 
+      // Anchor dt for the first post-calibration measurement; otherwise the
+      // first dt is computed against prev_imu_stamp = 0 (a ~1e9 s step) and
+      // poisons the IMU buffer / state propagation, causing startup drift.
+      this->prev_imu_stamp = imu_stamp_secs;
+
     }
 
   } else {
@@ -1092,16 +1103,12 @@ void dlio::OdomNode::getNextPose() {
 
   if (this->new_submap_is_ready && this->submap_hasChanged) {
 
-    // Set the current global submap as the target cloud
-    // this->gicp.registerInputTarget(this->submap_cloud);
-    this->gicp.setInputTarget(this->submap_cloud);
-
-
-    // Set submap kdtree
-    // this->gicp.target_kdtree_ = this->submap_kdtree;
-
-    // Set target cloud's normals as submap normals
-    // this->gicp.setTargetCovariances(this->submap_normals);
+    // Adopt the submap target prepared in the background by buildSubmap():
+    // cloud + kd-tree + photometric gradients from gicp_temp, plus the
+    // keyframe-derived covariances assembled alongside the submap. Nothing
+    // expensive is recomputed here on the registration hot path.
+    this->gicp.shareTargetDataFrom(this->gicp_temp);
+    this->gicp.setTargetCovariances(this->submap_normals);
 
     this->submap_hasChanged = false;
   }
@@ -1692,9 +1699,6 @@ void dlio::OdomNode::updateKeyframes() {
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
     this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
-    // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_transformations.push_back(this->T_corr);
     lock.unlock();
@@ -1840,8 +1844,11 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    this->gicp_temp.setInputTarget(this->submap_cloud);
-    // this->submap_kdtree = this->gicp_temp.target_kdtree_;
+    // Prepare the new target in the background: builds the kd-tree and the
+    // photometric gradients without blocking the main loop. Covariances come
+    // from the keyframe normals assembled above (submap_normals), shared with
+    // the registration instance in getNextPose().
+    this->gicp_temp.registerInputTarget(this->submap_cloud);
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }

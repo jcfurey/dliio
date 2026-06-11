@@ -12,6 +12,8 @@
 
 /**:
   ros__parameters:
+    # NOTE: set to false on real hardware -- with no /clock publisher the node
+    # clock stays at zero and timestamps/statistics will be wrong.
     use_sim_time: true
     frames/odom: odom
     frames/baselink: base_link

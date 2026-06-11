@@ -6,11 +6,15 @@ Lidar intensity aided DLIO. The extra "i" in the name is for intensity.
 
 Added `photometricWeight` (default value: 0.1) and `gradientKNeighbors` (default value: 10) to cfg/params.yaml.
 
-These new user-configurable parameters allow you to control the influence of the intensity information. In featureless enviroments a higher `photometricWeight` is preferred.
+These new user-configurable parameters allow you to control the influence of the intensity information. In featureless environments a higher `photometricWeight` is preferred.
 
 Added `intensityAlpha` (default value: 2.0) and `intensityRRef` (default value: 1.0) to cfg/params.yaml.
 
-These new user-configurable parameters allow you to control the influence the range coorection. Specifically, `intensityAlpha` is the falloff exponent and `intensityRRef` is the reference range in metres.
+These new user-configurable parameters allow you to control the influence of the range correction. Specifically, `intensityAlpha` is the falloff exponent and `intensityRRef` is the reference range in metres.
+
+Added `photometricChannel` (default value: `intensity`) to cfg/params.yaml.
+
+Selects which point field feeds the photometric GICP term: `intensity` (raw return strength, range-dependent, range correction applied) or `reflectivity` (calibrated, range-normalized — e.g. Ouster; range correction is skipped). The input cloud must carry the chosen field.
 
 ---
 
@@ -30,7 +34,7 @@ DLIO is a new lightweight LiDAR-inertial odometry algorithm with a novel coarse-
 ## Instructions
 
 ### Sensor Setup
-DLIO has been extensively tested using a variety of sensor configurations and currently supports Ouster, Velodyne, and Hesai LiDARs. The point cloud should be of input type `sensor_msgs::PointCloud2` and the 6-axis IMU input type of `sensor_msgs::Imu`.
+DLIO has been extensively tested using a variety of sensor configurations and currently supports Ouster, Velodyne, Hesai, and Livox LiDARs. The point cloud should be of input type `sensor_msgs::msg::PointCloud2` and the 6-axis IMU input type of `sensor_msgs::msg::Imu`.
 
 For best performance, extrinsic calibration between the LiDAR/IMU sensors and the robot's center-of-gravity should be inputted into `cfg/dlio.yaml`. If the exact values of these are unavailable, a rough LiDAR-to-IMU extrinsics can also be used (note however that performance will be degraded).
 
@@ -41,9 +45,9 @@ Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized
 ### Dependencies
 The following has been verified to be compatible, although other configurations may work too:
 
-- Ubuntu 22.04
-- ROS Humble (`rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`)
-- C++ 14
+- Ubuntu 24.04
+- ROS 2 Jazzy or newer (`rclcpp`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`, `pcl_conversions`, `tf2_ros`)
+- C++ 17
 - CMake >= `3.12.4`
 - OpenMP >= `4.5`
 - Point Cloud Library >= `1.10.0`
@@ -56,13 +60,13 @@ sudo apt install libomp-dev libpcl-dev libeigen3-dev
 DLIO currently supports `ROS 1` and `ROS 2`!
 
 ### Compiling
-Compile using the [`catkin_tools`](https://catkin-tools.readthedocs.io/en/latest/) package via:
+Compile with `colcon`:
 
 ```sh
-mkdir ~/ros2_ws && cd ~/ros2_ws && mkdir src && cd src
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 ```
 ```sh
-git clone https://github.com/vectr-ucla/direct_lidar_inertial_odometry -b feature/ros2
+git clone https://github.com/jcfurey/dliio direct_lidar_inertial_odometry
 ```
 ```sh
 cd ~/ros2_ws
@@ -84,7 +88,7 @@ source ~/ros2_ws/install/setup.bash
 Execute via:
 
 ```sh
-roslaunch direct_lidar_inertial_odometry dlio.launch \
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
   rviz:={true, false} \
   pointcloud_topic:=/robot/lidar \
   imu_topic:=/robot/imu
@@ -108,8 +112,10 @@ Be sure to change the topic names to your corresponding topics. Alternatively, e
 To save DLIO's generated map into `.pcd` format, call the following service:
 
 ```sh
-ros2 service call /save_pcd direct_lidar_inertial_odometry/srv/SavePCD "{'leaf_size': 0.2, 'save_path': '~/map'}"
+ros2 service call /save_pcd direct_lidar_inertial_odometry/srv/SavePCD "{'leaf_size': 0.2, 'save_path': '/home/user/map'}"
 ```
+
+Note: `save_path` must be an absolute path to an existing directory (`~` is not expanded).
 
 ### Test Data
 For your convenience, we provide test data [here](https://drive.google.com/file/d/1Sp_Mph4rekXKY2euxYxv6SD6WIzB-wVU/view?usp=sharing) (1.2GB, 1m 13s, Ouster OS1-32) of an aggressive motion to test our motion correction scheme, and [here](https://drive.google.com/file/d/1HbmF5gTHxCAMqBkEd5PTxDNQvcI8tKXn/view?usp=sharing) (16.5GB, 4m 21s, Ouster OSDome) of a longer trajectory outside with lots of trees. Try these two datasets with both deskewing on and off!
