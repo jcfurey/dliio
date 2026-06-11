@@ -13,6 +13,8 @@
 #include "dlio/map.h"
 #include "dlio/utils.h"
 
+#include <filesystem>
+
 dlio::MapNode::MapNode(): Node("dlio_map_node") {
 
   this->getParams();
@@ -61,6 +63,8 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   this->voxelgrid.filter(*keyframe_pcl);
 
   // save filtered keyframe to map for rviz
+  // (lock: savePCD runs in a different callback group and may read concurrently)
+  std::lock_guard<std::mutex> lock(this->map_mutex);
   *this->dlio_map += *keyframe_pcl;
 
   // publish full map
@@ -76,10 +80,24 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
 void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                             std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res) {
 
+  std::unique_lock<std::mutex> lock(this->map_mutex);
   pcl::PointCloud<PointType>::Ptr m = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  lock.unlock();
 
   float leaf_size = req->leaf_size;
   std::string p = req->save_path;
+
+  if (!std::filesystem::is_directory(p)) {
+    std::cout << "Could not find directory " << p << std::endl;
+    res->success = false;
+    return;
+  }
+
+  if (m->empty()) {
+    std::cout << "Map is empty, nothing to save" << std::endl;
+    res->success = false;
+    return;
+  }
 
   std::cout << std::setprecision(2) << "Saving map to " << p + "/dlio_map.pcd"
     << " with leaf size " << to_string_with_precision(leaf_size, 2) << "... "; std::cout.flush();

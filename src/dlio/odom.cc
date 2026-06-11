@@ -1049,6 +1049,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
       this->imu_calibrated = true;
 
+      // Anchor dt for the first post-calibration measurement; otherwise the
+      // first dt is computed against prev_imu_stamp = 0 (a ~1e9 s step) and
+      // poisons the IMU buffer / state propagation, causing startup drift.
+      this->prev_imu_stamp = imu_stamp_secs;
+
     }
 
   } else {

@@ -12,7 +12,13 @@
 
 #include "dlio/odom.h"
 
+#include <malloc.h>
+
 int main(int argc, char** argv) {
+
+  // Limit glibc to a single malloc arena; with many short-lived threads the
+  // per-thread arenas fragment and inflate resident memory over long runs.
+  mallopt(M_ARENA_MAX, 1);
 
   rclcpp::init(argc, argv);
   auto node = std::make_shared<dlio::OdomNode>();

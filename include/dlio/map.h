@@ -48,6 +48,7 @@ private:
   rclcpp::Service<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_srv;
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
+  std::mutex map_mutex;
   pcl::VoxelGrid<PointType> voxelgrid;
 
   std::string odom_frame;
