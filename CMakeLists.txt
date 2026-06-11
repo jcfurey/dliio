@@ -18,15 +18,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 
-# Find packages first
+# ROS deps are pulled from package.xml; non-ROS deps found explicitly below.
+find_package(ament_cmake_auto REQUIRED)
+ament_auto_find_build_dependencies()
+
 find_package(rosidl_default_generators REQUIRED)
-find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
-find_package(pcl_ros REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io registration kdtree search features surface filters)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
@@ -96,51 +92,29 @@ target_link_libraries(nano_gicp PUBLIC
 )
 
 # Odometry Node
-add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
+# ament_auto_add_executable links the ROS deps from package.xml (rclcpp,
+# tf2_ros, pcl_ros, pcl_conversions, sensor_msgs, nav_msgs, geometry_msgs)
+# and installs the target to lib/${PROJECT_NAME}.
+ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
 target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
 target_compile_options(dlio_odom_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_odom_node 
+target_link_libraries(dlio_odom_node
   nano_gicp
   Threads::Threads
   ${PCL_LIBRARIES}
 )
-ament_target_dependencies(dlio_odom_node 
-  tf2_ros 
-  pcl_ros 
-  nav_msgs 
-  pcl_conversions 
-  rclcpp 
-  sensor_msgs 
-  geometry_msgs
-)
 
 # Mapping Node
-add_executable(dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
+ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
 target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
 target_compile_options(dlio_map_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_map_node 
+target_link_libraries(dlio_map_node
   ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
-)
-ament_target_dependencies(dlio_map_node 
-  tf2_ros 
-  pcl_ros 
-  pcl_conversions 
-  rclcpp
-)
-
-# Export
-ament_export_include_directories(include)
-ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp std_msgs sensor_msgs geometry_msgs pcl_ros)
-
-# Install
-install(TARGETS dlio_odom_node dlio_map_node
-  DESTINATION lib/${PROJECT_NAME}
 )
 
 install(DIRECTORY cfg launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_package()
+ament_auto_package()
