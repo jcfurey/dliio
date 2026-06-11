@@ -41,10 +41,11 @@ dlio::MapNode::~MapNode() {}
 
 void dlio::MapNode::getParams() {
 
-  this->declare_parameter<std::string>("odom/odom_frame", "odom");
+  // same key the odometry node uses, so the map and odometry frames stay in sync
+  this->declare_parameter<std::string>("frames/odom", "odom");
   this->declare_parameter<double>("map/sparse/leafSize", 0.5);
 
-  this->get_parameter("odom/odom_frame", this->odom_frame);
+  this->get_parameter("frames/odom", this->odom_frame);
   this->get_parameter("map/sparse/leafSize", this->leaf_size_);
 }
 

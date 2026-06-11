@@ -508,15 +508,7 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   this->kf_pose_pub->publish(this->kf_pose_ros);
 
   // publish keyframe scan for map
-  if (this->vf_use_) {
-    if (kf.second->points.size() == kf.second->width * kf.second->height) {
-      sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
-      pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
-      keyframe_cloud_ros.header.stamp = timestamp;
-      keyframe_cloud_ros.header.frame_id = this->odom_frame;
-      this->kf_cloud_pub->publish(keyframe_cloud_ros);
-    }
-  } else {
+  if (kf.second->points.size() == kf.second->width * kf.second->height) {
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
     keyframe_cloud_ros.header.stamp = timestamp;
@@ -680,6 +672,15 @@ void dlio::OdomNode::preprocessPoints() {
 }
 
 void dlio::OdomNode::deskewPointcloud() {
+
+  // an empty scan (e.g. fully cropped) would otherwise crash on the
+  // first-point/median-timestamp lookups below
+  if (this->original_scan->points.empty()) {
+    this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
+    this->deskewed_scan = this->original_scan;
+    this->deskew_status = false;
+    return;
+  }
 
   // pcl::PointCloud(width, height): N points wide, 1 row tall (unorganized)
   pcl::PointCloud<PointType>::Ptr deskewed_scan_ =

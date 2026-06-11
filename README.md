@@ -46,7 +46,7 @@ Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized
 The following has been verified to be compatible, although other configurations may work too:
 
 - Ubuntu 24.04
-- ROS 2 Jazzy or newer (`rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`, `pcl_conversions`, `tf2_ros`)
+- ROS 2 Jazzy or newer (`rclcpp`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`, `pcl_conversions`, `tf2_ros`)
 - C++ 17
 - CMake >= `3.12.4`
 - OpenMP >= `4.5`

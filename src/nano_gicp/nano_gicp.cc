@@ -431,25 +431,37 @@ void NanoGICP<PointSource, PointTarget>::calculate_covariances(
         std::vector<int> k_indices(k_correspondences_);
         std::vector<float> k_sq_distances(k_correspondences_);
 
-        kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
+        // nearestKSearch resizes the outputs to k but only fills the first
+        // `found` entries -- the rest are garbage, so never read past `found`.
+        int found = kdtree.nearestKSearch(cloud->at(i), k_correspondences_, k_indices, k_sq_distances);
+
+        if (found < 4) {
+            // not enough neighbors for a meaningful covariance; use a small
+            // isotropic placeholder instead of reading uninitialized indices
+            Eigen::Matrix4f cov = Eigen::Matrix4f::Zero();
+            cov.block<3, 3>(0, 0) = Eigen::Matrix3f::Identity() * 0.001f;
+            cov(3, 3) = 1.0;
+            covs[i] = cov;
+            continue;
+        }
 
         // accumulate normalized neighborhood spread for the density metric
         // (skip k_sq_distances[0], the query point itself)
-        const int normalization = ((k_correspondences_ - 1) * (2 + k_correspondences_)) / 2;
+        const int normalization = ((found - 1) * (2 + found)) / 2;
         sum_k_sq_distances +=
-            std::accumulate(k_sq_distances.begin() + 1, k_sq_distances.end(), 0.0f) / normalization;
+            std::accumulate(k_sq_distances.begin() + 1, k_sq_distances.begin() + found, 0.0f) / normalization;
 
-        Eigen::Matrix<float, 4, -1> neighbors(4, k_correspondences_);
-        for(int j = 0; j < k_indices.size(); ++j) {
+        Eigen::Matrix<float, 4, -1> neighbors(4, found);
+        for(int j = 0; j < found; ++j) {
             neighbors.col(j) = cloud->at(k_indices[j]).getVector4fMap();
         }
-        
+
         neighbors.row(3).array() = 1.0f;
         Eigen::Vector4f mean = neighbors.rowwise().mean();
         Eigen::Matrix<float, 4, -1> centered = neighbors.colwise() - mean;
         centered.row(3).array() = 0.0f;
-        
-        Eigen::Matrix4f cov = (centered * centered.transpose()) / static_cast<float>(k_correspondences_);
+
+        Eigen::Matrix4f cov = (centered * centered.transpose()) / static_cast<float>(found);
         cov(3, 3) = 1.0;
         
         if(regularization_method_ == RegularizationMethod::PLANE) {
