@@ -52,6 +52,20 @@ public:
   // Selects which point field feeds the photometric term:
   // false = intensity (default), true = reflectivity.
   void setPhotometricChannel(bool use_reflectivity);
+  // Full-scale value of the photometric channel (default 255). The channel is
+  // divided by this before gradient estimation and residuals, so
+  // photometricWeight is in normalized units and transfers across sensors.
+  void setPhotometricScale(float scale);
+
+  // Degeneracy gating (solution remapping): the rotation and translation
+  // Hessian blocks are eigen-analyzed separately; the update is projected off
+  // directions with eigenvalue < ratio * block_lambda_max, so the initial
+  // guess (IMU prior) is held along unobservable directions, e.g. the axis of
+  // a featureless tunnel. 0 disables the gate. Most discriminative with the
+  // PLANE regularization method.
+  void setDegeneracyThreshRatio(float ratio);
+  // Number of degenerate directions detected during the last align() (0-6).
+  int lastDegenerateDirections() const;
 
   virtual void setInputSource(const PointCloudSourceConstPtr& cloud) override;
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
@@ -113,6 +127,9 @@ protected:
   float photometric_weight_;
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
+  float photometric_scale_;            // channel full-scale; channel is divided by this
+  float degeneracy_thresh_ratio_;
+  int last_degenerate_directions_;
   
   std::shared_ptr<const GradientList> target_intensity_gradients_;
   std::shared_ptr<const std::vector<bool>> gradient_valid_;

@@ -116,4 +116,16 @@ install(DIRECTORY cfg launch
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Tests
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
+  target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
+  target_compile_options(test_nano_gicp PRIVATE ${OpenMP_CXX_FLAGS})
+  target_link_libraries(test_nano_gicp
+    nano_gicp
+    ${PCL_LIBRARIES}
+  )
+endif()
+
 ament_auto_package()

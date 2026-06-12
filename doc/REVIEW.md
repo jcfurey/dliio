@@ -1,0 +1,134 @@
+# DLIIO — Literature Review & Full Code Roast
+
+**Scope:** branch `lyrical` @ `1766c1e` (code, configs, launch, docs, build).
+**Method:** every claim below was checked against the source on this branch; build-verified on ROS 2 Jazzy (`ros:jazzy-ros-base`, Ubuntu 24.04). Items already fixed on the audit branch (PR #1) are marked **[PR #1]**.
+
+---
+
+## Part I — The literature this repo stands on
+
+### 1. DLIO itself
+Chen, Nemiroff & Lopez, *"Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction"*, ICRA 2023 ([arXiv:2203.03749](https://arxiv.org/abs/2203.03749)).
+The paper's three pillars, and where they live here:
+
+| Paper concept | Code |
+|---|---|
+| Coarse-to-fine continuous-time deskew: analytic constant-jerk / constant-angular-acceleration integration between IMU samples, evaluated at unique point timestamps | `OdomNode::integrateImu` / `integrateImuInternal`, consumed by `deskewPointcloud()` |
+| Direct scan-to-map registration (no scan-to-scan), submap of kNN + convex/concave-hull keyframes (inherited from DLO, [arXiv:2110.00605](https://arxiv.org/abs/2110.00605)) | `buildSubmap()`, `computeConvexHull()`, `pushSubmapIndices()` |
+| Hierarchical geometric observer with guaranteed convergence for state update | `propagateState()` / `updateState()` |
+
+### 2. The observer
+Lopez, *"A Contracting Hierarchical Observer for Pose-Inertial Fusion"* ([arXiv:2303.02777](https://arxiv.org/abs/2303.02777)): two cascaded contracting observers — quaternion + gyro bias first, then position/velocity/accel bias. `updateState()` is a faithful transcription (quaternion error `qe = qhat* ⊗ qin`, sign-corrected vector part, gain-scaled bias updates with clamps `abias_max`/`gbias_max`). The paper's convergence guarantee is the *justification for trusting the IMU prior that the deskew depends on* — which is why the startup-`dt` poisoning bug mattered so much **[PR #1]**.
+
+### 3. The registration engine
+Segal et al., *Generalized-ICP* (RSS 2009) via Koide's [fast_gicp](https://github.com/koide3/fast_gicp) (*Voxelized GICP*, ICRA 2021). Upstream DLIO vendors fast_gicp's `NanoGICP` with nanoflann kd-trees. **This repo replaced the optimizer wholesale** (see roast §II.1).
+
+### 4. Intensity/reflectivity-aided LIO (what the "extra i" competes with)
+- **COIN-LIO** (ICRA 2024, [arXiv:2310.01235](https://arxiv.org/abs/2310.01235)): projects intensity into an image, filters brightness/range artifacts, selects patches that are *complementary to degenerate registration directions*, fuses photometric error in an IEKF.
+- **RI-LIO** (RA-L 2023): photometric residuals from calibrated *reflectivity* images blended with GICP point-to-plane in an IEKF.
+- **PG-LIO** (2025, [arXiv:2506.18583](https://arxiv.org/abs/2506.18583)): photometric-geometric fusion.
+- Radiometric calibration review (Kashani et al., *Sensors* 2015, [PMC4701271](https://pmc.ncbi.nlm.nih.gov/articles/PMC4701271/)): physically-motivated correction is `I·R²/(R_ref²·cos α)` — range **and incidence angle**; the pure inverse-square model is explicitly called "too simple for all conditions", with non-ideal (≈exponential) behavior at close range.
+
+This repo's approach — a per-point photometric residual added directly into the GICP Hessian using a target-side spatial intensity gradient — is closest in spirit to RI-LIO's residual, but implemented in 3D point space rather than image space, without a measurement model, robust kernel, or degeneracy analysis. That's a legitimate lightweight design point; the literature mostly says the hard part is *normalization and selection*, which is where the roast below lands hardest.
+
+---
+
+## Part II — The roast: algorithms & logic
+
+### II.1 NanoGICP rewrite: you forked fast_gicp and quietly changed the math
+
+1. **The `PLANE` regularization isn't plane-to-plane anymore.** fast_gicp's `PLANE` forces every covariance to a unit disc, `Σ = U·diag(1, 1, 1e-3)·Uᵀ` — scale-free, the canonical GICP plane-to-plane weighting. This repo's version keeps the raw singular values and only clamps the smallest (`values(2) = max(values(2), 0.001)`), i.e. it implements **MIN_EIG** while calling itself PLANE. Consequences: the Mahalanobis weights are now scale-dependent (dense neighborhoods → tiny covariances → enormous weights), the balance against `maxCorrespondenceDistance` and the photometric weight shifts with point density, and every parameter tuned during the "fix the drift" commit streak is implicitly tuned to this undocumented change. Either rename the enum case to be honest, or restore `(1,1,1e-3)` and re-tune. **[FIXED on this branch: all regularization methods implemented honestly; `odom/gicp/regularizationMethod` param, default `min_eig` preserves historical behavior]**
+2. **Levenberg–Marquardt was replaced by fixed-λ Gauss-Newton with no step control.** `lsq_registration` (LM with ρ-based step acceptance) is dead code on this branch — still *compiled*, never *called* **[PR #1 removes it]**. The replacement in `computeTransformation()` takes every step unconditionally: no cost evaluation, no backtracking, no λ adaptation. GN on a well-conditioned scan-to-map problem usually works, but the entire reason fast_gicp ships LM is the occasional ill-conditioned submap; here that case just NaN-breaks (silently — `hasConverged()` wasn't even set **[PR #1]**).
+3. **Rotation updates by Euler-increment composition.** `prerotate(Z)·prerotate(Y)·prerotate(X)` is a small-angle approximation of the SO(3) exponential that upstream uses (`so3_exp`). Fine for converged steps; sloppy for the large first iterations of an aggressive-motion scan. You have Eigen; `Eigen::AngleAxisf(dx.head<3>().norm(), dx.head<3>().normalized())` is one line.
+4. **Everything is `float` now.** Upstream computed covariances and the Hessian in `double`. Eight points in a 100 m-radius map already cost you ~7 significant digits in `centered * centeredᵀ`; the per-point 4×4 `RCR.inverse()` in float on near-singular plane covariances is begging for noise amplification. The Hessian sum across 10k+ points in float is the same story.
+5. **The intensity-gradient solve is built in world coordinates.** `estimate_spatial_intensity_gradient` fills `A` with absolute `(x, y, z, 1)` and conditions-checks `AᵀA`. At 5 m from origin that's fine. At 200 m, `cond(AᵀA)` scales with ‖x‖⁴ and your `cond > 1e6` rejection starts firing *because of where the robot is, not how informative the surface is* — the photometric term silently fades out as the map grows. Center the neighborhood on the query point before solving; the gradient is translation-invariant.
+6. **Unit soup in the photometric term.** Geometric residuals are meters weighted by inverse covariance (≈ dimensionless·m⁻¹); photometric residuals are raw 0–255 intensity counts (or uint16 reflectivity that was clamped to 255 — see II.3). `photometricWeight: 0.1` therefore means something completely different for an Ouster vs a Velodyne vs after changing `intensityRRef`. COIN-LIO and RI-LIO both normalize the channel before residual construction. Normalize intensity to [0,1] (or z-score per scan) and the weight becomes portable. **[FIXED on this branch: channel normalized by `odom/gicp/photometricScale` (default 255) before gradients and residuals]**
+7. **One threshold, three meanings.** `intensity_gradient_threshold_ = 1e-6` is used as (a) a variance floor in intensity², (b) a gradient-magnitude floor in intensity/m, and implicitly (c) against `gradient.norm()` again in `linearize` with different constants (1e-6, 100). Pick units, name constants.
+8. **No robustification, no degeneracy awareness.** Every accepted correspondence contributes its photometric residual at full weight — a specular sign flip or wet patch shoves the pose directly (the literature's first lesson: Huber/Cauchy it). And the term is applied isotropically; COIN-LIO's entire contribution is *only* trusting intensity along directions where geometry is degenerate. A cheap version here: scale the photometric weight by the inverse condition of the geometric Hessian.
+9. **Per-point `JacobiSVD` on `AᵀA` just to estimate a condition number** (gradient estimation) is the most expensive way to answer "is this neighborhood planar-degenerate"; you already do an `ldlt()` — check `info()` and the diagonal, or reuse the covariance SVD you computed for GICP anyway.
+
+### II.2 Odometry node logic
+
+10. **`setAdaptiveParams` makes the density metric decorative.** After clamping `den` to `[0.5, 2.0]·maxCorrDist`, the next two lines overwrite it with `0.5·maxCorrDist` when `sp < 5.0` and `2.0·maxCorrDist` when `sp > 5.0`. Density influences the result only when spaciousness equals exactly 5.0 — measure zero. Inherited verbatim from upstream, but on this branch it's doubly dead because `source_density_` was never computed after the rewrite (always 0) **[PR #1 restores the computation; the override logic remains upstream-faithful and questionable]**.
+11. **Startup `dt` poisoning** — `prev_imu_stamp` never set when calibration ends, so the first post-calibration `dt` ≈ first IMU epoch (~1.7e9 s). Given the observer's correctness depends on sane IMU integration (Part I.2), this single line is the most plausible root cause of the repo's "robot drift on startup / still drifting" commit archaeology **[PR #1]**.
+12. **Keyframe set is append-only.** `keyframes`, `keyframe_normals`, `keyframe_transformations` grow forever; so do `trajectory`, `path_ros.poses`, `kf_pose_ros.poses`, `comp_times`, `imu_rates`, `lidar_rates`, `cpu_percents`. A 2-hour run publishes a `Path` message with ~50k poses at scan rate (quadratic bandwidth) and `debug()` does an O(n) accumulate over all of history per scan. Cap the message histories and consider keyframe pruning/merging beyond a radius. **[PARTLY FIXED on this branch: stats vectors capped, Path message bounded at 10k poses, distance-traveled now incremental (trajectory vector removed); keyframe pruning still open]**
+13. **Detached threads everywhere** (`publish_thread`, `metrics_thread`, `debug_thread`, `publish_keyframe_thread`). They capture `this` and outlive nothing in particular: at shutdown a detached `debug()` can race node destruction (use-after-free on publishers/members); `computeMetrics` reads `this->original_scan` (a non-atomic `shared_ptr` member the main thread reassigns) — a data race that's "fine" until it isn't. The idiomatic fix is jthread members joined in the destructor, or just doing this work in the existing callback groups.
+14. **`imuMeasFromTimeRange` can block the LiDAR callback forever.** The cv wait `imu_buffer.front().stamp >= end_time` has no timeout; if the IMU stream dies mid-flight the odometry thread parks permanently inside a callback (and `front()` on a momentarily-empty buffer is UB). A `wait_for` with a deadline plus a dropout warning costs five lines. **[FIXED on this branch: 1 s bounded wait with empty-buffer guard and throttled warning; falls back to the rigid-transform path]**
+15. **The deskew "Bad time sync" fallback is load-bearing and chatty.** On any IMU gap, it logs FATAL (it isn't fatal), silently degrades to rigid transform with `deskew_status = false`, and the median-timestamp prior quietly becomes a header-stamp prior. Reasonable behavior, mislabeled severity, zero introspection topic for it.
+16. **`updateKeyframes`' decision cascade** (three sequential `if`s mutating `newKeyframe`) encodes: "far → yes; close → no; close but rotated and alone → yes". It works, but the second `if` discards the rotation trigger from the first, so a pure rotation at distance `0.9·thresh` with two neighbors is rejected even though rotation exceeded its threshold — i.e. the rotation criterion only exists inside the `num_nearby <= 1` carve-out. Whether that's intent or accident, it deserves a comment and a truth table.
+17. **Frame-ID hygiene:** `nav_msgs/Odometry.pose.covariance` and `twist.covariance` are all zeros — any downstream EKF (robot_localization etc.) will either reject it or trust it infinitely; neither is good. The observer has gain structure you could translate into at least an honest constant diagonal.
+
+### II.3 Intensity pipeline logic
+
+18. **Range correction is applied unconditionally** — even when `photometricWeight: 0` (pure wasted per-point `pow()`), and the *modified* intensities are what get published in the deskewed cloud and keyframes. Downstream consumers (clustering, semantics, rviz coloring) silently receive `I·(r/r_ref)^α` instead of sensor output. Gate it on the photometric term being active, or correct a scratch channel.
+19. **No incidence-angle term.** The literature's standard model divides by `cos α` (Part I.4); at grazing angles on the ground plane — *the* dominant surface for a ground robot — pure range correction systematically darkens distant ground points, which then look like intensity gradients. You already compute surface normals (GICP covariances!); the cosine is one dot product away.
+20. **`clamp(..., 0, 255)` bakes in an 8-bit assumption.** Ouster calibrated reflectivity is uint16 (0–65535) with values >255 for retroreflectors — precisely the most informative landmarks — and the reflectivity path copies the raw uint16 then later clamps photometric inputs as if 8-bit. Retroreflective signs saturate to the same value as white paint.
+21. **The α=2 inverse-square default contradicts the near-range literature** (≈exponential below ~10 m, per the radiometric review) — fine as a default, but `intensityRRef: 1.0` meters anchors the correction in exactly the regime where the model is worst. A README sentence noting "calibrate α on your sensor, anchor R_ref in mid-range" would save users a bad week.
+
+### II.4 The featureless-conduit scenario (degeneracy)
+
+A smooth, geometrically self-similar tunnel is the canonical failure case for any LiDAR odometry, and the *stated reason this intensity fork exists*. Walking through what this codebase did in that scenario before mitigation:
+
+1. **Geometry:** every scan of a featureless cylinder looks identical under translation along the axis (and rotation about it, for a circular section). The GICP Hessian `H` is rank-deficient in those directions; with only `λ = 1e-9` added to the diagonal, `H.ldlt().solve(-b)` produced *some* finite step along the axis — pure noise amplification, applied at full confidence, every iteration, overwriting the one good source of axis information (the IMU prior that DLIO's observer exists to provide). The failure mode is not "drifts slowly like dead reckoning"; it's "jumps randomly along the tunnel."
+2. **Intensity (the intended rescue):** in a concrete conduit, most neighborhoods are intensity-uniform → the variance gate rejects them (correctly). The informative exceptions — pipe joints, seams, stains, markings — are exactly what should constrain the axis. But the world-frame `AᵀA` conditioning bug (§II.1.5) meant gradient validity *also* decayed with distance into the tunnel, i.e. the feature switched itself off precisely where it was needed. And with unnormalized units (§II.1.6), `photometricWeight: 0.1` against tunnel-scale geometric weights may contribute negligibly even when gradients survive.
+3. **No introspection:** nothing measured or reported observability, so the operator learned about the degeneracy from the map.
+
+**Mitigation now implemented (this branch):**
+- `computeTransformation()` performs **solution remapping** (Zhang, Kaess & Singh, ICRA 2016), applied *block-wise*: the rotation (rad-scaled, lever-arm-dependent) and translation (meters) 3×3 Hessian blocks are eigen-analyzed separately — a single threshold across the mixed-unit 6×6 is either inert in real tunnels or trips on healthy long-range scans — and the solved update is projected off directions with `λᵢ ≤ degeneracyThreshRatio · λ_max(block)` (param `odom/gicp/degeneracyThreshRatio`, default `0.005`). Held directions keep the initial guess — the IMU prior — so the tunnel axis degrades to *honest dead reckoning* instead of noise. Because the photometric term contributes to `H`, any usable intensity texture re-constrains the axis and the gate opens automatically — the COIN-LIO complementarity argument, in its cheapest possible form. Discrimination is sharpest with `regularizationMethod: plane` (scale-free covariance discs put the in-plane/normal weight ratio at ~1e-3); `min_eig` covariances add artificial in-plane stiffness from correspondence snapping that partially masks the degeneracy — unit-tested with both a planar (degenerate) and a corner (well-conditioned) target.
+- The intensity-gradient solve is now **centered on the query point**, fixing §II.1.5 so gradient validity no longer decays with distance from origin — deep-tunnel seams stay usable.
+- The odometry node logs a **throttled warning** with the number of degenerate directions while the gate is active.
+
+**What this does *not* solve** (and what a serious tunnel deployment still needs): unnormalized photometric units (§II.1.6) mean the re-constraint strength is sensor-specific; there is no robust kernel, so one specular surprise can still bend the only constrained measurement; the observer's accel-bias estimate goes unobservable along the axis during extended degeneracy (bias drift compounds the dead reckoning); and a wheel/leg odometry or barometric prior would bound the axis error the way COIN-LIO's patch selection bounds it photometrically. Validation needs a tunnel bag — simulated conduit in Gazebo (`gz_sensors_ouster` with intensity) is the cheapest start.
+
+---
+
+## Part III — The roast: ROS 2 modernity
+
+22. **QoS mismatch waiting to happen (highest-impact item in Part III).** The point-cloud subscription uses `create_subscription(..., 1)` → **reliable** QoS. Most ROS 2 LiDAR drivers (ouster-ros included, in common configurations) publish sensor data **best-effort**; a best-effort publisher and reliable subscriber are *incompatible* — you get zero messages and no error besides a QoS-incompatibility event nobody subscribed to. The IMU sub already uses `SensorDataQoS()`; the LiDAR sub should too (depth 1 is fine). **[FIXED on this branch: `SensorDataQoS().keep_last(1)`]**
+23. **Not composable.** Two raw `main()`s, no `rclcpp_components`. On Jazzy, registering both nodes as components in one container enables intra-process zero-copy for the keyframe clouds between odom and map node — currently every keyframe is serialized through the RMW for a same-host hop. This is the single cheapest real perf win ROS 2 offers and the package can't use it.
+24. **Static transforms broadcast dynamically.** `publishToROS` re-sends `baselink→imu` and `baselink→lidar` on the regular `TransformBroadcaster` *every scan*, stamped with IMU time. These are extrinsics from YAML — that's `StaticTransformBroadcaster`, once, latched. Bonus roast: extrinsics live in YAML while the rest of the robot describes itself in URDF; a `tf2` lookup with YAML fallback would kill the duplication. **[FIXED on this branch: extrinsics latched once via `publishStaticTransforms()`; URDF unification still open]**
+25. **A 1990s terminal dashboard.** `debug()` printf-paints a box-drawing UI with `\033[2J` (clear screen) at scan rate, and `start()` does it again — under `ros2 launch` with two nodes multiplexed this garbles both logs; under systemd it's noise. ROS 2 has `RCLCPP_INFO_THROTTLE` and, for exactly this use-case, `diagnostic_updater` + `rqt_robot_monitor`. At minimum: gate the dashboard behind a parameter, default off, and route warnings through the logger (the map node's `savePCD` talks via `std::cout` exclusively).
+26. **Parameter system used at ROS 1 fluency.** Slash-separated names (`odom/gicp/maxIterations`) are a rosparam habit — they work, but break the idiomatic nested-YAML mapping (dots/nesting) and made the dot-vs-slash bug that disabled the photometric feature *possible* (fixed earlier on this branch). No `ParameterDescriptor`s (no ranges, no descriptions for `ros2 param describe`), nothing marked read-only, no `add_on_set_parameters_callback` — yet half these parameters (gains, weights, thresholds) are exactly what you want to tune live during a drift hunt.
+27. **`use_sim_time: true` hardcoded in the shipped config.** On hardware with no `/clock`, node time is 0, `now()`-based statistics are garbage, and the 100 Hz pose timer's behavior is at the executor's mercy. Configs should default to real time; sim overrides belong in the launch file **[PR #1 adds a warning comment; flipping the default is the real fix]**.
+28. **Zero tests, zero lint, zero CI.** No `ament_lint_auto`, no gtest, not even a build workflow. The deskew math (`integrateImuInternal`) is a pure function begging for a unit test with a synthetic constant-jerk trajectory; the last six months of this repo's history is what debugging-by-commit looks like without one. A GitHub Action running `colcon build` + `colcon test` on `ros:jazzy` is ~30 lines.
+29. **Vendored 2014-era nanoflann** (2.4k lines) with local modifications (and a thread-unsafe `static` in `radiusSearch` **[PR #1]**), while `nanoflann` is in rosdistro as a clean dependency. Vendoring is defensible for the adaptor; carrying the whole header is maintenance debt.
+30. **Build-system split personality.** `ament_cmake_auto` (good, this branch) coexists with: globals like `include_directories`/`link_directories`, OpenMP via string-appended `CMAKE_CXX_FLAGS` instead of the `OpenMP::OpenMP_CXX` imported target, a forced `CMAKE_BUILD_TYPE Release` that overrides whatever the user/colcon asked for (good luck debugging), static libs that are installed nowhere yet `ament_export_libraries`'d upstream, and a `try_compile` CPUID probe whose only consumer is the terminal dashboard.
+31. **Misc modernity nits:** `boost::circular_buffer`/range-adaptors where `std::deque` + a sort would read cleaner (boost is fine, but it's the package's only reason for several `<boost/...>` includes); `version` is a parameter compared against nothing; node names are hardcoded (no `NodeOptions` passthrough, blocks multi-robot namespacing); `~OdomNode()` empty while detached threads run (see #13); the `Point` struct registers three overlapping union members with PCL — standard DLIO trick, but one `static_assert(sizeof(Point)==32)` would document the contract.
+
+---
+
+## Part IV — Scorecard & priorities
+
+| Area | Grade | One-liner |
+|---|---|---|
+| Deskew & observer math | **A−** | Faithful to two strong papers; startup-dt bug undermined it **[PR #1]** |
+| Registration engine | **C** | Working GN, but silently diverged from GICP-the-paper in regularization, precision, and step control |
+| Intensity feature | **B−** | Right instinct, fixed on this branch to actually run; needs normalization, robustness, and incidence-angle physics to compete with COIN-LIO/RI-LIO |
+| Concurrency | **C−** | Clever pause/resume submap handshake; detached threads and unguarded shared state everywhere else |
+| ROS 2 idiom | **D+** | Runs on Jazzy, written in ROS 1 accent: QoS gap, no composition, dynamic static-TF, printf UI, no descriptors |
+| Testing & CI | **F** | None of either; the git history is the test suite |
+| Docs/config | **B** | README/params now accurate (this branch + PR #1); physics caveats undocumented |
+
+**Do next, in order of leverage:**
+1. `SensorDataQoS` on the point-cloud subscription (#22) — one line, prevents a silent total failure.
+2. Static-broadcast the extrinsics once (#24) — one class swap.
+3. Decide what `PLANE` means (#1) and re-tune once, deliberately.
+4. Center the gradient solve (#5) and normalize the photometric channel (#6) — the intensity feature currently degrades with map size and doesn't transfer across sensors.
+5. Bound the histories (#12) and add the IMU-dropout timeout (#14) before any long-duration deployment.
+6. A deskew unit test + Jazzy build CI (#28) — cheapest insurance in the repo.
+7. Componentize the two nodes (#23) when touching the mains anyway.
+
+---
+
+## References
+
+- K. J. Chen, R. Nemiroff, B. T. Lopez, *Direct LiDAR-Inertial Odometry*, ICRA 2023 — [arXiv:2203.03749](https://arxiv.org/abs/2203.03749)
+- K. J. Chen et al., *Direct LiDAR Odometry: Fast Localization with Dense Point Clouds*, RA-L 2022 — [arXiv:2110.00605](https://arxiv.org/abs/2110.00605)
+- B. T. Lopez, *A Contracting Hierarchical Observer for Pose-Inertial Fusion* — [arXiv:2303.02777](https://arxiv.org/abs/2303.02777)
+- A. Segal, D. Haehnel, S. Thrun, *Generalized-ICP*, RSS 2009
+- K. Koide et al., *Voxelized GICP for Fast and Accurate 3D Point Cloud Registration*, ICRA 2021 — [fast_gicp](https://github.com/koide3/fast_gicp)
+- P. Pfreundschuh et al., *COIN-LIO: Complementary Intensity-Augmented LiDAR Inertial Odometry*, ICRA 2024 — [arXiv:2310.01235](https://arxiv.org/abs/2310.01235)
+- Y. Zhang et al., *RI-LIO: Reflectivity Image Assisted Tightly-Coupled LiDAR-Inertial Odometry*, RA-L 2023
+- *PG-LIO: Photometric-Geometric fusion for Robust LiDAR-Inertial Odometry* — [arXiv:2506.18583](https://arxiv.org/abs/2506.18583)
+- A. G. Kashani et al., *A Review of LIDAR Radiometric Processing: From Ad Hoc Intensity Correction to Rigorous Radiometric Calibration*, Sensors 2015 — [PMC4701271](https://pmc.ncbi.nlm.nih.gov/articles/PMC4701271/)
+- J. L. Blanco, P. K. Rai, *nanoflann* — [github.com/jlblancoc/nanoflann](https://github.com/jlblancoc/nanoflann)

@@ -10,49 +10,102 @@
 #                                                         #
 ###########################################################
 
+# ALGORITHM PARAMETERS
+# Environment- and tuning-related settings shared by both nodes. Per-robot
+# settings (extrinsics, IMU intrinsics) live in dlio.yaml. Example overlays
+# for common setups: cfg/examples/.
+
 /**:
   ros__parameters:
-    # NOTE: set to false on real hardware -- with no /clock publisher the node
-    # clock stays at zero and timestamps/statistics will be wrong.
-    use_sim_time: true
+    # Simulation time is controlled by the launch argument
+    # use_sim_time:=true|false (default false). Keep false here: with no
+    # /clock publisher the node clock stays at zero and timestamps and
+    # statistics are wrong.
+    use_sim_time: false
+
+    # TF frame names. odom -> baselink is published per scan; baselink ->
+    # lidar/imu are latched once on /tf_static from the extrinsics.
     frames/odom: odom
     frames/baselink: base_link
     frames/lidar: lidar
     frames/imu: imu
 
+    # Map node: delay publishing until the robot has moved 0.1 m; publish the
+    # unfiltered (dense) or voxelized clouds; sparse map voxel size [m].
     map/waitUntilMove: true
     map/dense/filtered: false
     map/sparse/leafSize: 0.25
 
+    # Gravity magnitude [m/s^2].
     odom/gravity: 9.80665
+    # Estimate a constant LiDAR<->IMU clock offset from the first scan.
     odom/computeTimeOffset: true
 
+    # IMU startup calibration (robot must be stationary for `time` seconds).
+    # approximateGravity also estimates the initial attitude from the
+    # gravity direction (leave false if the robot starts level).
     odom/imu/approximateGravity: false
     odom/imu/calibration/gyro: true
     odom/imu/calibration/accel: true
     odom/imu/calibration/time: 3.0
+    # IMU ring-buffer length [samples]; must cover at least one scan period
+    # plus scheduling jitter (5000 @ 500 Hz = 10 s).
     odom/imu/bufferSize: 5000
 
+    # Preprocessing: remove points within a cube of +/- size [m] around the
+    # sensor (robot body returns), then voxel-downsample at res [m].
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 0.25
 
+    # Keyframe creation thresholds: distance [m] and rotation [deg].
+    # With adaptive: true (dlio.yaml) threshD is scaled by spaciousness.
     odom/keyframe/threshD: 1.0
     odom/keyframe/threshR: 45.0
 
+    # Submap construction: K nearest keyframes + K convex-hull + K
+    # concave-hull keyframes (from DLO).
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
     odom/submap/keyframe/kcc: 10
-    odom/gicp/minNumPoints: 64
-    odom/gicp/kCorrespondences: 16
-    odom/gicp/maxCorrespondenceDistance: 0.5
+
+    # GICP scan-to-map registration.
+    odom/gicp/minNumPoints: 64            # skip scans smaller than this
+    odom/gicp/kCorrespondences: 16        # neighbors per covariance estimate
+    odom/gicp/maxCorrespondenceDistance: 0.5  # [m]; adapted when adaptive: true
     odom/gicp/maxIterations: 32
-    odom/gicp/transformationEpsilon: 0.01
-    odom/gicp/rotationEpsilon: 0.01
-    odom/gicp/initLambdaFactor: 1e-9
+    odom/gicp/transformationEpsilon: 0.01 # translation step convergence [m]
+    odom/gicp/rotationEpsilon: 0.01       # rotation step convergence [rad]
+    odom/gicp/initLambdaFactor: 1e-9      # Hessian diagonal regularization
 
+    # GICP covariance regularization:
+    #   min_eig (default)  - clamp small covariance singular values: this
+    #                        fork's historical behavior (was mislabeled
+    #                        "plane" internally)
+    #   plane              - true GICP plane-to-plane (fixed 1,1,1e-3 discs;
+    #                        scale-free, recommended for tunnel/degenerate
+    #                        environments together with the gate below)
+    #   normalized_min_eig | frobenius | none
+    odom/gicp/regularizationMethod: min_eig
+
+    # Degeneracy gate (solution remapping) for geometrically self-similar
+    # environments such as featureless tunnels/conduits: the rotation and
+    # translation blocks of the GICP Hessian are eigen-analyzed separately and
+    # the update is projected off directions with eigenvalue below
+    # ratio * block_lambda_max, holding the IMU prior along unobservable
+    # directions instead of amplifying noise. Raise (e.g. 0.02) to gate
+    # earlier/more aggressively; 0.0 disables the gate entirely.
+    # Most discriminative with regularizationMethod: plane.
+    odom/gicp/degeneracyThreshRatio: 0.005
+
+    # Photometric (intensity-aided) GICP term. Weight of the photometric
+    # residual relative to the geometric term; 0.0 disables. The channel is
+    # normalized by photometricScale, so the weight is dimensionless. In
+    # featureless environments a higher weight is preferred.
     odom/gicp/photometricWeight: 0.1
+    # Neighbors used to estimate the spatial channel gradient on the submap.
+    odom/gicp/gradientKNeighbors: 10
 
-    # Photometric channel for the GICP intensity term:
+    # Photometric channel:
     #   intensity    - raw return strength (range-dependent); uses the range
     #                  correction below.
     #   reflectivity - calibrated reflectivity (e.g. Ouster), already range-
@@ -60,17 +113,34 @@
     # Requires the input cloud to carry the chosen field.
     odom/gicp/photometricChannel: intensity
 
+    # Full-scale of the photometric channel; the channel is divided by this so
+    # photometricWeight is sensor-independent. 255 covers 8-bit intensity and
+    # Ouster calibrated reflectivity; use 65535 for raw 16-bit channels.
+    odom/gicp/photometricScale: 255.0
+
     # Intensity range correction (only applied when photometricChannel: intensity)
-    # intensityAlpha : falloff exponent (2.0 = inverse-square; tune per sensor)
+    # I_corrected = clamp(I * (r / rRef)^alpha, 0, 255)
+    # intensityAlpha : falloff exponent (2.0 = inverse-square; tune per sensor;
+    #                  the inverse-square model is poor below ~10 m)
     # intensityRRef  : reference range in metres (anchor; 1.0 is a safe default)
     odom/preprocessing/intensityAlpha: 2.0
     odom/preprocessing/intensityRRef: 1.0
-    odom/gicp/gradientKNeighbors: 10
-    
+
+    # Diagonal covariance stamped on the published nav_msgs/Odometry
+    # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
+    # Constant and intentionally conservative; tune for your fusion stack
+    # (robot_localization etc.).
+    odom/covariance/pose:  [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
+    odom/covariance/twist: [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
+
+    # Hierarchical geometric observer gains (Lopez, arXiv:2303.02777):
+    # position / velocity / orientation correction gains and accel/gyro bias
+    # adaptation gains with clamps. The defaults satisfy the paper's gain
+    # hierarchy; retune as a set, not individually.
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25
     odom/geo/Kq: 4.0
     odom/geo/Kab: 2.25
     odom/geo/Kgb: 1.0
-    odom/geo/abias_max: 5.0
-    odom/geo/gbias_max: 0.5
+    odom/geo/abias_max: 5.0   # [m/s^2]
+    odom/geo/gbias_max: 0.5   # [rad/s]

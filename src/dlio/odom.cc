@@ -18,6 +18,15 @@
 #include "rclcpp/qos.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 
+// Keep statistics history vectors bounded: drop the oldest half once they
+// exceed max_size, so long runs don't grow memory (and debug() stays O(window)).
+template <typename T>
+static void cap_history(std::vector<T>& v, size_t max_size = 1000) {
+  if (v.size() > max_size) {
+    v.erase(v.begin(), v.begin() + v.size()/2);
+  }
+}
+
 dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
 
   this->getParams();
@@ -60,16 +69,57 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->gicp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp.setPhotometricChannel(this->use_reflectivity_);
 
+  // Full-scale of the photometric channel; the channel is normalized by this
+  // so photometricWeight is sensor-independent (255 covers 8-bit intensity and
+  // Ouster calibrated reflectivity; use 65535 for raw 16-bit channels).
+  double photometricScale;
+  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0);
+  this->gicp.setPhotometricScale(static_cast<float>(photometricScale));
+
+  // GICP covariance regularization:
+  //   min_eig (default)    - clamp small singular values (this fork's historical
+  //                          behavior, previously mislabeled "plane")
+  //   plane                - true GICP plane-to-plane: fixed (1, 1, 1e-3) discs
+  //   normalized_min_eig   - scale-normalized clamp
+  //   frobenius | none
+  std::string regularizationMethod;
+  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"));
+  nano_gicp::RegularizationMethod reg_method = nano_gicp::RegularizationMethod::MIN_EIG;
+  if (regularizationMethod == "plane") { reg_method = nano_gicp::RegularizationMethod::PLANE; }
+  else if (regularizationMethod == "normalized_min_eig") { reg_method = nano_gicp::RegularizationMethod::NORMALIZED_MIN_EIG; }
+  else if (regularizationMethod == "frobenius") { reg_method = nano_gicp::RegularizationMethod::FROBENIUS; }
+  else if (regularizationMethod == "none") { reg_method = nano_gicp::RegularizationMethod::NONE; }
+  else if (regularizationMethod != "min_eig") {
+    RCLCPP_WARN(this->get_logger(),
+        "Unknown odom/gicp/regularizationMethod '%s'; using 'min_eig'.",
+        regularizationMethod.c_str());
+  }
+  this->gicp.setRegularizationMethod(reg_method);
+
+  // Degeneracy gate for geometrically self-similar environments (featureless
+  // tunnels/conduits): rotation/translation Hessian blocks are eigen-analyzed
+  // separately and the GICP update is projected off directions below
+  // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
+  double degeneracyThreshRatio;
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005);
+  this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
+
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
   // the background thread, so it needs the same photometric configuration.
   this->gicp_temp.setPhotometricWeight(photometricWeight);
   this->gicp_temp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
-  
+  this->gicp_temp.setPhotometricScale(static_cast<float>(photometricScale));
+  this->gicp_temp.setRegularizationMethod(reg_method);
+
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
-  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", 1,
+  // SensorDataQoS (best-effort): LiDAR drivers commonly publish sensor data
+  // best-effort; a reliable subscription would be QoS-incompatible and
+  // silently receive nothing.
+  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud",
+      rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1), lidar_sub_opt);
 
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -86,6 +136,15 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+  this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+  this->publishStaticTransforms();
+
+  // constant diagonal covariance on the published odometry (set once;
+  // the message object is reused by publishPose)
+  for (int i = 0; i < 6; i++) {
+    this->odom_ros.pose.covariance[i*7] = this->pose_cov_[i];
+    this->odom_ros.twist.covariance[i*7] = this->twist_cov_[i];
+  }
 
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&dlio::OdomNode::publishPose, this));
@@ -130,6 +189,7 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->first_scan_stamp = 0.;
   this->elapsed_time = 0.;
   this->length_traversed = 0.;
+  this->length_prev_p = Eigen::Vector3f(0., 0., 0.);
 
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
@@ -331,6 +391,15 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/gicp/rotationEpsilon", this->gicp_rotation_ep_, 0.0005);
   dlio::declare_param(this, "odom/gicp/initLambdaFactor", this->gicp_init_lambda_factor_, 1e-9);
 
+  // Published odometry covariance (diagonal: x y z roll pitch yaw).
+  // All-zero covariance makes the odometry unusable for downstream fusion
+  // (robot_localization etc. either reject it or trust it infinitely).
+  std::vector<double> cov_default{0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025};
+  dlio::declare_param(this, "odom/covariance/pose", this->pose_cov_, cov_default);
+  dlio::declare_param(this, "odom/covariance/twist", this->twist_cov_, cov_default);
+  if (this->pose_cov_.size() != 6) { this->pose_cov_ = cov_default; }
+  if (this->twist_cov_.size() != 6) { this->twist_cov_ = cov_default; }
+
   // Geometric Observer
   dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0);
   dlio::declare_param(this, "odom/geo/Kv", this->geo_Kv_, 1.0);
@@ -414,6 +483,12 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   p.pose.orientation.z = this->state.q.z();
 
   this->path_ros.poses.push_back(p);
+  // bound the path message: at scan rate an unbounded Path grows quadratically
+  // in publish bandwidth over long runs
+  if (this->path_ros.poses.size() > 10000) {
+    this->path_ros.poses.erase(this->path_ros.poses.begin(),
+                               this->path_ros.poses.begin() + 1000);
+  }
   this->path_pub->publish(this->path_ros);
 
   // transform: odom to baselink
@@ -434,8 +509,16 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
 
   br->sendTransform(transformStamped);
 
+  // baselink->imu and baselink->lidar are fixed extrinsics from YAML and are
+  // published once, latched, by the static broadcaster (see constructor).
+
+}
+
+void dlio::OdomNode::publishStaticTransforms() {
+
   // transform: baselink to imu
-  transformStamped.header.stamp = this->imu_stamp;
+  geometry_msgs::msg::TransformStamped transformStamped;
+  transformStamped.header.stamp = this->now();
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->imu_frame;
 
@@ -449,10 +532,9 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = q.y();
   transformStamped.transform.rotation.z = q.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
   // transform: baselink to lidar
-  transformStamped.header.stamp = this->imu_stamp;
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->lidar_frame;
 
@@ -466,7 +548,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = qq.y();
   transformStamped.transform.rotation.z = qq.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
 }
 
@@ -915,11 +997,17 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     this->submap_build_cv.notify_one();
   }
 
-  // Update trajectory
-  this->trajectory.push_back( std::make_pair(this->state.p, this->state.q) );
+  // Update distance traveled incrementally (replaces the unbounded trajectory
+  // vector that debug() used to re-integrate from scratch every scan)
+  double l = (this->state.p - this->length_prev_p).norm();
+  if (l >= 0.1) {
+    this->length_traversed += l;
+    this->length_prev_p = this->state.p;
+  }
 
   // Update time stamps
   this->lidar_rates.push_back( 1. / (this->scan_stamp - this->prev_scan_stamp) );
+  cap_history(this->lidar_rates);
   this->prev_scan_stamp = this->scan_stamp;
   this->elapsed_time = this->scan_stamp - this->first_scan_stamp;
 
@@ -935,6 +1023,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Update some statistics
   this->comp_times.push_back(this->now().seconds() - then);
+  cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
   // Debug statements and publish custom DLIO message
@@ -1067,6 +1156,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     double dt = imu_stamp_secs - this->prev_imu_stamp;
     if (dt == 0) { dt = 1.0/200.0; }
     this->imu_rates.push_back( 1./dt );
+    cap_history(this->imu_rates);
 
     // Apply the calibrated bias to the new IMU measurements
     this->imu_meas.stamp = imu_stamp_secs;
@@ -1117,6 +1207,17 @@ void dlio::OdomNode::getNextPose() {
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
+  // Surface degeneracy (e.g. featureless tunnel): the solver held the IMU
+  // prior along the unobservable directions; warn so the operator knows the
+  // estimate is dead-reckoning in those directions.
+  int degenerate_dirs = this->gicp.lastDegenerateDirections();
+  if (degenerate_dirs > 0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Scan-to-map registration is degenerate along %d direction(s); "
+        "holding IMU prior there (geometrically self-similar environment?)",
+        degenerate_dirs);
+  }
+
   // Get final transformation in global frame
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
@@ -1135,9 +1236,18 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
                                           boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
 
   if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    // Wait for the latest IMU data
+    // Wait (bounded) for the latest IMU data; an unbounded wait parks the
+    // odometry callback forever if the IMU stream drops mid-flight.
     std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
-    this->cv_imu_stamp.wait(lock, [this, &end_time]{ return this->imu_buffer.front().stamp >= end_time; });
+    bool imu_arrived = this->cv_imu_stamp.wait_for(lock, std::chrono::seconds(1),
+        [this, &end_time]{ return !this->imu_buffer.empty()
+                                  && this->imu_buffer.front().stamp >= end_time; });
+    if (!imu_arrived) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "Timed out waiting for IMU data covering the scan (IMU dropout?); "
+          "skipping IMU integration for this range");
+      return false;
+    }
   }
 
   auto imu_it = this->imu_buffer.begin();
@@ -1529,6 +1639,7 @@ void dlio::OdomNode::computeSpaciousness() {
 
   // push
   this->metrics.spaciousness.push_back( median_lpf );
+  cap_history(this->metrics.spaciousness);
 
 }
 
@@ -1547,6 +1658,7 @@ void dlio::OdomNode::computeDensity() {
   density_prev = density_lpf;
 
   this->metrics.density.push_back( density_lpf );
+  cap_history(this->metrics.density);
 
 }
 
@@ -1901,24 +2013,8 @@ void dlio::OdomNode::pauseSubmapBuildIfNeeded() {
 
 void dlio::OdomNode::debug() {
 
-  // Total length traversed
-  double length_traversed = 0.;
-  Eigen::Vector3f p_curr = Eigen::Vector3f(0., 0., 0.);
-  Eigen::Vector3f p_prev = Eigen::Vector3f(0., 0., 0.);
-  for (const auto& t : this->trajectory) {
-    if (p_prev == Eigen::Vector3f(0., 0., 0.)) {
-      p_prev = t.first;
-      continue;
-    }
-    p_curr = t.first;
-    double l = sqrt(pow(p_curr[0] - p_prev[0], 2) + pow(p_curr[1] - p_prev[1], 2) + pow(p_curr[2] - p_prev[2], 2));
-
-    if (l >= 0.1) {
-      length_traversed += l;
-      p_prev = p_curr;
-    }
-  }
-  this->length_traversed = length_traversed;
+  // Total length traversed is maintained incrementally in callbackPointCloud
+  double length_traversed = this->length_traversed;
 
   // Average computation time
   double avg_comp_time =
@@ -1980,6 +2076,7 @@ void dlio::OdomNode::debug() {
   this->lastSysCPU = timeSample.tms_stime;
   this->lastUserCPU = timeSample.tms_utime;
   this->cpu_percents.push_back(cpu_percent);
+  cap_history(this->cpu_percents);
   double avg_cpu_usage =
     std::accumulate(this->cpu_percents.begin(), this->cpu_percents.end(), 0.0) / this->cpu_percents.size();
 
