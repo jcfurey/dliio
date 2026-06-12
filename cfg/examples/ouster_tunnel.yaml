@@ -1,0 +1,48 @@
+# EXAMPLE: Ouster in a tunnel / geometrically self-similar environment.
+#
+# Self-contained "tunnel mode" overlay: the calibrated-reflectivity photometric
+# channel + plane regularization + the degeneracy gate, PLUS a photometric
+# weight strong enough to actually re-constrain the unobservable tunnel axis.
+#
+# Why the stronger weight: in a smooth tunnel scan-to-map registration is
+# unobservable along the tunnel axis, so the degeneracy gate holds the IMU prior
+# there. The gate ALONE is not enough — with only the default photometricWeight
+# (0.1) the held axis dead-reckons on the IMU and drifts to km-scale over a long
+# tunnel (and does so erratically run-to-run). The reflectivity photometric term
+# is what pins the axis back down; it just needs enough weight to do so.
+#
+# Evidence (06042026 Ouster tunnel, ~200 s, n=3 reps, gate fixed at 0.005):
+#   photometricWeight 0.1 -> diverged 2/3 (11 km, 9 km, ok)
+#   photometricWeight 0.3 -> stable 3/3, repeatable ~100 m path  <-- this file
+#   photometricWeight 0.5 -> bounded 3/3 but less repeatable (one ~570 m run)
+#   photometricWeight 1.0 -> regresses 1/3 (over-trusts intensity)
+# See the resple_test_ws benchmark notes (results/dliio_tunnel_sweep/NOTES.md).
+#
+# Usage (overlay on top of params.yaml; later files win):
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
+#     params_file:=$(ros2 pkg prefix direct_lidar_inertial_odometry)/share/direct_lidar_inertial_odometry/cfg/params.yaml
+#   # then append this overlay:
+#   #   --ros-args --params-file .../cfg/examples/ouster_tunnel.yaml
+#
+# Requires the driver to publish the 'reflectivity' point field (ouster-ros does
+# by default). Supersedes ouster_reflectivity.yaml for tunnel deployments.
+
+/**:
+  ros__parameters:
+    # Reflectivity photometric channel (range-normalized by the sensor; the
+    # software range correction is skipped automatically).
+    odom/gicp/photometricChannel: reflectivity
+    # Ouster calibrated reflectivity: 0-100 diffuse %, 101-255 retroreflective.
+    odom/gicp/photometricScale: 255.0
+    # Strong enough to re-constrain the tunnel axis (see evidence above).
+    odom/gicp/photometricWeight: 0.3
+
+    # Plane regularization gives the sharpest degeneracy discrimination, and the
+    # gate holds the IMU prior along the (still-detected) degenerate axis.
+    odom/gicp/regularizationMethod: plane
+    odom/gicp/degeneracyThreshRatio: 0.005
+
+    # The OS-series integrated IMU offset (from the Ouster datasheet); replace
+    # with your unit's calibration if available.
+    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]

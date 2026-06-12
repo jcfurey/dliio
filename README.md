@@ -37,6 +37,7 @@ Added `photometricHuberDelta` (default value: 0.05), `maxKeyframes` (default val
 | `cfg/dlio.yaml` | Per-robot: sensor extrinsics, IMU intrinsics, preprocessing switches. Copy per robot and pass via `robot_config:=`. |
 | `cfg/params.yaml` | Algorithm tuning: registration, keyframing, observer gains, photometric term, degeneracy gate, published covariance. Override via `params_file:=`. |
 | `cfg/examples/ouster_reflectivity.yaml` | Overlay: Ouster calibrated-reflectivity photometric channel + plane regularization for tunnel-like environments. |
+| `cfg/examples/ouster_tunnel.yaml` | Overlay: full tunnel mode — reflectivity + plane + degeneracy gate **with photometricWeight 0.3** (strong enough to re-constrain the tunnel axis; the gate alone diverges). Supersedes `ouster_reflectivity.yaml` for tunnels. |
 | `cfg/examples/simulation.yaml` | Overlay: sim time, no IMU calibration wait, ideal extrinsics. |
 
 **Launch arguments** (`dlio.launch.py`): `pointcloud_topic`, `imu_topic`, `rviz`, `use_sim_time` (default **false**; set true under Gazebo or `ros2 bag play --clock`), `robot_config`, `params_file`. Overlays can be appended at run time with `--ros-args --params-file <overlay.yaml>` (later files win).
