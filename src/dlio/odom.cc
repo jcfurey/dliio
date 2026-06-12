@@ -303,7 +303,6 @@ dlio::OdomNode::~OdomNode() {
 
   if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
-  if (this->metrics_thread.joinable()) { this->metrics_thread.join(); }
   if (this->debug_thread.joinable()) { this->debug_thread.join(); }
 
 }
@@ -1012,13 +1011,11 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     return;
   }
 
-  // Compute Metrics
-  // (join-before-respawn: the previous iteration's thread has long finished,
-  //  so join() returns immediately; keeping threads joinable lets the
-  //  destructor wait for them instead of leaking detached threads into a
-  //  destroyed node at shutdown/component unload)
-  if (this->metrics_thread.joinable()) { this->metrics_thread.join(); }
-  this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
+  // Compute Metrics (inline: cheap relative to registration, removes the
+  // data race on original_scan/metrics vectors the old worker thread had,
+  // and setAdaptiveParams below now uses THIS scan's metrics, not the
+  // previous scan's)
+  this->computeMetrics();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
@@ -1420,14 +1417,15 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it, this->gravity_);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
                                      boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                                     double gravity) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -1436,7 +1434,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
   Eigen::Vector3f p = p_init;
   Eigen::Vector3f v = v_init;
   Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
-  a[2] -= this->gravity_;
+  a[2] -= gravity;
 
   // Iterate over IMU measurements and timestamps
   auto prev_imu_it = begin_imu_it;
@@ -1459,7 +1457,14 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Average angular velocity
     Eigen::Vector3f omega = f0.ang_vel + 0.5*alpha_dt;
 
-    // Orientation
+    // Orientation at f0: the interpolation below integrates forward from
+    // here with idt measured from f0.stamp, matching how position is
+    // interpolated. Using the already-advanced q double-counted one IMU
+    // sample of rotation (a constant omega*dt attitude offset on every
+    // deskewed point). Caught by test_imu_integration.
+    Eigen::Quaternionf q0 = q;
+
+    // Orientation at f
     q = Eigen::Quaternionf (
       q.w() - 0.5*( q.x()*omega[0] + q.y()*omega[1] + q.z()*omega[2] ) * dt,
       q.x() + 0.5*( q.w()*omega[0] - q.z()*omega[1] + q.y()*omega[2] ) * dt,
@@ -1471,7 +1476,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Acceleration
     Eigen::Vector3f a0 = a;
     a = q._transformVector(f.lin_accel);
-    a[2] -= this->gravity_;
+    a[2] -= gravity;
 
     // Jerk
     Eigen::Vector3f j_dt = a - a0;
@@ -1485,12 +1490,12 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       // Average angular velocity
       Eigen::Vector3f omega_i = f0.ang_vel + 0.5*alpha*idt;
 
-      // Orientation
+      // Orientation (integrated forward from f0, like the position below)
       Eigen::Quaternionf q_i (
-        q.w() - 0.5*( q.x()*omega_i[0] + q.y()*omega_i[1] + q.z()*omega_i[2] ) * idt,
-        q.x() + 0.5*( q.w()*omega_i[0] - q.z()*omega_i[1] + q.y()*omega_i[2] ) * idt,
-        q.y() + 0.5*( q.z()*omega_i[0] + q.w()*omega_i[1] - q.x()*omega_i[2] ) * idt,
-        q.z() + 0.5*( q.x()*omega_i[1] - q.y()*omega_i[0] + q.w()*omega_i[2] ) * idt
+        q0.w() - 0.5*( q0.x()*omega_i[0] + q0.y()*omega_i[1] + q0.z()*omega_i[2] ) * idt,
+        q0.x() + 0.5*( q0.w()*omega_i[0] - q0.z()*omega_i[1] + q0.y()*omega_i[2] ) * idt,
+        q0.y() + 0.5*( q0.z()*omega_i[0] + q0.w()*omega_i[1] - q0.x()*omega_i[2] ) * idt,
+        q0.z() + 0.5*( q0.x()*omega_i[1] - q0.y()*omega_i[0] + q0.w()*omega_i[2] ) * idt
       );
       q_i.normalize();
 

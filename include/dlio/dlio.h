@@ -87,4 +87,8 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(dlio::Point,
                                  (float, time, time)
                                  (double, timestamp, timestamp))
 
+// PCL field registration above relies on this exact layout (overlapping
+// union members registered by offset); fail loudly if the struct changes.
+static_assert(sizeof(dlio::Point) == 32, "dlio::Point layout changed; update PCL field registration");
+
 typedef dlio::Point PointType;

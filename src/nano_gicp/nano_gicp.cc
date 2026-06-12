@@ -42,7 +42,6 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_use_reflectivity_ = false;
   this->photometric_scale_ = 255.0f;
   this->photometric_huber_delta_ = 0.05f;
-  this->intensity_gradient_threshold_ = 1e-6;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->last_degenerate_directions_ = 0;
 }
@@ -263,7 +262,7 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
   intensity_variance /= found_neighbors;
 
   // Reject if the channel is too uniform
-  if (intensity_variance < intensity_gradient_threshold_) {
+  if (intensity_variance < kGradientVarianceFloor) {
       return false;
   }
   
@@ -288,7 +287,7 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
   
   // Reject unreasonably large or small gradients
   float gradient_mag = gradient.norm();
-  if (gradient_mag > 100.0f || gradient_mag < intensity_gradient_threshold_) {
+  if (gradient_mag > kGradientMagMax || gradient_mag < kGradientMagMin) {
       return false;
   }
   
@@ -313,17 +312,41 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     this->converged_ = false;
     this->last_degenerate_directions_ = 0;
 
+    // Step acceptance (retrospective LM-style damping): the plain GN loop
+    // took every step unconditionally -- on an ill-conditioned submap a bad
+    // step just got worse until NaN. Track the cost; if the last step
+    // increased it, revert the pose and retry with stronger damping.
+    const double base_lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
+    constexpr double kLambdaScale = 10.0;
+    constexpr double kLambdaMax = 1e6;
+    double lambda = base_lambda;
+    double prev_cost = std::numeric_limits<double>::max();
+    Eigen::Isometry3f prev_trans = trans;
+
     for (int i = 0; i < this->max_iterations_; ++i) {
         update_correspondences(trans);
 
         // Accumulated, solved, and gated in double; see linearize() for why.
         Eigen::Matrix<double, 6, 6> H;
         Eigen::Matrix<double, 6, 1> b;
+        double cost = 0.0;
 
-        linearize(trans, &H, &b);
+        linearize(trans, &H, &b, &cost);
 
-        // Add regularization
-        double lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
+        if (cost > prev_cost) {
+            // last step made things worse: revert it and damp harder
+            trans = prev_trans;
+            lambda *= kLambdaScale;
+            if (lambda > kLambdaMax) { break; }  // no progress possible
+            update_correspondences(trans);
+            linearize(trans, &H, &b, &cost);
+        } else {
+            lambda = std::max(lambda / kLambdaScale, base_lambda);
+        }
+        prev_cost = cost;
+        prev_trans = trans;
+
+        // Add regularization / damping
         H.diagonal().array() += lambda;
 
         Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(-b);
@@ -432,7 +455,8 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::linearize(
     const Eigen::Isometry3f& trans,
     Eigen::Matrix<double, 6, 6>* H,
-    Eigen::Matrix<double, 6, 1>* b) {
+    Eigen::Matrix<double, 6, 1>* b,
+    double* cost) {
     
     H->setZero();
     b->setZero();
@@ -443,11 +467,12 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     // near-singular Hessians the degeneracy gate has to discriminate.
     std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
     std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
+    double cost_sum = 0.0;
     
     bool use_photometric = (photometric_weight_ > 1e-8)
         && target_intensity_gradients_ && !target_intensity_gradients_->empty();
     
-    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum)
     for(int i = 0; i < input_->size(); ++i) {
         int thread_num = omp_get_thread_num();
         int target_index = correspondences_[i];
@@ -473,6 +498,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         
         H_private[thread_num] += (J_geometric.transpose() * M * J_geometric).cast<double>();
         b_private[thread_num] += (J_geometric.transpose() * M * residual).cast<double>();
+        cost_sum += residual.transpose() * M * residual;
         
         // Photometric term (channel normalized by photometric_scale_ to match
         // the units the target gradients were estimated in)
@@ -482,7 +508,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
             float intensity_diff = (src_val - tgt_val) / photometric_scale_;
             Eigen::Vector3f gradient = (*target_intensity_gradients_)[target_index];
             
-            if (gradient.norm() > 1e-6 && gradient.norm() < 100.0f) {
+            if (gradient.norm() > kGradientMagMin && gradient.norm() < kGradientMagMax) {
                 // Residual is (I_src - I_tgt); its Jacobian w.r.t. the (left-perturbation)
                 // pose is d/dθ (I_src - I_tgt(x)) = -gᵀ·dx/dθ = [ gᵀ·skew(x) | -gᵀ ].
                 // (Must match the geometric term's convention or the photometric step
@@ -502,6 +528,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 }
                 H_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
                 b_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
+                cost_sum += weight * intensity_diff * intensity_diff;
             }
         }
     }
@@ -510,6 +537,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         (*H) += H_private[i];
         (*b) += b_private[i];
     }
+    if (cost != nullptr) { *cost = cost_sum; }
 }
 
 template <typename PointSource, typename PointTarget>
