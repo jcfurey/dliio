@@ -22,6 +22,7 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 
@@ -125,6 +126,12 @@ private:
 
   void debug();
 
+  // Publish a diagnostic_msgs/DiagnosticArray on /diagnostics once per scan.
+  // Mirrors RESPLE's /diagnostics so the same capture/plot tooling works;
+  // published independently of the ANSI dashboard (debug() is gated on
+  // dashboard_, diagnostics should flow regardless).
+  void publishDiagnostics();
+
   rclcpp::TimerBase::SharedPtr publish_timer;
 
   // Subscribers
@@ -139,6 +146,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub;
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
@@ -308,6 +316,18 @@ private:
   std::vector<double> cpu_percents;
   clock_t lastCPU, lastSysCPU, lastUserCPU;
   int numProcessors;
+
+  // Degeneracy-gate activity, written only on the scan thread in getNextPose()
+  // and read by publishDiagnostics(): directions held to the IMU prior this
+  // scan, and the cumulative count of scans where the gate fired.
+  int loc_gate_axes_current_ = 0;
+  uint64_t loc_gate_updates_cumulative_ = 0;
+
+  // Separate CPU-time baseline for publishDiagnostics() so its utilization
+  // delta is independent of debug()'s (each maintains its own since-last-call
+  // window); -1 sentinel until the first sample.
+  clock_t lastCPU_diag_ = -1, lastSysCPU_diag_ = 0, lastUserCPU_diag_ = 0;
+  std::vector<double> cpu_percents_diag_;
 
   // Parameters
   std::string version_;

@@ -152,6 +152,10 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->kf_pose_pub  = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+  // Absolute /diagnostics (unlike the relative pubs above, this is NOT remapped
+  // by the launch file) so the standard diagnostics topic always lands at /diagnostics.
+  this->diag_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS(10).best_effort());
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
@@ -1090,6 +1094,9 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
+  // Publish /diagnostics every scan (independent of the dashboard toggle below).
+  this->publishDiagnostics();
+
   // Terminal dashboard (odom/debug/dashboard); disable under launch files,
   // containers, or logging setups where the ANSI clear-screen output garbles
   // multiplexed logs.
@@ -1279,7 +1286,11 @@ void dlio::OdomNode::getNextPose() {
   // prior along the unobservable directions; warn so the operator knows the
   // estimate is dead-reckoning in those directions.
   int degenerate_dirs = this->gicp.lastDegenerateDirections();
+  // Snapshot for /diagnostics (publishDiagnostics reads these on the same
+  // scan thread): directions held this scan + cumulative scans the gate fired.
+  this->loc_gate_axes_current_ = degenerate_dirs;
   if (degenerate_dirs > 0) {
+    ++this->loc_gate_updates_cumulative_;
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
         "Scan-to-map registration is degenerate along %d direction(s); "
         "holding IMU prior there (geometrically self-similar environment?)",
@@ -2139,6 +2150,118 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
 void dlio::OdomNode::pauseSubmapBuildIfNeeded() {
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(this->main_loop_running_mutex);
   this->submap_build_cv.wait(lock, [this]{ return !this->main_loop_running; });
+}
+
+void dlio::OdomNode::publishDiagnostics() {
+
+  // Computation time (ms): last / avg / max over the retained window.
+  double comp_last = 0.0, comp_avg = 0.0, comp_max = 0.0;
+  if (!this->comp_times.empty()) {
+    comp_last = this->comp_times.back() * 1000.;
+    comp_avg = std::accumulate(this->comp_times.begin(), this->comp_times.end(), 0.0)
+               / this->comp_times.size() * 1000.;
+    comp_max = *std::max_element(this->comp_times.begin(), this->comp_times.end()) * 1000.;
+  }
+
+  // Sensor rates (Hz), averaged over the most recent window (mirrors debug()).
+  const int win = 100;
+  auto avg_tail = [win](const std::vector<double>& v) -> double {
+    if (v.empty()) return 0.0;
+    if ((int)v.size() < win) return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+    return std::accumulate(v.end() - win, v.end(), 0.0) / win;
+  };
+  double imu_rate = avg_tail(this->imu_rates);
+  double lidar_rate = avg_tail(this->lidar_rates);
+
+  // RAM (resident set, MB) from /proc/self/stat.
+  double resident_mb = 0.0;
+  {
+    std::ifstream stat_stream("/proc/self/stat", std::ios_base::in);
+    std::string ignore;
+    unsigned long vsize = 0; long rss = 0;
+    // fields: pid comm state ppid pgrp session tty_nr tpgid flags minflt
+    //         cminflt majflt cmajflt utime stime cutime cstime priority
+    //         nice num_threads itrealvalue starttime vsize rss
+    for (int i = 0; i < 22; ++i) stat_stream >> ignore;
+    stat_stream >> vsize >> rss;
+    long page_kb = sysconf(_SC_PAGE_SIZE) / 1024;
+    resident_mb = (rss * page_kb) / 1000.;
+  }
+
+  // CPU utilization since the previous diagnostics publish (own baseline so it
+  // does not consume debug()'s since-last-call window).
+  double cpu_percent = 0.0, cores = 0.0;
+  {
+    struct tms t; clock_t now = times(&t);
+    if (this->lastCPU_diag_ != (clock_t)-1 && now > this->lastCPU_diag_ &&
+        t.tms_stime >= this->lastSysCPU_diag_ && t.tms_utime >= this->lastUserCPU_diag_) {
+      cpu_percent = (double)((t.tms_stime - this->lastSysCPU_diag_) +
+                             (t.tms_utime - this->lastUserCPU_diag_));
+      cpu_percent /= (now - this->lastCPU_diag_);
+      cpu_percent /= this->numProcessors;
+      cpu_percent *= 100.;
+      cores = (cpu_percent / 100.) * this->numProcessors;
+    }
+    this->lastCPU_diag_ = now;
+    this->lastSysCPU_diag_ = t.tms_stime;
+    this->lastUserCPU_diag_ = t.tms_utime;
+  }
+
+  diagnostic_msgs::msg::DiagnosticArray arr;
+  arr.header.stamp = this->scan_header_stamp;
+  arr.header.frame_id = this->odom_frame;
+
+  diagnostic_msgs::msg::DiagnosticStatus st;
+  st.name = "DLIO Odometry";          // capture tooling filters on substring "DLIO"
+  st.hardware_id = "DLIO";
+
+  auto kv = [&st](const std::string& key, const std::string& value) {
+    diagnostic_msgs::msg::KeyValue pair;
+    pair.key = key; pair.value = value;
+    st.values.push_back(pair);
+  };
+  auto fnum = [](double v, int prec = 3) {
+    std::ostringstream os; os << std::fixed << std::setprecision(prec) << v; return os.str();
+  };
+
+  // Health: WARN while the degeneracy gate is active or the per-scan budget
+  // (the LiDAR period) is blown; ERROR if GICP failed to converge.
+  double scan_period_ms = (lidar_rate > 0.0) ? 1000.0 / lidar_rate : 0.0;
+  if (!this->gicp_hasConverged.load()) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    st.message = "GICP did not converge";
+  } else if (this->loc_gate_axes_current_ > 0) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    st.message = "Degenerate along " + std::to_string(this->loc_gate_axes_current_) +
+                 " direction(s); holding IMU prior";
+  } else if (scan_period_ms > 0.0 && comp_last > scan_period_ms) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    st.message = "Computation time exceeds scan period";
+  } else {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    st.message = "OK";
+  }
+
+  kv("Computation Time (ms)", fnum(comp_last, 2));
+  kv("Avg Computation Time (ms)", fnum(comp_avg, 2));
+  kv("Max Computation Time (ms)", fnum(comp_max, 2));
+  kv("CPU Load (%)", fnum(cpu_percent, 1));
+  kv("Cores Utilized", fnum(cores, 2));
+  kv("RAM Allocation (MB)", fnum(resident_mb, 1));
+  kv("LiDAR Rate (Hz)", fnum(lidar_rate, 2));
+  kv("IMU Rate (Hz)", fnum(imu_rate, 2));
+  kv("Distance Traveled (m)", fnum(this->length_traversed, 3));
+  kv("Keyframes", std::to_string(this->keyframes.size()));
+  kv("Deskewed Points", std::to_string(this->deskew_size.load()));
+  kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
+  kv("Degenerate Directions (current)", std::to_string(this->loc_gate_axes_current_));
+  kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
+  kv("Photometric Active", this->photometric_active_ ? "1" : "0");
+  kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
+  kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
+
+  arr.status.push_back(st);
+  this->diag_pub->publish(arr);
 }
 
 void dlio::OdomNode::debug() {
