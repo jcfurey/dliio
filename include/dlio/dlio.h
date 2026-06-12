@@ -45,7 +45,10 @@ std::string to_string_with_precision(const T a_value, const int n = 6)
 #include <boost/format.hpp>
 
 // PCL
+// (also passed on the command line by CMake; guard to avoid redefinition warnings)
+#ifndef PCL_NO_PRECOMPILE
 #define PCL_NO_PRECOMPILE
+#endif
 
 // DLIO
 #include <nano_gicp/nano_gicp.h>

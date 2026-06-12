@@ -76,8 +76,7 @@ target_include_directories(nanoflann PUBLIC
 target_link_libraries(nanoflann PUBLIC ${PCL_LIBRARIES})
 
 # NanoGICP
-add_library(nano_gicp STATIC 
-  src/nano_gicp/lsq_registration.cc
+add_library(nano_gicp STATIC
   src/nano_gicp/nano_gicp.cc
 )
 target_compile_definitions(nano_gicp PRIVATE PCL_NO_PRECOMPILE)

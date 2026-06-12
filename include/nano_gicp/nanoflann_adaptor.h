@@ -156,7 +156,7 @@ int KdTreeFLANN<PointT>::radiusSearch(const PointT &point, double radius,
                               std::vector<int> &k_indices,
                               std::vector<float> &k_sqr_distances) const
 {
-  static std::vector<std::pair<int, float> > indices_dist;
+  std::vector<std::pair<int, float> > indices_dist;
   indices_dist.reserve( 128 );
 
   RadiusResultSet<float, int> resultSet(radius, indices_dist);
