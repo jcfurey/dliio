@@ -68,12 +68,29 @@
     odom/gicp/gradientKNeighbors: 10
 
     # Degeneracy gate (solution remapping) for geometrically self-similar
-    # environments such as featureless tunnels/conduits: GICP Hessian
-    # eigen-directions with eigenvalue < ratio * lambda_max are excluded from
-    # the update, holding the IMU prior along unobservable directions instead
-    # of amplifying noise. Raise (e.g. 1e-4) to gate earlier/more aggressively;
-    # 0.0 disables the gate entirely.
-    odom/gicp/degeneracyThreshRatio: 1.0e-6
+    # environments such as featureless tunnels/conduits: the rotation and
+    # translation blocks of the GICP Hessian are eigen-analyzed separately and
+    # the update is projected off directions with eigenvalue below
+    # ratio * block_lambda_max, holding the IMU prior along unobservable
+    # directions instead of amplifying noise. Raise (e.g. 0.02) to gate
+    # earlier/more aggressively; 0.0 disables the gate entirely.
+    # Most discriminative with regularizationMethod: plane.
+    odom/gicp/degeneracyThreshRatio: 0.005
+
+    # GICP covariance regularization:
+    #   min_eig (default)  - clamp small covariance singular values: this
+    #                        fork's historical behavior (was mislabeled
+    #                        "plane" internally)
+    #   plane              - true GICP plane-to-plane (fixed 1,1,1e-3 discs;
+    #                        scale-free, recommended for tunnel/degenerate
+    #                        environments together with the gate above)
+    #   normalized_min_eig | frobenius | none
+    odom/gicp/regularizationMethod: min_eig
+
+    # Full-scale of the photometric channel; the channel is divided by this so
+    # photometricWeight is sensor-independent. 255 covers 8-bit intensity and
+    # Ouster calibrated reflectivity; use 65535 for raw 16-bit channels.
+    odom/gicp/photometricScale: 255.0
     
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25

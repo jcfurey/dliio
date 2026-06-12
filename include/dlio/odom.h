@@ -151,9 +151,9 @@ private:
   std::thread metrics_thread;
   std::thread debug_thread;
 
-  // Trajectory
-  std::vector<std::pair<Eigen::Vector3f, Eigen::Quaternionf>> trajectory;
+  // Distance traveled (maintained incrementally in callbackPointCloud)
   double length_traversed;
+  Eigen::Vector3f length_prev_p;
 
   // Keyframes
   std::vector<std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,

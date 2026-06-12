@@ -16,9 +16,13 @@ Added `photometricChannel` (default value: `intensity`) to cfg/params.yaml.
 
 Selects which point field feeds the photometric GICP term: `intensity` (raw return strength, range-dependent, range correction applied) or `reflectivity` (calibrated, range-normalized — e.g. Ouster; range correction is skipped). The input cloud must carry the chosen field.
 
-Added `degeneracyThreshRatio` (default value: 1.0e-6) to cfg/params.yaml.
+Added `degeneracyThreshRatio` (default value: 0.005) to cfg/params.yaml.
 
-In geometrically self-similar environments (a featureless conduit/tunnel is the canonical case) scan-to-map registration is unobservable along one or more directions — for a smooth tunnel, translation along its axis. The registration Hessian is eigen-analyzed every iteration and directions whose eigenvalue falls below `degeneracyThreshRatio * lambda_max` are excluded from the update (solution remapping, Zhang/Kaess/Singh ICRA 2016), so the IMU prior is held there instead of being overwritten by noise. If the photometric term finds usable intensity texture (seams, joints, stains), it re-constrains those directions automatically. A throttled warning is logged while degeneracy is active. See `doc/REVIEW.md` §II.4 and `doc/REFERENCES.md`.
+In geometrically self-similar environments (a featureless conduit/tunnel is the canonical case) scan-to-map registration is unobservable along one or more directions — for a smooth tunnel, translation along its axis. The rotation and translation blocks of the registration Hessian are eigen-analyzed separately every iteration and the update is projected off directions whose eigenvalue falls below `degeneracyThreshRatio * block_lambda_max` (solution remapping, Zhang/Kaess/Singh ICRA 2016), so the IMU prior is held there instead of being overwritten by noise. If the photometric term finds usable intensity texture (seams, joints, stains), it re-constrains those directions automatically. A throttled warning is logged while degeneracy is active. Pair with `regularizationMethod: plane` for the sharpest degeneracy discrimination. See `doc/REVIEW.md` §II.4 and `doc/REFERENCES.md`.
+
+Added `regularizationMethod` (default value: `min_eig`) and `photometricScale` (default value: 255.0) to cfg/params.yaml.
+
+`regularizationMethod` selects the GICP covariance regularization: `min_eig` preserves this fork's historical behavior (clamped singular values, previously mislabeled "plane" internally); `plane` is true GICP plane-to-plane (fixed scale-free discs, recommended for degenerate environments). `photometricScale` is the full-scale value of the photometric channel — the channel is normalized by it so `photometricWeight` is dimensionless and transfers across sensors (255 covers 8-bit intensity and Ouster calibrated reflectivity; 65535 for raw 16-bit channels).
 
 ---
 

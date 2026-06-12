@@ -29,7 +29,9 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->num_threads_ = omp_get_max_threads();
   this->k_correspondences_ = 20;
   this->corr_dist_threshold_ = std::numeric_limits<float>::max();
-  this->regularization_method_ = RegularizationMethod::PLANE;
+  // MIN_EIG preserves this fork's historical (mislabeled-as-PLANE) behavior;
+  // see calculate_covariances for the honest PLANE option.
+  this->regularization_method_ = RegularizationMethod::MIN_EIG;
   this->max_iterations_ = 64;
   this->transformation_epsilon_ = 1e-4;
   this->rotation_epsilon_ = 1e-4;
@@ -37,8 +39,9 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_weight_ = 0.0f;
   this->gradient_k_neighbors_ = 10;
   this->photometric_use_reflectivity_ = false;
+  this->photometric_scale_ = 255.0f;
   this->intensity_gradient_threshold_ = 1e-6;
-  this->degeneracy_thresh_ratio_ = 1e-6f;
+  this->degeneracy_thresh_ratio_ = 0.005f;
   this->last_degenerate_directions_ = 0;
 }
 
@@ -88,6 +91,11 @@ void NanoGICP<PointSource, PointTarget>::setGradientKNeighbors(int k) {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricChannel(bool use_reflectivity) {
     this->photometric_use_reflectivity_ = use_reflectivity;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setPhotometricScale(float scale) {
+    this->photometric_scale_ = (scale > 0.f) ? scale : 1.0f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -207,10 +215,14 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
     return false;
   }
   
-  // Read whichever channel (intensity or reflectivity) is selected.
+  // Read whichever channel (intensity or reflectivity) is selected, normalized
+  // by photometric_scale_ so gradients/residuals are dimensionless and
+  // photometricWeight transfers across sensors (0-255 intensity, uint16
+  // reflectivity, float channels...).
   const bool use_refl = this->photometric_use_reflectivity_;
-  auto chan = [use_refl](const PointTarget& p) {
-    return use_refl ? p.reflectivity : p.intensity;
+  const float inv_scale = 1.0f / this->photometric_scale_;
+  auto chan = [use_refl, inv_scale](const PointTarget& p) {
+    return (use_refl ? p.reflectivity : p.intensity) * inv_scale;
   };
 
   Eigen::MatrixXf A(found_neighbors, 4);
@@ -306,33 +318,49 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         float lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
         H.diagonal().array() += lambda;
 
-        // Degeneracy-aware solve (solution remapping, Zhang/Kaess/Singh ICRA'16):
-        // solve only in the well-conditioned eigen-subspace of H. In a featureless
-        // tunnel the Hessian is rank-deficient along the tunnel axis; a plain
-        // solve amplifies noise into large updates along exactly that axis,
-        // overwriting the IMU prior with garbage. Zeroing the step in degenerate
-        // directions keeps the prior (i.e. the guess) there instead. If the
-        // photometric term constrains the axis, its contribution to H makes the
-        // direction well-conditioned again and the update passes through.
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<float, 6, 6>> eig(H);
-        const Eigen::Matrix<float, 6, 1>& evals = eig.eigenvalues();   // ascending
-        const Eigen::Matrix<float, 6, 6>& evecs = eig.eigenvectors();
-
-        const float eval_thresh = degeneracy_thresh_ratio_ * evals(5);
-        Eigen::Matrix<float, 6, 1> dx = Eigen::Matrix<float, 6, 1>::Zero();
-        int degenerate = 0;
-        for (int k = 0; k < 6; ++k) {
-            if (evals(k) > eval_thresh && evals(k) > 0.f) {
-                dx += evecs.col(k) * (evecs.col(k).dot(-b) / evals(k));
-            } else {
-                ++degenerate;
-            }
-        }
-        this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
+        Eigen::Matrix<float, 6, 1> dx = H.ldlt().solve(-b);
 
         if(dx.hasNaN() || !dx.allFinite()) {
             break;
         }
+
+        // Degeneracy gating (solution remapping, Zhang/Kaess/Singh ICRA'16):
+        // in a featureless tunnel the problem is unobservable along the tunnel
+        // axis and the solve above pours correspondence-snapping noise into
+        // exactly that direction, overwriting the IMU prior. Analyze the
+        // rotation (H[0:3,0:3], rad^2-scaled) and translation (H[3:6,3:6], m^2)
+        // blocks SEPARATELY -- a single threshold across the full 6x6 is
+        // meaningless because the two blocks have different units and the
+        // rotation block additionally scales with the lever arm (range^2).
+        // Project the solution off the weak eigen-directions of each block so
+        // the initial guess (IMU prior) is held there. A photometric term that
+        // constrains the axis stiffens the block and re-opens the gate.
+        // NOTE: discrimination is strongest with regularizationMethod 'plane'
+        // (scale-free covariance discs); 'min_eig' covariances add artificial
+        // in-plane stiffness that partially masks the degeneracy.
+        int degenerate = 0;
+        if (degeneracy_thresh_ratio_ > 0.f) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig_rr(H.template block<3, 3>(0, 0));
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig_tt(H.template block<3, 3>(3, 3));
+
+            const float rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
+            for (int k = 0; k < 3; ++k) {
+                if (eig_rr.eigenvalues()(k) <= rr_thresh) {
+                    const Eigen::Vector3f v = eig_rr.eigenvectors().col(k);
+                    dx.head<3>() -= v * v.dot(dx.head<3>());
+                    ++degenerate;
+                }
+            }
+            const float tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
+            for (int k = 0; k < 3; ++k) {
+                if (eig_tt.eigenvalues()(k) <= tt_thresh) {
+                    const Eigen::Vector3f v = eig_tt.eigenvectors().col(k);
+                    dx.tail<3>() -= v * v.dot(dx.tail<3>());
+                    ++degenerate;
+                }
+            }
+        }
+        this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
 
         // Apply transformation update
         trans.prerotate(Eigen::AngleAxisf(dx[2], Eigen::Vector3f::UnitZ()));
@@ -428,11 +456,12 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         H_private[thread_num] += J_geometric.transpose() * M * J_geometric;
         b_private[thread_num] += J_geometric.transpose() * M * residual;
         
-        // Photometric term
+        // Photometric term (channel normalized by photometric_scale_ to match
+        // the units the target gradients were estimated in)
         if (use_photometric && (*gradient_valid_)[target_index]) {
             float src_val = photometric_use_reflectivity_ ? source_pt.reflectivity : source_pt.intensity;
             float tgt_val = photometric_use_reflectivity_ ? target_pt.reflectivity : target_pt.intensity;
-            float intensity_diff = src_val - tgt_val;
+            float intensity_diff = (src_val - tgt_val) / photometric_scale_;
             Eigen::Vector3f gradient = (*target_intensity_gradients_)[target_index];
             
             if (gradient.norm() > 1e-6 && gradient.norm() < 100.0f) {
@@ -506,16 +535,41 @@ void NanoGICP<PointSource, PointTarget>::calculate_covariances(
 
         Eigen::Matrix4f cov = (centered * centered.transpose()) / static_cast<float>(found);
         cov(3, 3) = 1.0;
-        
-        if(regularization_method_ == RegularizationMethod::PLANE) {
+
+        // NOTE: this rewrite historically labeled its clamped-singular-value
+        // regularization "PLANE"; true GICP plane-to-plane (fast_gicp) replaces
+        // the singular values with the fixed, scale-free (1, 1, 1e-3). Both are
+        // available; MIN_EIG preserves the behavior this fork was tuned on.
+        switch (regularization_method_) {
+          case RegularizationMethod::PLANE: {
+            Eigen::JacobiSVD<Eigen::Matrix3f> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU);
+            Eigen::Vector3f values(1.0f, 1.0f, 1e-3f);
+            cov.block<3, 3>(0, 0) = svd.matrixU() * values.asDiagonal() * svd.matrixU().transpose();
+            break;
+          }
+          case RegularizationMethod::MIN_EIG: {
             Eigen::JacobiSVD<Eigen::Matrix3f> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU);
             Eigen::Vector3f values = svd.singularValues();
-            values(2) = std::max(values(2), 0.001f);
+            values = values.array().max(0.001f);
             cov.block<3, 3>(0, 0) = svd.matrixU() * values.asDiagonal() * svd.matrixU().transpose();
-        } else {
+            break;
+          }
+          case RegularizationMethod::NORMALIZED_MIN_EIG: {
+            Eigen::JacobiSVD<Eigen::Matrix3f> svd(cov.block<3, 3>(0, 0), Eigen::ComputeFullU);
+            Eigen::Vector3f values = svd.singularValues() / svd.singularValues().maxCoeff();
+            values = values.array().max(1e-3f);
+            cov.block<3, 3>(0, 0) = svd.matrixU() * values.asDiagonal() * svd.matrixU().transpose();
+            break;
+          }
+          case RegularizationMethod::FROBENIUS: {
             cov.block<3, 3>(0, 0) += Eigen::Matrix3f::Identity() * 0.001f;
+            break;
+          }
+          case RegularizationMethod::NONE:
+          default:
+            break;
         }
-        
+
         covs[i] = cov;
     }
 
