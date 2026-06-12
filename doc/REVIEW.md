@@ -65,6 +65,21 @@ This repo's approach — a per-point photometric residual added directly into th
 20. **`clamp(..., 0, 255)` bakes in an 8-bit assumption.** Ouster calibrated reflectivity is uint16 (0–65535) with values >255 for retroreflectors — precisely the most informative landmarks — and the reflectivity path copies the raw uint16 then later clamps photometric inputs as if 8-bit. Retroreflective signs saturate to the same value as white paint.
 21. **The α=2 inverse-square default contradicts the near-range literature** (≈exponential below ~10 m, per the radiometric review) — fine as a default, but `intensityRRef: 1.0` meters anchors the correction in exactly the regime where the model is worst. A README sentence noting "calibrate α on your sensor, anchor R_ref in mid-range" would save users a bad week.
 
+### II.4 The featureless-conduit scenario (degeneracy)
+
+A smooth, geometrically self-similar tunnel is the canonical failure case for any LiDAR odometry, and the *stated reason this intensity fork exists*. Walking through what this codebase did in that scenario before mitigation:
+
+1. **Geometry:** every scan of a featureless cylinder looks identical under translation along the axis (and rotation about it, for a circular section). The GICP Hessian `H` is rank-deficient in those directions; with only `λ = 1e-9` added to the diagonal, `H.ldlt().solve(-b)` produced *some* finite step along the axis — pure noise amplification, applied at full confidence, every iteration, overwriting the one good source of axis information (the IMU prior that DLIO's observer exists to provide). The failure mode is not "drifts slowly like dead reckoning"; it's "jumps randomly along the tunnel."
+2. **Intensity (the intended rescue):** in a concrete conduit, most neighborhoods are intensity-uniform → the variance gate rejects them (correctly). The informative exceptions — pipe joints, seams, stains, markings — are exactly what should constrain the axis. But the world-frame `AᵀA` conditioning bug (§II.1.5) meant gradient validity *also* decayed with distance into the tunnel, i.e. the feature switched itself off precisely where it was needed. And with unnormalized units (§II.1.6), `photometricWeight: 0.1` against tunnel-scale geometric weights may contribute negligibly even when gradients survive.
+3. **No introspection:** nothing measured or reported observability, so the operator learned about the degeneracy from the map.
+
+**Mitigation now implemented (this branch):**
+- `computeTransformation()` performs **solution remapping** (Zhang, Kaess & Singh, ICRA 2016): eigendecompose `H` each iteration, solve only in the well-conditioned eigen-subspace (`λᵢ > degeneracyThreshRatio · λ_max`, param `odom/gicp/degeneracyThreshRatio`, default `1e-6`), zero the step in degenerate directions. Held directions keep the initial guess — the IMU prior — so the tunnel axis degrades to *honest dead reckoning* instead of noise. Because the photometric term contributes to `H`, any usable intensity texture re-constrains the axis and the gate opens automatically — the COIN-LIO complementarity argument, in its cheapest possible form.
+- The intensity-gradient solve is now **centered on the query point**, fixing §II.1.5 so gradient validity no longer decays with distance from origin — deep-tunnel seams stay usable.
+- The odometry node logs a **throttled warning** with the number of degenerate directions while the gate is active.
+
+**What this does *not* solve** (and what a serious tunnel deployment still needs): unnormalized photometric units (§II.1.6) mean the re-constraint strength is sensor-specific; there is no robust kernel, so one specular surprise can still bend the only constrained measurement; the observer's accel-bias estimate goes unobservable along the axis during extended degeneracy (bias drift compounds the dead reckoning); and a wheel/leg odometry or barometric prior would bound the axis error the way COIN-LIO's patch selection bounds it photometrically. Validation needs a tunnel bag — simulated conduit in Gazebo (`gz_sensors_ouster` with intensity) is the cheapest start.
+
 ---
 
 ## Part III — The roast: ROS 2 modernity

@@ -1,5 +1,6 @@
 #include "nano_gicp/nano_gicp.h"
 #include "dlio/dlio.h"
+#include <algorithm>
 #include <omp.h>
 #include <Eigen/Dense>
 #include <pcl/common/transforms.h>
@@ -36,6 +37,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->gradient_k_neighbors_ = 10;
   this->photometric_use_reflectivity_ = false;
   this->intensity_gradient_threshold_ = 1e-6;
+  this->degeneracy_thresh_ratio_ = 1e-6f;
+  this->last_degenerate_directions_ = 0;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -84,6 +87,16 @@ void NanoGICP<PointSource, PointTarget>::setGradientKNeighbors(int k) {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricChannel(bool use_reflectivity) {
     this->photometric_use_reflectivity_ = use_reflectivity;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setDegeneracyThreshRatio(float ratio) {
+    this->degeneracy_thresh_ratio_ = ratio;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastDegenerateDirections() const {
+    return this->last_degenerate_directions_;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -173,12 +186,19 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
   Eigen::MatrixXf A(found_neighbors, 4);
   Eigen::VectorXf i(found_neighbors);
 
+  // Solve in coordinates centered on the query point: the gradient is
+  // translation-invariant, but with absolute world coordinates cond(AtA)
+  // grows ~ ||x||^4, so the condition-number rejection below would fire
+  // based on distance from the map origin rather than surface geometry
+  // (the photometric term would silently fade out as the map grows).
+  const auto& query_pt = this->target_->at(target_index);
+
   float mean_intensity = 0.0f;
   for (int j = 0; j < found_neighbors; ++j) {
     const auto& pt = this->target_->at(nn_indices[j]);
-    A(j, 0) = pt.x;
-    A(j, 1) = pt.y;
-    A(j, 2) = pt.z;
+    A(j, 0) = pt.x - query_pt.x;
+    A(j, 1) = pt.y - query_pt.y;
+    A(j, 2) = pt.z - query_pt.z;
     A(j, 3) = 1.0f;
     i(j) = chan(pt);
     mean_intensity += chan(pt);
@@ -229,23 +249,47 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
 template<typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::computeTransformation(
     PointCloudSource& output, const Eigen::Matrix4f& guess) {
-    
+
     Eigen::Isometry3f trans = Eigen::Isometry3f::Identity();
     trans.matrix() = guess;
-    
+
+    this->last_degenerate_directions_ = 0;
+
     for (int i = 0; i < this->max_iterations_; ++i) {
         update_correspondences(trans);
-        
+
         Eigen::Matrix<float, 6, 6> H;
         Eigen::Matrix<float, 6, 1> b;
-        
+
         linearize(trans, &H, &b);
-        
+
         // Add regularization
         float lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
         H.diagonal().array() += lambda;
-        
-        Eigen::Matrix<float, 6, 1> dx = H.ldlt().solve(-b);
+
+        // Degeneracy-aware solve (solution remapping, Zhang/Kaess/Singh ICRA'16):
+        // solve only in the well-conditioned eigen-subspace of H. In a featureless
+        // tunnel the Hessian is rank-deficient along the tunnel axis; a plain
+        // solve amplifies noise into large updates along exactly that axis,
+        // overwriting the IMU prior with garbage. Zeroing the step in degenerate
+        // directions keeps the prior (i.e. the guess) there instead. If the
+        // photometric term constrains the axis, its contribution to H makes the
+        // direction well-conditioned again and the update passes through.
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix<float, 6, 6>> eig(H);
+        const Eigen::Matrix<float, 6, 1>& evals = eig.eigenvalues();   // ascending
+        const Eigen::Matrix<float, 6, 6>& evecs = eig.eigenvectors();
+
+        const float eval_thresh = degeneracy_thresh_ratio_ * evals(5);
+        Eigen::Matrix<float, 6, 1> dx = Eigen::Matrix<float, 6, 1>::Zero();
+        int degenerate = 0;
+        for (int k = 0; k < 6; ++k) {
+            if (evals(k) > eval_thresh && evals(k) > 0.f) {
+                dx += evecs.col(k) * (evecs.col(k).dot(-b) / evals(k));
+            } else {
+                ++degenerate;
+            }
+        }
+        this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
 
         if(dx.hasNaN() || !dx.allFinite()) {
             break;

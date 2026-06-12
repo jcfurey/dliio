@@ -59,7 +59,14 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->gicp.setPhotometricWeight(photometricWeight);
   this->gicp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp.setPhotometricChannel(this->use_reflectivity_);
-  
+
+  // Degeneracy gate for geometrically self-similar environments (featureless
+  // tunnels/conduits): Hessian eigen-directions below ratio * lambda_max are
+  // excluded from the GICP update so the IMU prior is held there. 0 disables.
+  double degeneracyThreshRatio;
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 1.0e-6);
+  this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
+
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
@@ -1109,6 +1116,17 @@ void dlio::OdomNode::getNextPose() {
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
+
+  // Surface degeneracy (e.g. featureless tunnel): the solver held the IMU
+  // prior along the unobservable directions; warn so the operator knows the
+  // estimate is dead-reckoning in those directions.
+  int degenerate_dirs = this->gicp.lastDegenerateDirections();
+  if (degenerate_dirs > 0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Scan-to-map registration is degenerate along %d direction(s); "
+        "holding IMU prior there (geometrically self-similar environment?)",
+        degenerate_dirs);
+  }
 
   // Get final transformation in global frame
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation

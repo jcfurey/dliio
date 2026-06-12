@@ -12,6 +12,10 @@ Added `intensityAlpha` (default value: 2.0) and `intensityRRef` (default value: 
 
 These new user-configurable parameters allow you to control the influence the range coorection. Specifically, `intensityAlpha` is the falloff exponent and `intensityRRef` is the reference range in metres.
 
+Added `degeneracyThreshRatio` (default value: 1.0e-6) to cfg/params.yaml.
+
+In geometrically self-similar environments (a featureless conduit/tunnel is the canonical case) scan-to-map registration is unobservable along one or more directions — for a smooth tunnel, translation along its axis. The registration Hessian is eigen-analyzed every iteration and directions whose eigenvalue falls below `degeneracyThreshRatio * lambda_max` are excluded from the update (solution remapping, Zhang/Kaess/Singh ICRA 2016), so the IMU prior is held there instead of being overwritten by noise. If the photometric term finds usable intensity texture (seams, joints, stains), it re-constrains those directions automatically. A throttled warning is logged while degeneracy is active. See `doc/REVIEW.md` §II.4 and `doc/REFERENCES.md`.
+
 ---
 
 # Original ReadMe

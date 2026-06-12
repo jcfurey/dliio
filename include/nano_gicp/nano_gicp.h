@@ -52,6 +52,14 @@ public:
   // false = intensity (default), true = reflectivity.
   void setPhotometricChannel(bool use_reflectivity);
 
+  // Degeneracy gating (solution remapping): Hessian eigen-directions with
+  // eigenvalue < ratio * lambda_max are excluded from the update, so the
+  // initial guess (IMU prior) is held along unobservable directions, e.g.
+  // the axis of a featureless tunnel. 0 disables the gate.
+  void setDegeneracyThreshRatio(float ratio);
+  // Number of degenerate directions detected during the last align() (0-6).
+  int lastDegenerateDirections() const;
+
   virtual void setInputSource(const PointCloudSourceConstPtr& cloud) override;
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
 
@@ -101,6 +109,8 @@ protected:
   float photometric_weight_;
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
+  float degeneracy_thresh_ratio_;
+  int last_degenerate_directions_;
   
   std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>> target_intensity_gradients_;
   std::vector<bool> gradient_valid_;

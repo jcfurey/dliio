@@ -64,6 +64,14 @@
     odom/preprocessing/intensityAlpha: 2.0
     odom/preprocessing/intensityRRef: 1.0
     odom/gicp/gradientKNeighbors: 10
+
+    # Degeneracy gate (solution remapping) for geometrically self-similar
+    # environments such as featureless tunnels/conduits: GICP Hessian
+    # eigen-directions with eigenvalue < ratio * lambda_max are excluded from
+    # the update, holding the IMU prior along unobservable directions instead
+    # of amplifying noise. Raise (e.g. 1e-4) to gate earlier/more aggressively;
+    # 0.0 disables the gate entirely.
+    odom/gicp/degeneracyThreshRatio: 1.0e-6
     
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25
