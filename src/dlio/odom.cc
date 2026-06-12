@@ -441,13 +441,14 @@ void dlio::OdomNode::getParams() {
       "Huber threshold on the normalized visual residual (<= 0 disables robustification)");
   dlio::declare_param(this, "odom/visual/maxTimeDiff", this->visual_max_dt_, 0.05,
       "Max |image_stamp - scan_stamp| [s] to pair a camera frame with a scan");
-  // Degeneracy-gate safety floor: even when the visual term rescues a
-  // LiDAR-degenerate axis, the per-iteration step there is clamped to these
-  // bounds so a wrong visual constraint cannot run the pose away.
-  dlio::declare_param(this, "odom/visual/gateMaxStepTrans", this->visual_gate_max_trans_, 0.5,
-      "Visual gate safety floor: max per-iteration translation step on a rescued degenerate axis [m]");
-  dlio::declare_param(this, "odom/visual/gateMaxStepRot", this->visual_gate_max_rot_, 0.1,
-      "Visual gate safety floor: max per-iteration rotation step on a rescued degenerate axis [rad]");
+  // Degeneracy-gate safety floor: when the visual term rescues a LiDAR-
+  // degenerate axis, its total deviation from the IMU prior along that axis is
+  // bounded to these PER-SCAN budgets (summed across LM iterations), so a
+  // wrong/biased visual constraint can neither diverge nor inflate the path.
+  dlio::declare_param(this, "odom/visual/gateMaxStepTrans", this->visual_gate_max_trans_, 0.3,
+      "Visual gate safety floor: max per-scan translation correction on a rescued degenerate axis [m]");
+  dlio::declare_param(this, "odom/visual/gateMaxStepRot", this->visual_gate_max_rot_, 0.05,
+      "Visual gate safety floor: max per-scan rotation correction on a rescued degenerate axis [rad]");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};

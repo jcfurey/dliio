@@ -146,11 +146,12 @@
     odom/visual/maxTimeDiff: 0.05    # max |image - scan| stamp gap to pair [s]
     # Gate safety floor: the gate still detects LiDAR degeneracy from geometry
     # alone; on a degenerate axis the visual term may drive motion only if it
-    # stiffened that axis, and the per-iteration step is clamped to these bounds
-    # so a wrong visual constraint can't run the pose away (axes vision doesn't
-    # rescue stay held to the IMU prior).
-    odom/visual/gateMaxStepTrans: 0.5   # [m] per iteration
-    odom/visual/gateMaxStepRot: 0.1     # [rad] per iteration
+    # stiffened that axis, and its total deviation from the IMU prior there is
+    # bounded to these PER-SCAN budgets (summed over LM iterations) so a wrong/
+    # biased constraint can neither diverge nor inflate the path (axes vision
+    # doesn't rescue stay held to the IMU prior).
+    odom/visual/gateMaxStepTrans: 0.3   # [m] per scan
+    odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
 
     # Diagonal covariance stamped on the published nav_msgs/Odometry
     # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].

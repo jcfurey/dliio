@@ -86,10 +86,11 @@ public:
   // Safety floor for the degeneracy gate when the visual term is on. The gate
   // judges observability from LiDAR geometry alone; on a geometrically
   // degenerate axis the visual term is allowed to drive motion ONLY if it
-  // actually stiffened that axis, and even then the per-iteration step is
-  // clamped to these bounds so a wrong visual constraint cannot run away.
-  // Axes the visual term does not rescue stay held to the prior (LiDAR-only
-  // behavior). max_trans [m], max_rot [rad].
+  // actually stiffened that axis, and even then its total deviation from the
+  // IMU prior along that axis is bounded to these PER-SCAN budgets (summed
+  // across LM iterations) so a wrong/biased visual constraint cannot inflate
+  // the path or run away. Axes the visual term does not rescue stay held to
+  // the prior (LiDAR-only behavior). max_trans [m/scan], max_rot [rad/scan].
   void setVisualGateMaxStep(float max_trans, float max_rot);
 
   // RMS of the (normalized) visual residual and number of points used in the

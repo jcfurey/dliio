@@ -411,6 +411,15 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     double prev_cost = std::numeric_limits<double>::max();
     Eigen::Isometry3f prev_trans = trans;
 
+    // Per-SCAN cumulative budget for visual rescue on degenerate axes: the
+    // visual term may deviate from the IMU prior along a LiDAR-degenerate axis
+    // by at most visual_gate_max_* TOTAL across all LM iterations this scan.
+    // This bounds the rescued motion per scan (so it can't inflate the path
+    // over a long run -- the over-travel a per-iteration clamp allowed), while
+    // still letting vision refine the prior.
+    double rescued_t_used = 0.0;  // [m]   translation budget consumed this scan
+    double rescued_r_used = 0.0;  // [rad] rotation budget consumed this scan
+
     for (int i = 0; i < this->max_iterations_; ++i) {
         update_correspondences(trans);
 
@@ -496,9 +505,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
                     const double comp = v.dot(dx.head<3>());
                     if (visual_enabled_ && v.dot(Hrr * v) > rr_thresh) {
-                        const double cap = visual_gate_max_rot_;
+                        // bounded visual-driven motion, drawing from the per-scan budget
+                        const double cap = std::max(0.0, (double)visual_gate_max_rot_ - rescued_r_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
-                        dx.head<3>() += v * (cl - comp);  // bounded visual-driven motion
+                        dx.head<3>() += v * (cl - comp);
+                        rescued_r_used += std::abs(cl);
                         ++rescued;
                     } else {
                         dx.head<3>() -= v * comp;          // hold the prior
@@ -512,9 +523,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
                     const double comp = v.dot(dx.tail<3>());
                     if (visual_enabled_ && v.dot(Htt * v) > tt_thresh) {
-                        const double cap = visual_gate_max_trans_;
+                        // bounded visual-driven motion, drawing from the per-scan budget
+                        const double cap = std::max(0.0, (double)visual_gate_max_trans_ - rescued_t_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
-                        dx.tail<3>() += v * (cl - comp);  // bounded visual-driven motion
+                        dx.tail<3>() += v * (cl - comp);
+                        rescued_t_used += std::abs(cl);
                         ++rescued;
                     } else {
                         dx.tail<3>() -= v * comp;          // hold the prior

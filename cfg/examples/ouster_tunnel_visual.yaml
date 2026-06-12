@@ -33,10 +33,11 @@
     odom/visual/weight: 0.5          # UNTUNED starting point; sweep on the bag
     odom/visual/huberDelta: 0.05
     odom/visual/maxTimeDiff: 0.05
-    # Gate safety floor: bound visual-driven motion on a rescued degenerate axis
-    # so a wrong constraint can't diverge (axes vision doesn't rescue stay held).
-    odom/visual/gateMaxStepTrans: 0.5   # [m] per iteration
-    odom/visual/gateMaxStepRot: 0.1     # [rad] per iteration
+    # Gate safety floor (per-scan budget): bound vision's deviation from the IMU
+    # prior on a rescued degenerate axis so it can't diverge OR inflate the path
+    # (the first sweep over-traveled at high weight with a looser per-iter clamp).
+    odom/visual/gateMaxStepTrans: 0.2   # [m] per scan
+    odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
 
     # 06042026 /lucid_camera_1 intrinsics (bag camera_info) + plumb_bob distortion.
     camera/intrinsics: [ 1094.19, 1092.23, 969.58, 721.31 ]
