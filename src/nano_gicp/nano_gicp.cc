@@ -316,16 +316,17 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     for (int i = 0; i < this->max_iterations_; ++i) {
         update_correspondences(trans);
 
-        Eigen::Matrix<float, 6, 6> H;
-        Eigen::Matrix<float, 6, 1> b;
+        // Accumulated, solved, and gated in double; see linearize() for why.
+        Eigen::Matrix<double, 6, 6> H;
+        Eigen::Matrix<double, 6, 1> b;
 
         linearize(trans, &H, &b);
 
         // Add regularization
-        float lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
+        double lambda = (lambda_factor_ > 0) ? lambda_factor_ : 1e-6;
         H.diagonal().array() += lambda;
 
-        Eigen::Matrix<float, 6, 1> dx = H.ldlt().solve(-b);
+        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(-b);
 
         if(dx.hasNaN() || !dx.allFinite()) {
             break;
@@ -347,21 +348,21 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // in-plane stiffness that partially masks the degeneracy.
         int degenerate = 0;
         if (degeneracy_thresh_ratio_ > 0.f) {
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig_rr(H.template block<3, 3>(0, 0));
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig_tt(H.template block<3, 3>(3, 3));
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H.template block<3, 3>(0, 0));
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H.template block<3, 3>(3, 3));
 
-            const float rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
+            const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
                 if (eig_rr.eigenvalues()(k) <= rr_thresh) {
-                    const Eigen::Vector3f v = eig_rr.eigenvectors().col(k);
+                    const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
                     dx.head<3>() -= v * v.dot(dx.head<3>());
                     ++degenerate;
                 }
             }
-            const float tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
+            const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
                 if (eig_tt.eigenvalues()(k) <= tt_thresh) {
-                    const Eigen::Vector3f v = eig_tt.eigenvectors().col(k);
+                    const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
                     dx.tail<3>() -= v * v.dot(dx.tail<3>());
                     ++degenerate;
                 }
@@ -374,11 +375,12 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // perturbation) rather than composing per-axis Euler increments,
         // which is only a small-angle approximation and degrades on the
         // large first steps of aggressive motion.
-        const float angle = dx.head<3>().norm();
+        const Eigen::Vector3f rot_step = dx.head<3>().cast<float>();
+        const float angle = rot_step.norm();
         if (angle > 1e-12f) {
-            trans.prerotate(Eigen::AngleAxisf(angle, dx.head<3>() / angle));
+            trans.prerotate(Eigen::AngleAxisf(angle, rot_step / angle));
         }
-        trans.pretranslate(dx.tail<3>());
+        trans.pretranslate(dx.tail<3>().cast<float>());
 
         // Check convergence: rotation step (dx.head) vs rotation_epsilon_,
         // translation step (dx.tail) vs transformation_epsilon_.
@@ -428,15 +430,19 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::linearize(
-    const Eigen::Isometry3f& trans, 
-    Eigen::Matrix<float, 6, 6>* H, 
-    Eigen::Matrix<float, 6, 1>* b) {
+    const Eigen::Isometry3f& trans,
+    Eigen::Matrix<double, 6, 6>* H,
+    Eigen::Matrix<double, 6, 1>* b) {
     
     H->setZero();
     b->setZero();
-    
-    std::vector<Eigen::Matrix<float, 6, 6>> H_private(num_threads_, Eigen::Matrix<float, 6, 6>::Zero());
-    std::vector<Eigen::Matrix<float, 6, 1>> b_private(num_threads_, Eigen::Matrix<float, 6, 1>::Zero());
+
+    // Per-point Jacobians are computed in float (the data is float), but the
+    // accumulation across 10k+ points is done in double: summing that many
+    // float products loses several significant digits, which matters for the
+    // near-singular Hessians the degeneracy gate has to discriminate.
+    std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
     
     bool use_photometric = (photometric_weight_ > 1e-8)
         && target_intensity_gradients_ && !target_intensity_gradients_->empty();
@@ -465,8 +471,8 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         
         Eigen::Matrix3f M = mahalanobis_[i].block<3, 3>(0, 0);
         
-        H_private[thread_num] += J_geometric.transpose() * M * J_geometric;
-        b_private[thread_num] += J_geometric.transpose() * M * residual;
+        H_private[thread_num] += (J_geometric.transpose() * M * J_geometric).cast<double>();
+        b_private[thread_num] += (J_geometric.transpose() * M * residual).cast<double>();
         
         // Photometric term (channel normalized by photometric_scale_ to match
         // the units the target gradients were estimated in)
@@ -494,8 +500,8 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
                     weight *= photometric_huber_delta_ / abs_r;
                 }
-                H_private[thread_num] += weight * J_photometric.transpose() * J_photometric;
-                b_private[thread_num] += weight * J_photometric.transpose() * intensity_diff;
+                H_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
+                b_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
             }
         }
     }

@@ -46,20 +46,26 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // the keys in cfg/params.yaml. Dot-separated names do NOT match the YAML keys and
   // silently fall back to the defaults (which left the photometric term disabled).
   double photometricWeight;
-  dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0);
+  dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0,
+      "Weight of the photometric GICP residual relative to the geometric term (dimensionless; 0 disables)");
 
   // Intensity range correction parameters
-  dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0);
-  dlio::declare_param(this, "odom/preprocessing/intensityRRef", this->intensity_r_ref_, 1.0);
+  dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0,
+      "Intensity range-correction falloff exponent (2.0 = inverse-square)");
+  dlio::declare_param(this, "odom/preprocessing/intensityRRef", this->intensity_r_ref_, 1.0,
+      "Intensity range-correction reference range [m]");
   int gradientKNeighbors;
-  dlio::declare_param(this, "odom/gicp/gradientKNeighbors", gradientKNeighbors, 10);
+  dlio::declare_param(this, "odom/gicp/gradientKNeighbors", gradientKNeighbors, 10,
+      "Neighbors used to estimate the spatial photometric gradient on the submap");
 
   // Photometric channel: "intensity" (range-dependent; pairs with the range
   // correction below) or "reflectivity" (e.g. Ouster calibrated reflectivity,
   // already range-normalized -> the range correction is skipped for it).
   std::string photometricChannel;
-  dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"));
+  dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"),
+      "Point field feeding the photometric term: 'intensity' or 'reflectivity'");
   this->use_reflectivity_ = (photometricChannel == "reflectivity");
+  this->photometric_active_ = (photometricWeight > 0.0);
   if (photometricChannel != "intensity" && photometricChannel != "reflectivity") {
     RCLCPP_WARN(this->get_logger(),
         "Unknown odom/gicp/photometricChannel '%s'; defaulting to 'intensity'.",
@@ -74,14 +80,16 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // so photometricWeight is sensor-independent (255 covers 8-bit intensity and
   // Ouster calibrated reflectivity; use 65535 for raw 16-bit channels).
   double photometricScale;
-  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0);
+  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0,
+      "Full-scale of the photometric channel (channel is divided by this; 255 for 8-bit / Ouster reflectivity)");
   this->gicp.setPhotometricScale(static_cast<float>(photometricScale));
 
   // Huber threshold on the normalized photometric residual; residuals beyond
   // it are downweighted so specular/wet-surface outliers can't shove the
   // pose at full weight. <= 0 disables.
   double photometricHuberDelta;
-  dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05);
+  dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05,
+      "Huber threshold on the normalized photometric residual (<= 0 disables robustification)");
   this->gicp.setPhotometricHuberDelta(static_cast<float>(photometricHuberDelta));
 
   // GICP covariance regularization:
@@ -91,7 +99,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   //   normalized_min_eig   - scale-normalized clamp
   //   frobenius | none
   std::string regularizationMethod;
-  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"));
+  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"),
+      "GICP covariance regularization: min_eig | plane | normalized_min_eig | frobenius | none");
   nano_gicp::RegularizationMethod reg_method = nano_gicp::RegularizationMethod::MIN_EIG;
   if (regularizationMethod == "plane") { reg_method = nano_gicp::RegularizationMethod::PLANE; }
   else if (regularizationMethod == "normalized_min_eig") { reg_method = nano_gicp::RegularizationMethod::NORMALIZED_MIN_EIG; }
@@ -109,7 +118,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // separately and the GICP update is projected off directions below
   // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
   double degeneracyThreshRatio;
-  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005);
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005,
+      "Degeneracy gate: block eigen-directions below ratio*lambda_max hold the IMU prior (0 disables)");
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
@@ -324,11 +334,13 @@ void dlio::OdomNode::getParams() {
 
   // Bound on the keyframe map (0 = unlimited). When exceeded, the most
   // spatially redundant processed keyframe is removed.
-  dlio::declare_param(this, "odom/keyframe/maxKeyframes", this->max_keyframes_, 0);
+  dlio::declare_param(this, "odom/keyframe/maxKeyframes", this->max_keyframes_, 0,
+      "Bound on the keyframe map; most redundant keyframe pruned when exceeded (0 = unlimited)");
 
   // Terminal status dashboard (ANSI clear-screen); disable when logs are
   // multiplexed (ros2 launch, containers, systemd).
-  dlio::declare_param(this, "odom/debug/dashboard", this->dashboard_, true);
+  dlio::declare_param(this, "odom/debug/dashboard", this->dashboard_, true,
+      "Terminal ANSI status dashboard; disable under multiplexed logging");
 
   // Submap
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
@@ -643,7 +655,7 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // copies fields whose datatype matches our struct (reflectivity is a float here,
   // but sensors publish it as uint8/uint16), so copy it explicitly with conversion.
   // Done before NaN removal so indices still line up 1:1 with the message.
-  if (this->use_reflectivity_) {
+  if (this->use_reflectivity_ && this->photometric_active_) {
     auto rfield = std::find_if(pc->fields.begin(), pc->fields.end(),
         [](const sensor_msgs::msg::PointField& f){ return f.name == "reflectivity"; });
     if (rfield != pc->fields.end()) {
@@ -680,8 +692,11 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // I_corrected = clamp( I_raw * (r / r_ref)^alpha , 0, 255 )
   // intensity_alpha_ : falloff exponent  (~2.0 for inverse-square law)
   // intensity_r_ref_ : reference range in metres (anchor point, typically 1.0 m)
-  // Skipped when using reflectivity, which is already range-normalized by the sensor.
-  if (!this->use_reflectivity_) {
+  // Skipped when using reflectivity (already range-normalized by the sensor)
+  // AND when the photometric term is disabled: the corrected values propagate
+  // into the published deskewed/keyframe clouds, so downstream consumers
+  // should only see modified intensities when the feature is actually in use.
+  if (!this->use_reflectivity_ && this->photometric_active_) {
     const float alpha   = static_cast<float>(this->intensity_alpha_);
     const float r_ref   = static_cast<float>(this->intensity_r_ref_);
     if (r_ref > 0.f) {  // r_ref <= 0 would divide-by-zero -> inf/NaN intensities
@@ -901,7 +916,10 @@ void dlio::OdomNode::deskewPointcloud() {
   // if there are no frames between the start and end of the sweep
   // that probably means that there's a sync issue
   if (frames.size() != timestamps.size()) {
-    RCLCPP_FATAL(this->get_logger(),"Bad time sync between LiDAR and IMU!");
+    // not fatal: gracefully degrades to a rigid (non-deskewed) transform below
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "IMU data does not cover the scan period (time sync / dropout?); "
+        "skipping motion correction for this scan");
 
     this->T_prior = this->T;
     pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
@@ -987,7 +1005,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   if (this->current_scan->points.size() <= this->gicp_min_num_points_) {
-    RCLCPP_FATAL(this->get_logger(), "Low number of points in the cloud!");
+    // not fatal: this scan is skipped; odometry continues on IMU propagation
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Low number of points in the cloud (%zu <= %d); skipping scan",
+        this->current_scan->points.size(), this->gicp_min_num_points_);
     return;
   }
 
@@ -1841,6 +1862,13 @@ void dlio::OdomNode::updateKeyframes() {
   double theta_deg = theta_rad * (180.0/M_PI);
 
   // update keyframes
+  // Decision table of the cascade below (D = distance > threshD,
+  // R = rotation > threshR, N = num_nearby <= 1):
+  //   D                    -> new keyframe (regardless of R)
+  //   !D &&  R &&  N       -> new keyframe (pure rotation in an uncrowded spot)
+  //   !D &&  R && !N       -> no  (rotation trigger suppressed near other kfs)
+  //   !D && !R             -> no
+  // i.e. the rotation criterion only applies inside the num_nearby carve-out.
   bool newKeyframe = false;
 
   if (abs(dd) > this->keyframe_thresh_dist_ || abs(theta_deg) > this->keyframe_thresh_rot_) {

@@ -378,5 +378,7 @@ private:
   double intensity_r_ref_;
   // Photometric channel: false = intensity, true = reflectivity
   bool use_reflectivity_;
+  // photometric term enabled (weight > 0); gates the intensity range correction
+  bool photometric_active_;
 
 };

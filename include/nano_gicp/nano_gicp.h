@@ -87,7 +87,7 @@ public:
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Eigen::Matrix4f& guess) override;
 
-  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<float, 6, 6>* H, Eigen::Matrix<float, 6, 1>* b);
+  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b);
   void update_correspondences(const Eigen::Isometry3f& trans);
 
   template<typename PointT>
