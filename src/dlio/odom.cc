@@ -76,7 +76,11 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
-  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", 1,
+  // SensorDataQoS (best-effort): LiDAR drivers commonly publish sensor data
+  // best-effort; a reliable subscription would be QoS-incompatible and
+  // silently receive nothing.
+  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud",
+      rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1), lidar_sub_opt);
 
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -93,6 +97,8 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+  this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+  this->publishStaticTransforms();
 
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&dlio::OdomNode::publishPose, this));
@@ -441,8 +447,16 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
 
   br->sendTransform(transformStamped);
 
+  // baselink->imu and baselink->lidar are fixed extrinsics from YAML and are
+  // published once, latched, by the static broadcaster (see constructor).
+
+}
+
+void dlio::OdomNode::publishStaticTransforms() {
+
   // transform: baselink to imu
-  transformStamped.header.stamp = this->imu_stamp;
+  geometry_msgs::msg::TransformStamped transformStamped;
+  transformStamped.header.stamp = this->now();
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->imu_frame;
 
@@ -456,10 +470,9 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = q.y();
   transformStamped.transform.rotation.z = q.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
   // transform: baselink to lidar
-  transformStamped.header.stamp = this->imu_stamp;
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->lidar_frame;
 
@@ -473,7 +486,7 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = qq.y();
   transformStamped.transform.rotation.z = qq.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
 }
 

@@ -21,6 +21,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 
 // BOOST
 #include <boost/format.hpp>
@@ -58,6 +59,7 @@ private:
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
 
   void publishPose();
+  void publishStaticTransforms();
 
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
@@ -125,6 +127,7 @@ private:
 
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br;
 
   // ROS Msgs
   nav_msgs::msg::Odometry odom_ros;
