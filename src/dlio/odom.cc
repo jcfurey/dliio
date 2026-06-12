@@ -139,6 +139,13 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
   this->publishStaticTransforms();
 
+  // constant diagonal covariance on the published odometry (set once;
+  // the message object is reused by publishPose)
+  for (int i = 0; i < 6; i++) {
+    this->odom_ros.pose.covariance[i*7] = this->pose_cov_[i];
+    this->odom_ros.twist.covariance[i*7] = this->twist_cov_[i];
+  }
+
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&dlio::OdomNode::publishPose, this));
 
@@ -383,6 +390,15 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/gicp/transformationEpsilon", this->gicp_transformation_ep_, 0.0005);
   dlio::declare_param(this, "odom/gicp/rotationEpsilon", this->gicp_rotation_ep_, 0.0005);
   dlio::declare_param(this, "odom/gicp/initLambdaFactor", this->gicp_init_lambda_factor_, 1e-9);
+
+  // Published odometry covariance (diagonal: x y z roll pitch yaw).
+  // All-zero covariance makes the odometry unusable for downstream fusion
+  // (robot_localization etc. either reject it or trust it infinitely).
+  std::vector<double> cov_default{0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025};
+  dlio::declare_param(this, "odom/covariance/pose", this->pose_cov_, cov_default);
+  dlio::declare_param(this, "odom/covariance/twist", this->twist_cov_, cov_default);
+  if (this->pose_cov_.size() != 6) { this->pose_cov_ = cov_default; }
+  if (this->twist_cov_.size() != 6) { this->twist_cov_ = cov_default; }
 
   // Geometric Observer
   dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0);

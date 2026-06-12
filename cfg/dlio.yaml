@@ -10,24 +10,47 @@
 #                                                         #
 ###########################################################
 
+# ROBOT / SENSOR CONFIGURATION
+# Per-robot settings: sensor extrinsics, IMU intrinsics, preprocessing
+# switches. Copy this file per robot and pass it to the launch file via
+# robot_config:=/path/to/your_robot.yaml. Algorithm tuning lives in
+# params.yaml. Example overlays: cfg/examples/.
+
 /**:
   ros__parameters:
 
     version: 1.1.1
 
+    # Adapt keyframe spacing and GICP correspondence distance to the
+    # environment's spaciousness (from DLO). Disable for fixed thresholds.
     adaptive: true
 
+    # Motion-correct each scan using continuous-time IMU integration.
+    # Requires per-point timestamps (auto-detected: Ouster 't', Velodyne
+    # 'time', Hesai/Livox 'timestamp'); falls back off if absent.
     pointcloud/deskew: true
+    # Voxel-downsample each scan before registration (resolution in
+    # params.yaml: odom/preprocessing/voxelFilter/res).
     pointcloud/voxelize: true
 
+    # Estimate IMU biases (and optionally initial attitude) by averaging
+    # while STATIONARY for odom/imu/calibration/time seconds at startup.
+    # If false, the intrinsics below are used as-is.
     imu/calibration: true
+    # Accelerometer bias [m/s^2] and gyro bias [rad/s], used when
+    # imu/calibration is false (e.g. from a prior calibration run).
     imu/intrinsics/accel/bias: [ 0.0, 0.0, 0.0 ]
+    imu/intrinsics/gyro/bias:  [ 0.0, 0.0, 0.0 ]
+    # Accelerometer scale/misalignment matrix (row-major 3x3).
     imu/intrinsics/accel/sm:   [ 1.,  0.,  0.,
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]
-    imu/intrinsics/gyro/bias: [ 0.0, 0.0, 0.0 ]
 
-    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ] 
+    # Rigid extrinsics from base_link to each sensor: translation [m] and
+    # row-major rotation matrix. Published once on /tf_static at startup.
+    # The defaults below are the Ouster OS1's internal IMU offset; replace
+    # with your robot's calibration.
+    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]
     extrinsics/baselink2imu/R: [ 1.,  0.,  0.,
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]

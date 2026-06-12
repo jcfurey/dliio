@@ -24,6 +24,32 @@ Added `regularizationMethod` (default value: `min_eig`) and `photometricScale` (
 
 `regularizationMethod` selects the GICP covariance regularization: `min_eig` preserves this fork's historical behavior (clamped singular values, previously mislabeled "plane" internally); `plane` is true GICP plane-to-plane (fixed scale-free discs, recommended for degenerate environments). `photometricScale` is the full-scale value of the photometric channel — the channel is normalized by it so `photometricWeight` is dimensionless and transfers across sensors (255 covers 8-bit intensity and Ouster calibrated reflectivity; 65535 for raw 16-bit channels).
 
+## Configuration & wiring
+
+**Config files** (all parameters are commented in the files themselves):
+
+| File | Contents |
+|---|---|
+| `cfg/dlio.yaml` | Per-robot: sensor extrinsics, IMU intrinsics, preprocessing switches. Copy per robot and pass via `robot_config:=`. |
+| `cfg/params.yaml` | Algorithm tuning: registration, keyframing, observer gains, photometric term, degeneracy gate, published covariance. Override via `params_file:=`. |
+| `cfg/examples/ouster_reflectivity.yaml` | Overlay: Ouster calibrated-reflectivity photometric channel + plane regularization for tunnel-like environments. |
+| `cfg/examples/simulation.yaml` | Overlay: sim time, no IMU calibration wait, ideal extrinsics. |
+
+**Launch arguments** (`dlio.launch.py`): `pointcloud_topic`, `imu_topic`, `rviz`, `use_sim_time` (default **false**; set true under Gazebo or `ros2 bag play --clock`), `robot_config`, `params_file`. Overlays can be appended at run time with `--ros-args --params-file <overlay.yaml>` (later files win).
+
+**Outputs / downstream wiring:**
+
+| Interface | Name | Notes |
+|---|---|---|
+| Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; constant diagonal covariance from `odom/covariance/*` (tune for your EKF) |
+| Pose | `dlio/odom_node/pose` (`PoseStamped`) | same state, no twist |
+| TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` | follows REP-105; no `map` frame is published — DLIO is odometry, not SLAM with loop closure |
+| Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; intensity is range-corrected when the intensity channel is active |
+| Keyframes / map | `dlio/odom_node/keyframes`, `dlio/map_node/map` | map is keyframe accumulation (unbounded; for visualization/export) |
+| Save map | `/save_pcd` service | absolute existing directory required |
+
+Wiring into a fusion/navigation stack: feed `dlio/odom_node/odom` to `robot_localization` (or use it directly as the `odom`→`base_link` source for Nav2, in which case let DLIO own that TF and do **not** also fuse a second publisher of the same transform). The LiDAR subscription uses best-effort `SensorDataQoS`; drivers publishing reliable still match.
+
 ---
 
 # Original ReadMe

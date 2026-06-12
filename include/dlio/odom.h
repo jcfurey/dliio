@@ -357,6 +357,9 @@ private:
   double gicp_rotation_ep_;
   double gicp_init_lambda_factor_;
 
+  std::vector<double> pose_cov_;
+  std::vector<double> twist_cov_;
+
   double geo_Kp_;
   double geo_Kv_;
   double geo_Kq_;
