@@ -7,6 +7,22 @@
 #include <Eigen/Dense>
 #include <pcl/common/transforms.h>
 
+namespace {
+// Bilinear sample of a single-channel CV_32F image. Caller guarantees the 2x2
+// neighborhood (floor(u),floor(v))..(+1,+1) is in bounds.
+inline float bilinearSample(const cv::Mat& img, float u, float v) {
+  const int x0 = static_cast<int>(std::floor(u));
+  const int y0 = static_cast<int>(std::floor(v));
+  const float ax = u - static_cast<float>(x0);
+  const float ay = v - static_cast<float>(y0);
+  const float* r0 = img.ptr<float>(y0);
+  const float* r1 = img.ptr<float>(y0 + 1);
+  const float top = r0[x0] * (1.f - ax) + r0[x0 + 1] * ax;
+  const float bot = r1[x0] * (1.f - ax) + r1[x0 + 1] * ax;
+  return top * (1.f - ay) + bot * ay;
+}
+}  // namespace
+
 template class nano_gicp::NanoGICP<dlio::Point, dlio::Point>;
 
 namespace nano_gicp {
@@ -44,6 +60,17 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_huber_delta_ = 0.05f;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->last_degenerate_directions_ = 0;
+  this->visual_enabled_ = false;
+  this->visual_weight_ = 0.0f;
+  this->visual_huber_delta_ = 0.05f;
+  this->visual_fx_ = this->visual_fy_ = this->visual_cx_ = this->visual_cy_ = 0.0f;
+  this->T_cw_cur_ = Eigen::Isometry3f::Identity();
+  this->T_cw_prev_ = Eigen::Isometry3f::Identity();
+  this->visual_gate_max_trans_ = 0.5f;
+  this->visual_gate_max_rot_ = 0.1f;
+  this->last_visual_rms_ = 0.0f;
+  this->last_visual_count_ = 0;
+  this->last_visual_rescued_ = 0;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -102,6 +129,64 @@ void NanoGICP<PointSource, PointTarget>::setPhotometricScale(float scale) {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricHuberDelta(float delta) {
     this->photometric_huber_delta_ = delta;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualEnabled(bool on) {
+    this->visual_enabled_ = on;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualWeight(float weight) {
+    this->visual_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualHuberDelta(float delta) {
+    this->visual_huber_delta_ = delta;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualIntrinsics(float fx, float fy, float cx, float cy) {
+    this->visual_fx_ = fx;
+    this->visual_fy_ = fy;
+    this->visual_cx_ = cx;
+    this->visual_cy_ = cy;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualCurrentFrame(
+    const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world) {
+    this->visual_cur_ = image_norm;
+    this->T_cw_cur_ = T_cam_world;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualPreviousFrame(
+    const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world) {
+    this->visual_prev_ = image_norm;
+    this->T_cw_prev_ = T_cam_world;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastVisualRms() const {
+    return this->last_visual_rms_;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualCount() const {
+    return this->last_visual_count_;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualGateMaxStep(float max_trans, float max_rot) {
+    this->visual_gate_max_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
+    this->visual_gate_max_rot_ = (max_rot > 0.f) ? max_rot : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualRescuedDirections() const {
+    return this->last_visual_rescued_;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -311,6 +396,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
 
     this->converged_ = false;
     this->last_degenerate_directions_ = 0;
+    this->last_visual_count_ = 0;
+    this->last_visual_rms_ = 0.0f;
+    this->last_visual_rescued_ = 0;
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -346,6 +434,23 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         prev_cost = cost;
         prev_trans = trans;
 
+        // Snapshot the GEOMETRIC (LiDAR-only) Hessian before adding the visual
+        // term. The degeneracy gate judges observability from this, NOT from
+        // the visual-augmented H: otherwise a strong-but-wrong visual term
+        // masks the degeneracy, the gate releases its prior-hold, and the pose
+        // diverges along the (still physically unobservable) axis.
+        const Eigen::Matrix<double, 6, 6> H_geo = H;
+
+        // Direct visual (camera) photometric term: accumulate into the SAME
+        // H/b that linearize() built, BEFORE damping and the degeneracy gate,
+        // so a camera-constrained axis can be detected (and rescued) by the
+        // gate below. The LM step-acceptance cost above stays geometric-only
+        // (visual is a secondary constraint); the visual term still shapes dx.
+        // No-op unless setVisualEnabled(true) and both frames are set.
+        if (visual_enabled_) {
+            accumulateVisualResidual(trans, &H, &b, nullptr);
+        }
+
         // Add regularization / damping
         H.diagonal().array() += lambda;
 
@@ -359,39 +464,66 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // in a featureless tunnel the problem is unobservable along the tunnel
         // axis and the solve above pours correspondence-snapping noise into
         // exactly that direction, overwriting the IMU prior. Analyze the
-        // rotation (H[0:3,0:3], rad^2-scaled) and translation (H[3:6,3:6], m^2)
-        // blocks SEPARATELY -- a single threshold across the full 6x6 is
-        // meaningless because the two blocks have different units and the
-        // rotation block additionally scales with the lever arm (range^2).
-        // Project the solution off the weak eigen-directions of each block so
-        // the initial guess (IMU prior) is held there. A photometric term that
-        // constrains the axis stiffens the block and re-opens the gate.
+        // GEOMETRIC rotation (H_geo[0:3,0:3], rad^2) and translation
+        // (H_geo[3:6,3:6], m^2) blocks SEPARATELY -- a single threshold across
+        // the full 6x6 is meaningless because the two blocks have different
+        // units and the rotation block additionally scales with the lever arm
+        // (range^2).
+        //
+        // For each geometrically-weak direction v:
+        //   - SAFETY FLOOR (visual on): if the visual term actually stiffened v
+        //     (combined Rayleigh quotient above threshold), allow motion there
+        //     but CLAMP the step to ±visual_gate_max_* so a wrong visual
+        //     constraint cannot run away; otherwise hold the prior.
+        //   - visual off: hold the prior (project the step off v) -- original
+        //     gate behavior, bit-identical.
         // NOTE: discrimination is strongest with regularizationMethod 'plane'
         // (scale-free covariance discs); 'min_eig' covariances add artificial
         // in-plane stiffness that partially masks the degeneracy.
         int degenerate = 0;
+        int rescued = 0;
         if (degeneracy_thresh_ratio_ > 0.f) {
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H.template block<3, 3>(0, 0));
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H.template block<3, 3>(3, 3));
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H_geo.template block<3, 3>(0, 0));
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H_geo.template block<3, 3>(3, 3));
+            // Combined (geometric + visual) blocks, to test visual rescue.
+            const Eigen::Matrix3d Hrr = H.template block<3, 3>(0, 0);
+            const Eigen::Matrix3d Htt = H.template block<3, 3>(3, 3);
 
             const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
                 if (eig_rr.eigenvalues()(k) <= rr_thresh) {
-                    const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
-                    dx.head<3>() -= v * v.dot(dx.head<3>());
                     ++degenerate;
+                    const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
+                    const double comp = v.dot(dx.head<3>());
+                    if (visual_enabled_ && v.dot(Hrr * v) > rr_thresh) {
+                        const double cap = visual_gate_max_rot_;
+                        const double cl = std::max(-cap, std::min(cap, comp));
+                        dx.head<3>() += v * (cl - comp);  // bounded visual-driven motion
+                        ++rescued;
+                    } else {
+                        dx.head<3>() -= v * comp;          // hold the prior
+                    }
                 }
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
                 if (eig_tt.eigenvalues()(k) <= tt_thresh) {
-                    const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
-                    dx.tail<3>() -= v * v.dot(dx.tail<3>());
                     ++degenerate;
+                    const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
+                    const double comp = v.dot(dx.tail<3>());
+                    if (visual_enabled_ && v.dot(Htt * v) > tt_thresh) {
+                        const double cap = visual_gate_max_trans_;
+                        const double cl = std::max(-cap, std::min(cap, comp));
+                        dx.tail<3>() += v * (cl - comp);  // bounded visual-driven motion
+                        ++rescued;
+                    } else {
+                        dx.tail<3>() -= v * comp;          // hold the prior
+                    }
                 }
             }
         }
         this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
+        this->last_visual_rescued_ = std::max(this->last_visual_rescued_, rescued);
 
         // Apply transformation update
         // Apply the rotation step as a proper SO(3) exponential (left
@@ -538,6 +670,117 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         (*b) += b_private[i];
     }
     if (cost != nullptr) { *cost = cost_sum; }
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
+    const Eigen::Isometry3f& trans,
+    Eigen::Matrix<double, 6, 6>* H,
+    Eigen::Matrix<double, 6, 1>* b,
+    double* cost) {
+
+    this->last_visual_count_ = 0;
+    this->last_visual_rms_ = 0.0f;
+
+    if (!visual_enabled_ || visual_weight_ <= 0.f) { return; }
+    if (visual_cur_.empty() || visual_prev_.empty() || !input_) { return; }
+    // Single-channel float images are required (normalized brightness).
+    if (visual_cur_.type() != CV_32FC1 || visual_prev_.type() != CV_32FC1) { return; }
+
+    const float fx = visual_fx_, fy = visual_fy_, cx = visual_cx_, cy = visual_cy_;
+    if (fx <= 0.f || fy <= 0.f) { return; }
+
+    // world -> camera for the previous (warp-target) and current (reference) frames
+    const Eigen::Matrix3f R_prev = T_cw_prev_.linear();
+    const Eigen::Vector3f t_prev = T_cw_prev_.translation();
+    const Eigen::Matrix3f R_cur  = T_cw_cur_.linear();
+    const Eigen::Vector3f t_cur  = T_cw_cur_.translation();
+
+    const float zmin = 1e-3f;
+    const float bw = 2.f;  // border (central-difference needs a 1px ring inside bilinear's)
+    const float prev_umax = static_cast<float>(visual_prev_.cols) - 1.f - bw;
+    const float prev_vmax = static_cast<float>(visual_prev_.rows) - 1.f - bw;
+    const float cur_umax  = static_cast<float>(visual_cur_.cols)  - 1.f - bw;
+    const float cur_vmax  = static_cast<float>(visual_cur_.rows)  - 1.f - bw;
+
+    std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
+    double cost_sum = 0.0;
+    double sq_sum = 0.0;
+    long count = 0;
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
+    for (int i = 0; i < input_->size(); ++i) {
+        const auto& sp = input_->at(i);
+        const Eigen::Vector3f p_w(sp.x, sp.y, sp.z);     // raw world point (prior pose)
+        const Eigen::Vector3f x = trans * p_w;           // pose-corrected world point
+
+        // Reference brightness: project the RAW world point into the CURRENT
+        // image. This is pose-independent (the point's position relative to the
+        // current camera is fixed by the rigid extrinsic), hence a fixed target.
+        const Eigen::Vector3f Pc_ref = R_cur * p_w + t_cur;
+        if (Pc_ref.z() <= zmin) { continue; }
+        const float u_ref = fx * Pc_ref.x() / Pc_ref.z() + cx;
+        const float v_ref = fy * Pc_ref.y() / Pc_ref.z() + cy;
+        if (u_ref < bw || u_ref > cur_umax || v_ref < bw || v_ref > cur_vmax) { continue; }
+        const float I_ref = bilinearSample(visual_cur_, u_ref, v_ref);
+
+        // Moving brightness: project the CORRECTED world point into the PREVIOUS
+        // image. This depends on `trans` -- the source of pose observability.
+        const Eigen::Vector3f Pc = R_prev * x + t_prev;
+        if (Pc.z() <= zmin) { continue; }
+        const float invz = 1.f / Pc.z();
+        const float u = fx * Pc.x() * invz + cx;
+        const float v = fy * Pc.y() * invz + cy;
+        if (u < bw || u > prev_umax || v < bw || v > prev_vmax) { continue; }
+        const float I_mov = bilinearSample(visual_prev_, u, v);
+
+        // Image gradient (central difference) on the previous image, normalized.
+        const float gu = 0.5f * (bilinearSample(visual_prev_, u + 1.f, v)
+                               - bilinearSample(visual_prev_, u - 1.f, v));
+        const float gv = 0.5f * (bilinearSample(visual_prev_, u, v + 1.f)
+                               - bilinearSample(visual_prev_, u, v - 1.f));
+        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { continue; }
+
+        const float r = I_mov - I_ref;
+
+        // dπ/dPc (2x3)
+        Eigen::Matrix<float, 2, 3> dpi;
+        dpi << fx * invz, 0.f,      -fx * Pc.x() * invz * invz,
+               0.f,       fy * invz, -fy * Pc.y() * invz * invz;
+        Eigen::Matrix<float, 1, 2> gI;
+        gI << gu, gv;
+        // G = grad_I · dπ/dPc · R_prev (1x3). Residual r = I_mov(x) - I_ref;
+        // since x = trans·p_w perturbs on the LEFT (dx' = [-skew(x)|I]·ξ), the
+        // Jacobian is [ -G·skew(x) | G ]. NOTE the translation block is +G,
+        // OPPOSITE the LiDAR photometric term's -gᵀ -- see test_visual_residual.
+        const Eigen::Matrix<float, 1, 3> G = gI * dpi * R_prev;
+
+        Eigen::Matrix<float, 1, 6> J;
+        J.block<1, 3>(0, 0) = -G * skew(x);
+        J.block<1, 3>(0, 3) = G;
+
+        float weight = visual_weight_;
+        const float abs_r = std::abs(r);
+        if (visual_huber_delta_ > 0.f && abs_r > visual_huber_delta_) {
+            weight *= visual_huber_delta_ / abs_r;
+        }
+
+        const int tn = omp_get_thread_num();
+        H_private[tn] += (weight * J.transpose() * J).cast<double>();
+        b_private[tn] += (weight * J.transpose() * r).cast<double>();
+        cost_sum += weight * r * r;
+        sq_sum += static_cast<double>(r) * r;
+        count += 1;
+    }
+
+    for (int t = 0; t < num_threads_; ++t) {
+        (*H) += H_private[t];
+        (*b) += b_private[t];
+    }
+    if (cost != nullptr) { *cost += cost_sum; }
+    this->last_visual_count_ = static_cast<int>(count);
+    this->last_visual_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
 
 template <typename PointSource, typename PointTarget>

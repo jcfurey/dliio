@@ -135,6 +135,23 @@
     odom/preprocessing/intensityAlpha: 2.0
     odom/preprocessing/intensityRRef: 1.0
 
+    # Direct visual (camera) photometric term. Frame-to-frame direct image
+    # alignment using LiDAR depth: constrains the along-axis translation a
+    # featureless tunnel leaves LiDAR-degenerate (re-opens the degeneracy gate
+    # on that axis). OFF by default; needs a camera topic, intrinsics, and the
+    # cam2lidar extrinsic (see dlio.yaml). enabled controls subscription too.
+    odom/visual/enabled: false
+    odom/visual/weight: 0.0          # relative to the geometric GICP term
+    odom/visual/huberDelta: 0.05     # Huber on the normalized residual (<=0 off)
+    odom/visual/maxTimeDiff: 0.05    # max |image - scan| stamp gap to pair [s]
+    # Gate safety floor: the gate still detects LiDAR degeneracy from geometry
+    # alone; on a degenerate axis the visual term may drive motion only if it
+    # stiffened that axis, and the per-iteration step is clamped to these bounds
+    # so a wrong visual constraint can't run the pose away (axes vision doesn't
+    # rescue stay held to the IMU prior).
+    odom/visual/gateMaxStepTrans: 0.5   # [m] per iteration
+    odom/visual/gateMaxStepRot: 0.1     # [rad] per iteration
+
     # Diagonal covariance stamped on the published nav_msgs/Odometry
     # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
     # Constant and intentionally conservative; tune for your fusion stack

@@ -1,0 +1,52 @@
+# EXAMPLE: Ouster + camera in a tunnel — direct visual term ON.
+#
+# Adds the direct (photometric) CAMERA residual on top of the LiDAR tunnel mode.
+# In a smooth tunnel the along-axis translation is LiDAR-unobservable, so the
+# degeneracy gate holds the IMU prior there and the pose dead-reckons/twists.
+# The reflectivity photometric term alone is the "least-bad" mitigation
+# (ouster_tunnel.yaml: ~60% of runs track, the rest map-lock). Camera texture
+# directly constrains that axis: the visual residual is accumulated into the same
+# Hessian BEFORE the degeneracy gate, lifting the axis eigenvalue above the gate
+# threshold so the gate stops suppressing it.
+#
+# Overlay ON TOP of ouster_tunnel.yaml (keeps reflectivity + plane + gate), then
+# this file. Requires a camera image topic remapped to 'camera', the camera
+# intrinsics, and the cam2lidar extrinsic below.
+#
+# Usage:
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
+#     camera_topic:=/lucid_camera_1/image_raw \
+#     params_file:=.../cfg/params.yaml
+#   #   --ros-args --params-file .../cfg/examples/ouster_tunnel.yaml \
+#   #               --params-file .../cfg/examples/ouster_tunnel_visual.yaml
+#
+# NOTE: visual/weight here is an UNTUNED starting point — sweep it on the bag
+# (Phase 2). Too small: the gate still fires on the axis; too large: vision
+# overwhelms geometry. Watch "Degenerate Directions (current)" and
+# "Visual Residual RMS" in /diagnostics.
+
+/**:
+  ros__parameters:
+    # --- direct visual term ---
+    odom/visual/enabled: true
+    odom/visual/weight: 0.5          # UNTUNED starting point; sweep on the bag
+    odom/visual/huberDelta: 0.05
+    odom/visual/maxTimeDiff: 0.05
+    # Gate safety floor: bound visual-driven motion on a rescued degenerate axis
+    # so a wrong constraint can't diverge (axes vision doesn't rescue stay held).
+    odom/visual/gateMaxStepTrans: 0.5   # [m] per iteration
+    odom/visual/gateMaxStepRot: 0.1     # [rad] per iteration
+
+    # 06042026 /lucid_camera_1 intrinsics (bag camera_info) + plumb_bob distortion.
+    camera/intrinsics: [ 1094.19, 1092.23, 969.58, 721.31 ]
+    camera/distortion: [ -0.04409, 0.05337, -0.00124, 0.00002, 0.0 ]
+
+    # camera -> lidar extrinsic (R,t maps a camera-frame point into the lidar
+    # frame). Provided for this rig; note R(3,3) corrected 0.30 -> 0.030 to make
+    # the matrix orthonormal. CONFIRM which camera serial corresponds to the
+    # recorded /lucid_camera_1 before trusting absolute results.
+    extrinsics/cam2lidar/t: [ -0.006, -0.115, -0.116 ]
+    extrinsics/cam2lidar/R: [ -0.040,  0.999, -0.010,
+                              -0.030, -0.011, -1.000,
+                              -0.999, -0.040,  0.030 ]

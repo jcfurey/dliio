@@ -22,7 +22,9 @@
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <deque>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 
@@ -78,6 +80,12 @@ private:
 
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
+  void callbackImage(const sensor_msgs::msg::Image::SharedPtr img);
+  // Set up the visual term on `gicp` for this scan (picks the image nearest
+  // scan_stamp, computes the camera transforms). Returns true if the visual
+  // term is active this scan. Stash-then-store of the previous frame is handled
+  // by the caller (getNextPose) after align().
+  bool setupVisualForScan();
 
   void publishPose();
   void publishStaticTransforms();
@@ -137,7 +145,8 @@ private:
   // Subscribers
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
-  rclcpp::CallbackGroup::SharedPtr lidar_cb_group, imu_cb_group;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
+  rclcpp::CallbackGroup::SharedPtr lidar_cb_group, imu_cb_group, image_cb_group;
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
@@ -393,5 +402,32 @@ private:
   bool use_reflectivity_;
   // photometric term enabled (weight > 0); gates the intensity range correction
   bool photometric_active_;
+
+  // --- Direct visual (camera) photometric term (off by default) ---
+  // Frame-to-frame direct image alignment that constrains the LiDAR-degenerate
+  // tunnel axis (see nano_gicp accumulateVisualResidual). All images are kept
+  // undistorted, single-channel, normalized CV_32F.
+  bool visual_enabled_;
+  double visual_weight_;
+  double visual_huber_delta_;
+  double visual_max_dt_;                 // max |image_stamp - scan_stamp| [s]
+  double visual_gate_max_trans_;         // gate safety floor: max step [m]
+  double visual_gate_max_rot_;           // gate safety floor: max step [rad]
+  std::vector<double> camera_intrinsics_;  // fx, fy, cx, cy
+  std::vector<double> camera_distortion_;  // plumb_bob k1,k2,p1,p2,k3
+  Eigen::Matrix4f cam2lidar_T_;            // T_lidar_cam (maps cam point -> lidar)
+
+  std::mutex image_mtx_;
+  std::deque<std::pair<double, cv::Mat>> image_buffer_;  // (stamp, undistorted gray f32)
+  cv::Mat vis_map1_, vis_map2_;          // undistort rectify maps (built lazily)
+  std::atomic<bool> visual_maps_ready_;
+
+  // Previous frame carried scan-to-scan (the warp target for the next scan).
+  cv::Mat visual_prev_img_;
+  Eigen::Isometry3f visual_T_cw_prev_;
+  bool visual_has_prev_;
+  // Stash of this scan's frame, promoted to "previous" after align().
+  cv::Mat visual_cur_pending_;
+  bool visual_cur_pending_valid_;
 
 };

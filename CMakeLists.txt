@@ -29,6 +29,8 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io registration kdtree search features surface filters)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
+# OpenCV: direct visual photometric residual (nano_gicp) + image undistort (odom)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
 # OpenMP via the imported target (carries compile options and link flags to
 # every dependent instead of mutating global CMAKE_*_FLAGS)
@@ -60,6 +62,7 @@ rosidl_get_typesupport_target(cpp_typesupport_target
 # Include directories (project headers are target-scoped; see below)
 include_directories(${PCL_INCLUDE_DIRS})
 include_directories(${EIGEN3_INCLUDE_DIR})
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
@@ -88,6 +91,7 @@ target_include_directories(nano_gicp PUBLIC
 target_link_libraries(nano_gicp PUBLIC
   nanoflann
   ${PCL_LIBRARIES}
+  ${OpenCV_LIBS}
   $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 
@@ -134,6 +138,14 @@ if(BUILD_TESTING)
   target_compile_definitions(test_imu_integration PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_imu_integration
     dlio_components
+  )
+
+  ament_add_gtest(test_visual_residual test/test_visual_residual.cpp)
+  target_compile_definitions(test_visual_residual PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_visual_residual
+    nano_gicp
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
   )
 endif()
 

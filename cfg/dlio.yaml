@@ -58,3 +58,17 @@
     extrinsics/baselink2lidar/R: [ 1.,  0.,  0.,
                                    0.,  1.,  0.,
                                    0.,  0.,  1. ]
+
+    # camera -> lidar extrinsic for the optional direct visual term: R,t maps a
+    # camera-frame point into the lidar frame (same storage convention as
+    # baselink2lidar). Identity is a placeholder; set per-rig (see the
+    # ouster_tunnel_visual overlay). Only used when odom/visual/enabled.
+    extrinsics/cam2lidar/t: [ 0.,  0.,  0. ]
+    extrinsics/cam2lidar/R: [ 1.,  0.,  0.,
+                              0.,  1.,  0.,
+                              0.,  0.,  1. ]
+
+    # Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion [k1,k2,p1,p2,k3]
+    # for the visual term. Defaults are the 06042026 bag's /lucid_camera_1.
+    camera/intrinsics: [ 1094.19, 1092.23, 969.58, 721.31 ]
+    camera/distortion: [ -0.04409, 0.05337, -0.00124, 0.00002, 0.0 ]

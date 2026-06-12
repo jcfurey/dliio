@@ -33,6 +33,10 @@ def generate_launch_description():
         'imu_topic', default_value='imu_raw',
         description='IMU topic name'
     )
+    declare_camera_topic_arg = DeclareLaunchArgument(
+        'camera_topic', default_value='image_raw',
+        description='Camera image topic (only used when odom/visual/enabled)'
+    )
     declare_use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='false',
         description='Use simulation (/clock) time.'
@@ -75,6 +79,7 @@ def generate_launch_description():
                 remappings=[
                     ('pointcloud', LaunchConfiguration('pointcloud_topic')),
                     ('imu', LaunchConfiguration('imu_topic')),
+                    ('camera', LaunchConfiguration('camera_topic')),
                     ('odom', 'dlio/odom_node/odom'),
                     ('pose', 'dlio/odom_node/pose'),
                     ('path', 'dlio/odom_node/path'),
@@ -101,6 +106,7 @@ def generate_launch_description():
     return LaunchDescription([
         declare_pointcloud_topic_arg,
         declare_imu_topic_arg,
+        declare_camera_topic_arg,
         declare_use_sim_time_arg,
         declare_robot_config_arg,
         declare_params_file_arg,

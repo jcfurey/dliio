@@ -17,6 +17,10 @@
 
 #include "rclcpp/qos.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 // Keep statistics history vectors bounded: drop the oldest half once they
 // exceed max_size, so long runs don't grow memory (and debug() stays O(window)).
@@ -146,6 +150,20 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::SensorDataQoS(),
       std::bind(&dlio::OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
 
+  // Camera image for the optional direct visual term (off by default). Only
+  // subscribed when enabled, so the LIO path is untouched otherwise.
+  if (this->visual_enabled_) {
+    this->image_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto image_sub_opt = rclcpp::SubscriptionOptions();
+    image_sub_opt.callback_group = this->image_cb_group;
+    this->image_sub = this->create_subscription<sensor_msgs::msg::Image>("camera",
+        rclcpp::SensorDataQoS().keep_last(10),
+        std::bind(&dlio::OdomNode::callbackImage, this, std::placeholders::_1), image_sub_opt);
+    RCLCPP_INFO(this->get_logger(),
+        "Direct visual term ENABLED (weight %.3f); subscribing to 'camera'.",
+        this->visual_weight_);
+  }
+
   this->odom_pub     = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
   this->pose_pub     = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 1);
   this->path_pub     = this->create_publisher<nav_msgs::msg::Path>("path", 1);
@@ -202,6 +220,12 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->deskewed_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->current_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->submap_cloud = std::make_shared<const pcl::PointCloud<PointType>>();
+
+  // Visual term runtime state
+  this->visual_maps_ready_ = false;
+  this->visual_has_prev_ = false;
+  this->visual_cur_pending_valid_ = false;
+  this->visual_T_cw_prev_ = Eigen::Isometry3f::Identity();
 
   this->num_processed_keyframes = 0;
 
@@ -395,6 +419,43 @@ void dlio::OdomNode::getParams() {
   this->extrinsics.baselink2lidar_T = Eigen::Matrix4f::Identity();
   this->extrinsics.baselink2lidar_T.block(0, 3, 3, 1) = this->extrinsics.baselink2lidar.t;
   this->extrinsics.baselink2lidar_T.block(0, 0, 3, 3) = this->extrinsics.baselink2lidar.R;
+
+  // camera -> lidar extrinsic (same storage convention as baselink2lidar: the
+  // R,t block maps a camera-frame point into the lidar frame, i.e. T_lidar_cam)
+  std::vector<double> cam2lidar_t, cam2lidar_R;
+  dlio::declare_param(this, "extrinsics/cam2lidar/t", cam2lidar_t, t_default);
+  dlio::declare_param(this, "extrinsics/cam2lidar/R", cam2lidar_R, R_default);
+  this->cam2lidar_T_ = Eigen::Matrix4f::Identity();
+  this->cam2lidar_T_.block(0, 3, 3, 1) =
+      Eigen::Vector3f(cam2lidar_t[0], cam2lidar_t[1], cam2lidar_t[2]);
+  this->cam2lidar_T_.block(0, 0, 3, 3) =
+      Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(
+          std::vector<float>(cam2lidar_R.begin(), cam2lidar_R.end()).data(), 3, 3);
+
+  // Direct visual (camera) photometric term (off by default).
+  dlio::declare_param(this, "odom/visual/enabled", this->visual_enabled_, false,
+      "Enable the direct visual (camera) photometric residual (constrains the LiDAR-degenerate tunnel axis)");
+  dlio::declare_param(this, "odom/visual/weight", this->visual_weight_, 0.0,
+      "Weight of the visual photometric residual relative to the geometric GICP term");
+  dlio::declare_param(this, "odom/visual/huberDelta", this->visual_huber_delta_, 0.05,
+      "Huber threshold on the normalized visual residual (<= 0 disables robustification)");
+  dlio::declare_param(this, "odom/visual/maxTimeDiff", this->visual_max_dt_, 0.05,
+      "Max |image_stamp - scan_stamp| [s] to pair a camera frame with a scan");
+  // Degeneracy-gate safety floor: even when the visual term rescues a
+  // LiDAR-degenerate axis, the per-iteration step there is clamped to these
+  // bounds so a wrong visual constraint cannot run the pose away.
+  dlio::declare_param(this, "odom/visual/gateMaxStepTrans", this->visual_gate_max_trans_, 0.5,
+      "Visual gate safety floor: max per-iteration translation step on a rescued degenerate axis [m]");
+  dlio::declare_param(this, "odom/visual/gateMaxStepRot", this->visual_gate_max_rot_, 0.1,
+      "Visual gate safety floor: max per-iteration rotation step on a rescued degenerate axis [rad]");
+  // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
+  // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
+  std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
+  std::vector<double> dist_default{-0.04409, 0.05337, -0.00124, 0.00002, 0.0};
+  dlio::declare_param(this, "camera/intrinsics", this->camera_intrinsics_, intr_default);
+  dlio::declare_param(this, "camera/distortion", this->camera_distortion_, dist_default);
+  if (this->camera_intrinsics_.size() != 4) { this->camera_intrinsics_ = intr_default; }
+  if (this->camera_distortion_.size() < 4)  { this->camera_distortion_ = dist_default; }
 
   // IMU
   dlio::declare_param(this, "odom/imu/calibration/accel", this->calibrate_accel_, true);
@@ -1261,6 +1322,100 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
 }
 
+void dlio::OdomNode::callbackImage(const sensor_msgs::msg::Image::SharedPtr img) {
+
+  if (!this->visual_enabled_) { return; }
+
+  // Convert to single-channel 8-bit (handles mono/rgb/bgr/bayer encodings).
+  cv_bridge::CvImageConstPtr cvp;
+  try {
+    cvp = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
+  } catch (const std::exception& e) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "cv_bridge could not convert image to mono8: %s", e.what());
+    return;
+  }
+  if (cvp->image.empty()) { return; }
+
+  // Build undistort maps once, from the configured intrinsics/distortion and
+  // the first image's size.
+  if (!this->visual_maps_ready_.load()) {
+    const auto& I = this->camera_intrinsics_;
+    cv::Mat K = (cv::Mat_<double>(3, 3) << I[0], 0.0, I[2], 0.0, I[1], I[3], 0.0, 0.0, 1.0);
+    cv::Mat D(static_cast<int>(this->camera_distortion_.size()), 1, CV_64F);
+    for (size_t i = 0; i < this->camera_distortion_.size(); ++i) { D.at<double>(static_cast<int>(i)) = this->camera_distortion_[i]; }
+    cv::initUndistortRectifyMap(K, D, cv::Mat(), K, cvp->image.size(), CV_16SC2,
+                               this->vis_map1_, this->vis_map2_);
+    this->visual_maps_ready_ = true;
+  }
+
+  cv::Mat undistorted;
+  cv::remap(cvp->image, undistorted, this->vis_map1_, this->vis_map2_, cv::INTER_LINEAR);
+
+  cv::Mat norm;
+  undistorted.convertTo(norm, CV_32FC1, 1.0 / 255.0);
+
+  const double stamp = rclcpp::Time(img->header.stamp).seconds();
+  {
+    std::lock_guard<std::mutex> lock(this->image_mtx_);
+    this->image_buffer_.emplace_back(stamp, norm);
+    while (this->image_buffer_.size() > 30) { this->image_buffer_.pop_front(); }
+  }
+}
+
+bool dlio::OdomNode::setupVisualForScan() {
+
+  if (!this->visual_enabled_ || this->visual_weight_ <= 0.0) {
+    this->gicp.setVisualEnabled(false);
+    return false;
+  }
+
+  // Pick the buffered image nearest this scan's stamp (within tolerance).
+  cv::Mat cur_img;
+  double best_dt = this->visual_max_dt_;
+  {
+    std::lock_guard<std::mutex> lock(this->image_mtx_);
+    for (const auto& kv : this->image_buffer_) {
+      const double dt = std::abs(kv.first - this->scan_stamp);
+      if (dt <= best_dt) { best_dt = dt; cur_img = kv.second; }
+    }
+  }
+  if (cur_img.empty()) {
+    this->gicp.setVisualEnabled(false);  // graceful LiDAR-only this scan
+    return false;
+  }
+
+  // world -> current camera, from the prior (predicted) pose. The current point
+  // in the current camera is pose-correction-independent, so this is the fixed
+  // reference frame; raw world points project here.
+  Eigen::Matrix4f T_wc_cur = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+  Eigen::Isometry3f T_cw_cur;
+  T_cw_cur.matrix() = T_wc_cur.inverse();
+
+  this->gicp.setVisualIntrinsics(
+      static_cast<float>(this->camera_intrinsics_[0]), static_cast<float>(this->camera_intrinsics_[1]),
+      static_cast<float>(this->camera_intrinsics_[2]), static_cast<float>(this->camera_intrinsics_[3]));
+  this->gicp.setVisualWeight(static_cast<float>(this->visual_weight_));
+  this->gicp.setVisualHuberDelta(static_cast<float>(this->visual_huber_delta_));
+  this->gicp.setVisualGateMaxStep(static_cast<float>(this->visual_gate_max_trans_),
+                                  static_cast<float>(this->visual_gate_max_rot_));
+  this->gicp.setVisualCurrentFrame(cur_img, T_cw_cur);
+
+  // Stash for promotion to "previous" after align().
+  this->visual_cur_pending_ = cur_img;
+  this->visual_cur_pending_valid_ = true;
+
+  if (this->visual_has_prev_) {
+    this->gicp.setVisualPreviousFrame(this->visual_prev_img_, this->visual_T_cw_prev_);
+    this->gicp.setVisualEnabled(true);
+    return true;
+  }
+
+  // First scan with an image: no previous frame yet to warp against.
+  this->gicp.setVisualEnabled(false);
+  return false;
+}
+
 void dlio::OdomNode::getNextPose() {
 
   // Check if the new submap is ready to be used
@@ -1277,6 +1432,10 @@ void dlio::OdomNode::getNextPose() {
 
     this->submap_hasChanged = false;
   }
+
+  // Configure the optional direct visual term for this scan (picks the camera
+  // frame nearest scan_stamp; no-op / LiDAR-only if disabled or no image).
+  this->setupVisualForScan();
 
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
@@ -1300,6 +1459,16 @@ void dlio::OdomNode::getNextPose() {
   // Get final transformation in global frame
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
+
+  // Promote this scan's camera frame to "previous" for the next scan's warp,
+  // using the corrected pose (world -> camera at this->T).
+  if (this->visual_cur_pending_valid_) {
+    Eigen::Matrix4f T_wc = this->T * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+    this->visual_T_cw_prev_.matrix() = T_wc.inverse();
+    this->visual_prev_img_ = this->visual_cur_pending_;
+    this->visual_has_prev_ = true;
+    this->visual_cur_pending_valid_ = false;
+  }
 
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
@@ -2258,6 +2427,10 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");
   kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
+  kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
+  kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
+  kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));
+  kv("Visual Rescued Axes", std::to_string(this->gicp.lastVisualRescuedDirections()));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);

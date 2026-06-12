@@ -2,6 +2,7 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <opencv2/core.hpp>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl/registration/registration.h>
@@ -60,6 +61,45 @@ public:
   // beyond it are IRLS-downweighted. <= 0 disables robustification.
   void setPhotometricHuberDelta(float delta);
 
+  // --- Direct visual (camera) photometric term (off by default) ---
+  // Frame-to-frame direct image alignment using LiDAR depth. Each current-scan
+  // world point is projected into the PREVIOUS camera image at the current pose
+  // estimate (pose-dependent) and compared to its brightness in the CURRENT
+  // image (a fixed, pose-independent reference). The residual is accumulated
+  // into the SAME 6x6 Hessian as the geometric/LiDAR-photometric terms, BEFORE
+  // the degeneracy gate, so a camera-constrained tunnel axis lifts that block's
+  // eigenvalue above the gate threshold and the gate stops holding the prior
+  // there. Images are single-channel CV_32F, normalized to the same units as
+  // the residual (i.e. divide 8-bit by 255). No-op unless enabled and both
+  // frames are set.
+  void setVisualEnabled(bool on);
+  void setVisualWeight(float weight);
+  // Huber threshold on the (normalized) visual residual; <= 0 disables.
+  void setVisualHuberDelta(float delta);
+  void setVisualIntrinsics(float fx, float fy, float cx, float cy);
+  // Current frame: reference brightness image + world->camera transform (built
+  // from the prior pose). Raw (uncorrected) world points project here.
+  void setVisualCurrentFrame(const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world);
+  // Previous frame: warp-target image + world->camera transform (previous
+  // optimized pose). Pose-corrected world points project here.
+  void setVisualPreviousFrame(const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world);
+  // Safety floor for the degeneracy gate when the visual term is on. The gate
+  // judges observability from LiDAR geometry alone; on a geometrically
+  // degenerate axis the visual term is allowed to drive motion ONLY if it
+  // actually stiffened that axis, and even then the per-iteration step is
+  // clamped to these bounds so a wrong visual constraint cannot run away.
+  // Axes the visual term does not rescue stay held to the prior (LiDAR-only
+  // behavior). max_trans [m], max_rot [rad].
+  void setVisualGateMaxStep(float max_trans, float max_rot);
+
+  // RMS of the (normalized) visual residual and number of points used in the
+  // last align() (for diagnostics).
+  float lastVisualRms() const;
+  int lastVisualCount() const;
+  // Geometrically-degenerate axes the visual term rescued (allowed bounded
+  // motion on) during the last align(); for diagnostics.
+  int lastVisualRescuedDirections() const;
+
   // Degeneracy gating (solution remapping): the rotation and translation
   // Hessian blocks are eigen-analyzed separately; the update is projected off
   // directions with eigenvalue < ratio * block_lambda_max, so the initial
@@ -98,6 +138,15 @@ protected:
 
   bool estimate_spatial_intensity_gradient(int target_index, Eigen::Vector3f& gradient) const;
   void calculate_target_intensity_gradients();
+
+  // Adds the direct visual photometric contribution to (H, b) for the given
+  // pose `trans` (the same source->target correction the LM loop optimizes).
+  // Accumulates onto whatever is already in H/b (call after linearize()).
+  // Iterates the source cloud (input_); requires only the visual_* state.
+  void accumulateVisualResidual(const Eigen::Isometry3f& trans,
+                                Eigen::Matrix<double, 6, 6>* H,
+                                Eigen::Matrix<double, 6, 1>* b,
+                                double* cost = nullptr);
 
 protected:
   using pcl::Registration<PointSource, PointTarget>::reg_name_;
@@ -143,6 +192,21 @@ protected:
   
   std::shared_ptr<const GradientList> target_intensity_gradients_;
   std::shared_ptr<const std::vector<bool>> gradient_valid_;
+
+  // --- Direct visual (camera) photometric term state ---
+  bool visual_enabled_;
+  float visual_weight_;
+  float visual_huber_delta_;
+  float visual_fx_, visual_fy_, visual_cx_, visual_cy_;
+  cv::Mat visual_cur_;          // current image (fixed reference brightness), CV_32F 1ch
+  cv::Mat visual_prev_;         // previous image (pose-dependent warp target), CV_32F 1ch
+  Eigen::Isometry3f T_cw_cur_;  // world -> current camera (from prior pose)
+  Eigen::Isometry3f T_cw_prev_; // world -> previous camera (previous optimized pose)
+  float visual_gate_max_trans_; // gate safety floor: max per-iter translation step [m]
+  float visual_gate_max_rot_;   // gate safety floor: max per-iter rotation step [rad]
+  float last_visual_rms_;
+  int last_visual_count_;
+  int last_visual_rescued_;
 };
 
 } // namespace nano_gicp
