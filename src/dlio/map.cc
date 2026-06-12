@@ -15,7 +15,8 @@
 
 #include <filesystem>
 
-dlio::MapNode::MapNode(): Node("dlio_map_node") {
+dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
+    : Node("dlio_map_node", options) {
 
   this->getParams();
 

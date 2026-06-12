@@ -61,6 +61,11 @@
     # With adaptive: true (dlio.yaml) threshD is scaled by spaciousness.
     odom/keyframe/threshD: 1.0
     odom/keyframe/threshR: 45.0
+    # Bound on the keyframe map (0 = unlimited). When exceeded, the most
+    # spatially redundant keyframe is removed (the origin anchor and recent
+    # keyframes are kept). Bounds long-run memory at the cost of map detail
+    # in revisited areas.
+    odom/keyframe/maxKeyframes: 0
 
     # Submap construction: K nearest keyframes + K convex-hull + K
     # concave-hull keyframes (from DLO).
@@ -75,7 +80,7 @@
     odom/gicp/maxIterations: 32
     odom/gicp/transformationEpsilon: 0.01 # translation step convergence [m]
     odom/gicp/rotationEpsilon: 0.01       # rotation step convergence [rad]
-    odom/gicp/initLambdaFactor: 1e-9      # Hessian diagonal regularization
+    odom/gicp/initLambdaFactor: 1.0e-9      # Hessian diagonal regularization
 
     # GICP covariance regularization:
     #   min_eig (default)  - clamp small covariance singular values: this
@@ -104,6 +109,10 @@
     odom/gicp/photometricWeight: 0.1
     # Neighbors used to estimate the spatial channel gradient on the submap.
     odom/gicp/gradientKNeighbors: 10
+    # Huber threshold on the normalized photometric residual: residuals beyond
+    # this are downweighted (robust to specular/wet-surface outliers).
+    # 0.05 = ~13 intensity counts at photometricScale 255. <= 0 disables.
+    odom/gicp/photometricHuberDelta: 0.05
 
     # Photometric channel:
     #   intensity    - raw return strength (range-dependent); uses the range
@@ -132,6 +141,11 @@
     # (robot_localization etc.).
     odom/covariance/pose:  [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
     odom/covariance/twist: [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
+
+    # Terminal status dashboard (ANSI clear-screen UI). Disable when logs are
+    # multiplexed (ros2 launch with multiple nodes, containers, systemd).
+    # The composed launch file disables it automatically.
+    odom/debug/dashboard: true
 
     # Hierarchical geometric observer gains (Lopez, arXiv:2303.02777):
     # position / velocity / orientation correction gains and accel/gyro bias

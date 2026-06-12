@@ -67,9 +67,11 @@ link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
 # NanoFLANN
+# (PIC: linked into the shared component library)
 add_library(nanoflann STATIC src/nano_gicp/nanoflann.cc)
+set_target_properties(nanoflann PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nanoflann PRIVATE PCL_NO_PRECOMPILE)
-target_include_directories(nanoflann PUBLIC 
+target_include_directories(nanoflann PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
@@ -79,38 +81,43 @@ target_link_libraries(nanoflann PUBLIC ${PCL_LIBRARIES})
 add_library(nano_gicp STATIC
   src/nano_gicp/nano_gicp.cc
 )
+set_target_properties(nano_gicp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nano_gicp PRIVATE PCL_NO_PRECOMPILE)
-target_include_directories(nano_gicp PUBLIC 
+target_include_directories(nano_gicp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(nano_gicp PUBLIC 
-  nanoflann 
+target_link_libraries(nano_gicp PUBLIC
+  nanoflann
   ${PCL_LIBRARIES}
   ${OpenMP_LIBS}
 )
 
-# Odometry Node
-# ament_auto_add_executable links the ROS deps from package.xml (rclcpp,
-# tf2_ros, pcl_ros, pcl_conversions, sensor_msgs, nav_msgs, geometry_msgs)
-# and installs the target to lib/${PROJECT_NAME}.
-ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
-target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_odom_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_odom_node
+# Component library: both nodes, loadable into a component container for
+# intra-process communication; the classic executables link it too.
+ament_auto_add_library(dlio_components SHARED
+  src/dlio/odom.cc
+  src/dlio/map.cc
+  src/dlio/components.cc
+)
+target_compile_definitions(dlio_components PRIVATE PCL_NO_PRECOMPILE)
+target_compile_options(dlio_components PRIVATE ${OpenMP_CXX_FLAGS})
+target_link_libraries(dlio_components
   nano_gicp
   Threads::Threads
   ${PCL_LIBRARIES}
-)
-
-# Mapping Node
-ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
-target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_map_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_map_node
-  ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
 )
+rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
+
+# Standalone executables
+ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc)
+target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_odom_node dlio_components)
+
+ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc)
+target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_map_node dlio_components)
 
 install(DIRECTORY cfg launch
   DESTINATION share/${PROJECT_NAME}

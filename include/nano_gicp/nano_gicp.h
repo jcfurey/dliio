@@ -56,6 +56,9 @@ public:
   // divided by this before gradient estimation and residuals, so
   // photometricWeight is in normalized units and transfers across sensors.
   void setPhotometricScale(float scale);
+  // Huber threshold on the (normalized) photometric residual; residuals
+  // beyond it are IRLS-downweighted. <= 0 disables robustification.
+  void setPhotometricHuberDelta(float delta);
 
   // Degeneracy gating (solution remapping): the rotation and translation
   // Hessian blocks are eigen-analyzed separately; the update is projected off
@@ -128,6 +131,7 @@ protected:
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
   float photometric_scale_;            // channel full-scale; channel is divided by this
+  float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float degeneracy_thresh_ratio_;
   int last_degenerate_directions_;
   

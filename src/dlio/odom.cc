@@ -27,7 +27,8 @@ static void cap_history(std::vector<T>& v, size_t max_size = 1000) {
   }
 }
 
-dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
+dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
+    : Node("dlio_odom_node", options) {
 
   this->getParams();
 
@@ -75,6 +76,13 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   double photometricScale;
   dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0);
   this->gicp.setPhotometricScale(static_cast<float>(photometricScale));
+
+  // Huber threshold on the normalized photometric residual; residuals beyond
+  // it are downweighted so specular/wet-surface outliers can't shove the
+  // pose at full weight. <= 0 disables.
+  double photometricHuberDelta;
+  dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05);
+  this->gicp.setPhotometricHuberDelta(static_cast<float>(photometricHuberDelta));
 
   // GICP covariance regularization:
   //   min_eig (default)    - clamp small singular values (this fork's historical
@@ -270,7 +278,25 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
 
 }
 
-dlio::OdomNode::~OdomNode() {}
+dlio::OdomNode::~OdomNode() {
+
+  // Unblock the background submap thread (it may be paused waiting on
+  // main_loop_running) and wait for it; then join the worker threads.
+  // Threads are joined (not detached) so a component unload or shutdown
+  // cannot leave them running against a destroyed node.
+  {
+    std::lock_guard<std::mutex> lk(this->main_loop_running_mutex);
+    this->main_loop_running = false;
+  }
+  this->submap_build_cv.notify_all();
+  if (this->submap_future.valid()) { this->submap_future.wait(); }
+
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
+  if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
+  if (this->metrics_thread.joinable()) { this->metrics_thread.join(); }
+  if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
+}
 
 void dlio::OdomNode::getParams() {
 
@@ -295,6 +321,14 @@ void dlio::OdomNode::getParams() {
   // Keyframe Threshold
   dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
+
+  // Bound on the keyframe map (0 = unlimited). When exceeded, the most
+  // spatially redundant processed keyframe is removed.
+  dlio::declare_param(this, "odom/keyframe/maxKeyframes", this->max_keyframes_, 0);
+
+  // Terminal status dashboard (ANSI clear-screen); disable when logs are
+  // multiplexed (ros2 launch, containers, systemd).
+  dlio::declare_param(this, "odom/debug/dashboard", this->dashboard_, true);
 
   // Submap
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
@@ -958,8 +992,12 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   // Compute Metrics
+  // (join-before-respawn: the previous iteration's thread has long finished,
+  //  so join() returns immediately; keeping threads joinable lets the
+  //  destructor wait for them instead of leaking detached threads into a
+  //  destroyed node at shutdown/component unload)
+  if (this->metrics_thread.joinable()) { this->metrics_thread.join(); }
   this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
-  this->metrics_thread.detach();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
@@ -984,6 +1022,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Update current keyframe poses and map
   this->updateKeyframes();
+
+  // Optionally bound the keyframe map. Only safe while the background submap
+  // thread is idle (new_submap_is_ready), since pruning re-indexes the
+  // keyframe vectors that buildKeyframesAndSubmap iterates.
+  if (this->max_keyframes_ > 0 && this->new_submap_is_ready
+      && (int)this->keyframes.size() > this->max_keyframes_) {
+    this->pruneKeyframes();
+  }
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
@@ -1018,17 +1064,21 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   } else {
     published_cloud = this->deskewed_scan;
   }
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
-  this->publish_thread.detach();
 
   // Update some statistics
   this->comp_times.push_back(this->now().seconds() - then);
   cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
-  // Debug statements and publish custom DLIO message
-  this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
-  this->debug_thread.detach();
+  // Terminal dashboard (odom/debug/dashboard); disable under launch files,
+  // containers, or logging setups where the ANSI clear-screen output garbles
+  // multiplexed logs.
+  if (this->dashboard_) {
+    if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+    this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
+  }
 
   this->geo.first_opt_done = true;
 
@@ -1819,6 +1869,53 @@ void dlio::OdomNode::updateKeyframes() {
 
 }
 
+void dlio::OdomNode::pruneKeyframes() {
+
+  // Bound the keyframe map by removing the most spatially redundant keyframe:
+  // the one with the smallest distance to its nearest neighbor. The first
+  // keyframe (origin anchor) and the most recent ones (likely in the current
+  // submap neighborhood) are never removed. Caller guarantees the background
+  // submap thread is idle -- pruning re-indexes the vectors it iterates.
+  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+
+  const int keep_recent = 10;
+
+  while ((int)this->keyframes.size() > this->max_keyframes_) {
+
+    // candidates: processed keyframes only, excluding the anchor and the tail
+    int last_candidate = std::min(this->num_processed_keyframes,
+                                  (int)this->keyframes.size() - keep_recent);
+    if (last_candidate <= 1) { break; }
+
+    int prune_idx = -1;
+    float min_nn_dist = std::numeric_limits<float>::max();
+    for (int i = 1; i < last_candidate; i++) {
+      float nn = std::numeric_limits<float>::max();
+      for (int j = 0; j < (int)this->keyframes.size(); j++) {
+        if (j == i) { continue; }
+        float d = (this->keyframes[i].first.first - this->keyframes[j].first.first).norm();
+        nn = std::min(nn, d);
+      }
+      if (nn < min_nn_dist) {
+        min_nn_dist = nn;
+        prune_idx = i;
+      }
+    }
+    if (prune_idx < 0) { break; }
+
+    this->keyframes.erase(this->keyframes.begin() + prune_idx);
+    this->keyframe_timestamps.erase(this->keyframe_timestamps.begin() + prune_idx);
+    this->keyframe_normals.erase(this->keyframe_normals.begin() + prune_idx);
+    this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
+    --this->num_processed_keyframes;
+  }
+
+  // indices into the keyframe vectors are no longer valid; force the next
+  // submap build to start fresh
+  this->submap_kf_idx_prev.clear();
+
+}
+
 void dlio::OdomNode::setAdaptiveParams() {
 
   // Spaciousness
@@ -1994,8 +2091,8 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
     this->keyframes[i].second = transformed_keyframe;
     this->keyframe_normals[i] = transformed_covariances;
 
+    if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
     this->publish_keyframe_thread = std::thread( &dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i] );
-    this->publish_keyframe_thread.detach();
   }
 
   lock.unlock();

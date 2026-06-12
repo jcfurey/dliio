@@ -1,5 +1,3 @@
-#pragma once
-
 /***********************************************************
  *                                                         *
  * Copyright (c)                                           *
@@ -12,17 +10,14 @@
  *                                                         *
  ***********************************************************/
 
-#include "rclcpp/rclcpp.hpp"
+// Component registration: lets both nodes run inside a (multithreaded)
+// component container with intra-process communication, so the keyframe
+// clouds between the odometry and map nodes skip RMW serialization.
 
-namespace dlio {
+#include <rclcpp_components/register_node_macro.hpp>
 
-    template <typename T>
-    struct identity { typedef T type; };
+#include "dlio/odom.h"
+#include "dlio/map.h"
 
-    template <typename T>
-    void declare_param(rclcpp::Node* node, const std::string param_name, T& param, const typename identity<T>::type& default_value) {
-        node->declare_parameter(param_name, default_value);
-        node->get_parameter(param_name, param);
-    }
-
-}
+RCLCPP_COMPONENTS_REGISTER_NODE(dlio::OdomNode)
+RCLCPP_COMPONENTS_REGISTER_NODE(dlio::MapNode)

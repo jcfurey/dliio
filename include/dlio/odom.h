@@ -1,3 +1,5 @@
+#pragma once
+
 /***********************************************************
  *                                                         *
  * Copyright (c)                                           *
@@ -43,7 +45,7 @@ class dlio::OdomNode: public rclcpp::Node {
 
 public:
 
-  OdomNode();
+  explicit OdomNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~OdomNode();
 
   void start();
@@ -101,6 +103,7 @@ private:
   sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu);
 
   void updateKeyframes();
+  void pruneKeyframes();
   void computeConvexHull();
   void computeConcaveHull();
   void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
@@ -327,6 +330,9 @@ private:
 
   double keyframe_thresh_dist_;
   double keyframe_thresh_rot_;
+
+  int max_keyframes_;
+  bool dashboard_;
 
   int submap_knn_;
   int submap_kcv_;

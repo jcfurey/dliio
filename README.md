@@ -24,6 +24,10 @@ Added `regularizationMethod` (default value: `min_eig`) and `photometricScale` (
 
 `regularizationMethod` selects the GICP covariance regularization: `min_eig` preserves this fork's historical behavior (clamped singular values, previously mislabeled "plane" internally); `plane` is true GICP plane-to-plane (fixed scale-free discs, recommended for degenerate environments). `photometricScale` is the full-scale value of the photometric channel — the channel is normalized by it so `photometricWeight` is dimensionless and transfers across sensors (255 covers 8-bit intensity and Ouster calibrated reflectivity; 65535 for raw 16-bit channels).
 
+Added `photometricHuberDelta` (default value: 0.05), `maxKeyframes` (default value: 0), and `odom/debug/dashboard` (default value: true) to cfg/params.yaml.
+
+`photometricHuberDelta` Huber-robustifies the photometric residual so specular/wet-surface outliers are downweighted instead of shoving the pose at full weight. `maxKeyframes` optionally bounds the keyframe map by pruning the most spatially redundant keyframe when exceeded (0 = unlimited, the historical behavior). `odom/debug/dashboard` toggles the ANSI terminal dashboard — disable it under multiplexed logging; the composed launch file disables it automatically.
+
 ## Configuration & wiring
 
 **Config files** (all parameters are commented in the files themselves):
@@ -36,6 +40,8 @@ Added `regularizationMethod` (default value: `min_eig`) and `photometricScale` (
 | `cfg/examples/simulation.yaml` | Overlay: sim time, no IMU calibration wait, ideal extrinsics. |
 
 **Launch arguments** (`dlio.launch.py`): `pointcloud_topic`, `imu_topic`, `rviz`, `use_sim_time` (default **false**; set true under Gazebo or `ros2 bag play --clock`), `robot_config`, `params_file`. Overlays can be appended at run time with `--ros-args --params-file <overlay.yaml>` (later files win).
+
+**Composed launch** (`dlio_composed.launch.py`): same arguments (minus `rviz`); runs both nodes as components in one multithreaded container with intra-process communication, so keyframe clouds pass between the odometry and map nodes without serialization. The terminal dashboard is disabled automatically in this mode. Both nodes are also loadable into your own container (`dlio::OdomNode`, `dlio::MapNode`).
 
 **Outputs / downstream wiring:**
 

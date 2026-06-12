@@ -1,6 +1,7 @@
 #include "nano_gicp/nano_gicp.h"
 #include "dlio/dlio.h"
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <omp.h>
 #include <Eigen/Dense>
@@ -40,6 +41,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->gradient_k_neighbors_ = 10;
   this->photometric_use_reflectivity_ = false;
   this->photometric_scale_ = 255.0f;
+  this->photometric_huber_delta_ = 0.05f;
   this->intensity_gradient_threshold_ = 1e-6;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->last_degenerate_directions_ = 0;
@@ -96,6 +98,11 @@ void NanoGICP<PointSource, PointTarget>::setPhotometricChannel(bool use_reflecti
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricScale(float scale) {
     this->photometric_scale_ = (scale > 0.f) ? scale : 1.0f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setPhotometricHuberDelta(float delta) {
+    this->photometric_huber_delta_ = delta;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -363,9 +370,14 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
 
         // Apply transformation update
-        trans.prerotate(Eigen::AngleAxisf(dx[2], Eigen::Vector3f::UnitZ()));
-        trans.prerotate(Eigen::AngleAxisf(dx[1], Eigen::Vector3f::UnitY()));
-        trans.prerotate(Eigen::AngleAxisf(dx[0], Eigen::Vector3f::UnitX()));
+        // Apply the rotation step as a proper SO(3) exponential (left
+        // perturbation) rather than composing per-axis Euler increments,
+        // which is only a small-angle approximation and degrades on the
+        // large first steps of aggressive motion.
+        const float angle = dx.head<3>().norm();
+        if (angle > 1e-12f) {
+            trans.prerotate(Eigen::AngleAxisf(angle, dx.head<3>() / angle));
+        }
         trans.pretranslate(dx.tail<3>());
 
         // Check convergence: rotation step (dx.head) vs rotation_epsilon_,
@@ -472,8 +484,16 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 Eigen::Matrix<float, 1, 6> J_photometric;
                 J_photometric.block<1, 3>(0, 0) = gradient.transpose() * skew(transformed_source);
                 J_photometric.block<1, 3>(0, 3) = -gradient.transpose();
-                
+
+                // Huber robustification: photometric outliers (specular
+                // returns, wet patches, exposure-like artifacts) otherwise
+                // shove the pose at full weight -- IRLS down-weighting
+                // beyond photometric_huber_delta_ (normalized units).
                 float weight = photometric_weight_;
+                const float abs_r = std::abs(intensity_diff);
+                if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
+                    weight *= photometric_huber_delta_ / abs_r;
+                }
                 H_private[thread_num] += weight * J_photometric.transpose() * J_photometric;
                 b_private[thread_num] += weight * J_photometric.transpose() * intensity_diff;
             }

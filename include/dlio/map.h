@@ -1,3 +1,5 @@
+#pragma once
+
 /***********************************************************
  *                                                         *
  * Copyright (c)                                           *
@@ -26,7 +28,7 @@ class dlio::MapNode: public rclcpp::Node {
 
 public:
 
-  MapNode();
+  explicit MapNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~MapNode();
 
   void start();
