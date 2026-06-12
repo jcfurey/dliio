@@ -15,7 +15,8 @@
 
 #include <filesystem>
 
-dlio::MapNode::MapNode(): Node("dlio_map_node") {
+dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
+    : Node("dlio_map_node", options) {
 
   this->getParams();
 
@@ -89,19 +90,19 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   std::string p = req->save_path;
 
   if (!std::filesystem::is_directory(p)) {
-    std::cout << "Could not find directory " << p << std::endl;
+    RCLCPP_ERROR(this->get_logger(), "save_pcd: could not find directory %s", p.c_str());
     res->success = false;
     return;
   }
 
   if (m->empty()) {
-    std::cout << "Map is empty, nothing to save" << std::endl;
+    RCLCPP_WARN(this->get_logger(), "save_pcd: map is empty, nothing to save");
     res->success = false;
     return;
   }
 
-  std::cout << std::setprecision(2) << "Saving map to " << p + "/dlio_map.pcd"
-    << " with leaf size " << to_string_with_precision(leaf_size, 2) << "... "; std::cout.flush();
+  RCLCPP_INFO(this->get_logger(), "save_pcd: saving map (%zu points) to %s/dlio_map.pcd with leaf size %.2f",
+              m->size(), p.c_str(), leaf_size);
 
   // voxelize map
   pcl::VoxelGrid<PointType> vg;
@@ -114,8 +115,8 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   res->success = ret == 0;
 
   if (res->success) {
-    std::cout << "done" << std::endl;
+    RCLCPP_INFO(this->get_logger(), "save_pcd: done (%zu points after voxelization)", m->size());
   } else {
-    std::cout << "failed" << std::endl;
+    RCLCPP_ERROR(this->get_logger(), "save_pcd: failed to write %s/dlio_map.pcd", p.c_str());
   }
 }

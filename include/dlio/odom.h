@@ -1,3 +1,5 @@
+#pragma once
+
 /***********************************************************
  *                                                         *
  * Copyright (c)                                           *
@@ -43,15 +45,33 @@ class dlio::OdomNode: public rclcpp::Node {
 
 public:
 
-  OdomNode();
+  explicit OdomNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~OdomNode();
 
   void start();
 
+  // IMU measurement sample. Public (with the static integration entry point
+  // below) so the continuous-time integration math is unit-testable.
+  struct ImuMeas {
+    double stamp;
+    double dt; // defined as the difference between the current and the previous measurement
+    Eigen::Vector3f ang_vel;
+    Eigen::Vector3f lin_accel;
+  };
+
+  // Pure constant-jerk / constant-angular-acceleration integration between
+  // IMU samples, evaluated at sorted_timestamps (the DLIO paper's analytic
+  // deskew kernel). Static and side-effect-free.
+  static std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+    integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
+                         const std::vector<double>& sorted_timestamps,
+                         boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
+                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                         double gravity);
+
 private:
 
   struct State;
-  struct ImuMeas;
 
   void getParams();
 
@@ -81,18 +101,12 @@ private:
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                  const std::vector<double>& sorted_timestamps);
-  std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
-    integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
-                         const std::vector<double>& sorted_timestamps,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it);
   void propagateGICP();
 
   void propagateState();
   void updateState();
 
   void setAdaptiveParams();
-  void setKeyframeCloud();
 
   void computeMetrics();
   void computeSpaciousness();
@@ -101,6 +115,7 @@ private:
   sensor_msgs::msg::Imu::SharedPtr transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu);
 
   void updateKeyframes();
+  void pruneKeyframes();
   void computeConvexHull();
   void computeConcaveHull();
   void pushSubmapIndices(std::vector<float> dists, int k, std::vector<int> frames);
@@ -148,7 +163,6 @@ private:
   // Threads
   std::thread publish_thread;
   std::thread publish_keyframe_thread;
-  std::thread metrics_thread;
   std::thread debug_thread;
 
   // Distance traveled (maintained incrementally in callbackPointCloud)
@@ -181,8 +195,6 @@ private:
   pcl::PointCloud<PointType>::ConstPtr deskewed_scan;
   pcl::PointCloud<PointType>::ConstPtr current_scan;
 
-  // Keyframes
-  pcl::PointCloud<PointType>::ConstPtr keyframe_cloud;
   int num_processed_keyframes;
 
   pcl::ConvexHull<PointType> convex_hull;
@@ -207,7 +219,6 @@ private:
   rclcpp::Time scan_header_stamp;
   double scan_stamp;
   double prev_scan_stamp;
-  double scan_dt;
   std::vector<double> comp_times;
   std::vector<double> imu_rates;
   std::vector<double> lidar_rates;
@@ -221,7 +232,6 @@ private:
 
   // Transformations
   Eigen::Matrix4f T, T_prior, T_corr;
-  Eigen::Quaternionf q_final;
 
   Eigen::Vector3f origin;
 
@@ -240,22 +250,13 @@ private:
   rclcpp::Time imu_stamp;
   double first_imu_stamp;
   double prev_imu_stamp;
-  double imu_dp, imu_dq_deg;
 
-  struct ImuMeas {
-    double stamp;
-    double dt; // defined as the difference between the current and the previous measurement
-    Eigen::Vector3f ang_vel;
-    Eigen::Vector3f lin_accel;
-  }; ImuMeas imu_meas;
+  ImuMeas imu_meas;
 
   boost::circular_buffer<ImuMeas> imu_buffer;
   std::mutex mtx_imu;
   std::condition_variable cv_imu_stamp;
 
-  static bool comparatorImu(ImuMeas m1, ImuMeas m2) {
-    return (m1.stamp < m2.stamp);
-  };
 
   // Geometric Observer
   struct Geo {
@@ -296,7 +297,6 @@ private:
     Eigen::Quaternionf q; // orientation in world frame
   };
   Pose lidarPose;
-  Pose imuPose;
 
   // Metrics
   struct Metrics {
@@ -321,17 +321,16 @@ private:
 
   bool adaptive_params_;
 
-  double obs_submap_thresh_;
-  double obs_keyframe_thresh_;
-  double obs_keyframe_lag_;
 
   double keyframe_thresh_dist_;
   double keyframe_thresh_rot_;
 
+  int max_keyframes_;
+  bool dashboard_;
+
   int submap_knn_;
   int submap_kcv_;
   int submap_kcc_;
-  double submap_concave_alpha_;
 
   bool densemap_filtered_;
   bool wait_until_move_;
@@ -372,5 +371,7 @@ private:
   double intensity_r_ref_;
   // Photometric channel: false = intensity, true = reflectivity
   bool use_reflectivity_;
+  // photometric term enabled (weight > 0); gates the intensity range correction
+  bool photometric_active_;
 
 };

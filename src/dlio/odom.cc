@@ -27,7 +27,8 @@ static void cap_history(std::vector<T>& v, size_t max_size = 1000) {
   }
 }
 
-dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
+dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
+    : Node("dlio_odom_node", options) {
 
   this->getParams();
 
@@ -45,20 +46,26 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   // the keys in cfg/params.yaml. Dot-separated names do NOT match the YAML keys and
   // silently fall back to the defaults (which left the photometric term disabled).
   double photometricWeight;
-  dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0);
+  dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0,
+      "Weight of the photometric GICP residual relative to the geometric term (dimensionless; 0 disables)");
 
   // Intensity range correction parameters
-  dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0);
-  dlio::declare_param(this, "odom/preprocessing/intensityRRef", this->intensity_r_ref_, 1.0);
+  dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0,
+      "Intensity range-correction falloff exponent (2.0 = inverse-square)");
+  dlio::declare_param(this, "odom/preprocessing/intensityRRef", this->intensity_r_ref_, 1.0,
+      "Intensity range-correction reference range [m]");
   int gradientKNeighbors;
-  dlio::declare_param(this, "odom/gicp/gradientKNeighbors", gradientKNeighbors, 10);
+  dlio::declare_param(this, "odom/gicp/gradientKNeighbors", gradientKNeighbors, 10,
+      "Neighbors used to estimate the spatial photometric gradient on the submap");
 
   // Photometric channel: "intensity" (range-dependent; pairs with the range
   // correction below) or "reflectivity" (e.g. Ouster calibrated reflectivity,
   // already range-normalized -> the range correction is skipped for it).
   std::string photometricChannel;
-  dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"));
+  dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"),
+      "Point field feeding the photometric term: 'intensity' or 'reflectivity'");
   this->use_reflectivity_ = (photometricChannel == "reflectivity");
+  this->photometric_active_ = (photometricWeight > 0.0);
   if (photometricChannel != "intensity" && photometricChannel != "reflectivity") {
     RCLCPP_WARN(this->get_logger(),
         "Unknown odom/gicp/photometricChannel '%s'; defaulting to 'intensity'.",
@@ -73,8 +80,17 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   // so photometricWeight is sensor-independent (255 covers 8-bit intensity and
   // Ouster calibrated reflectivity; use 65535 for raw 16-bit channels).
   double photometricScale;
-  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0);
+  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0,
+      "Full-scale of the photometric channel (channel is divided by this; 255 for 8-bit / Ouster reflectivity)");
   this->gicp.setPhotometricScale(static_cast<float>(photometricScale));
+
+  // Huber threshold on the normalized photometric residual; residuals beyond
+  // it are downweighted so specular/wet-surface outliers can't shove the
+  // pose at full weight. <= 0 disables.
+  double photometricHuberDelta;
+  dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05,
+      "Huber threshold on the normalized photometric residual (<= 0 disables robustification)");
+  this->gicp.setPhotometricHuberDelta(static_cast<float>(photometricHuberDelta));
 
   // GICP covariance regularization:
   //   min_eig (default)    - clamp small singular values (this fork's historical
@@ -83,7 +99,8 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   //   normalized_min_eig   - scale-normalized clamp
   //   frobenius | none
   std::string regularizationMethod;
-  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"));
+  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"),
+      "GICP covariance regularization: min_eig | plane | normalized_min_eig | frobenius | none");
   nano_gicp::RegularizationMethod reg_method = nano_gicp::RegularizationMethod::MIN_EIG;
   if (regularizationMethod == "plane") { reg_method = nano_gicp::RegularizationMethod::PLANE; }
   else if (regularizationMethod == "normalized_min_eig") { reg_method = nano_gicp::RegularizationMethod::NORMALIZED_MIN_EIG; }
@@ -101,7 +118,8 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   // separately and the GICP update is projected off directions below
   // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
   double degeneracyThreshRatio;
-  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005);
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005,
+      "Degeneracy gate: block eigen-directions below ratio*lambda_max hold the IMU prior (0 disables)");
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
@@ -270,7 +288,24 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
 
 }
 
-dlio::OdomNode::~OdomNode() {}
+dlio::OdomNode::~OdomNode() {
+
+  // Unblock the background submap thread (it may be paused waiting on
+  // main_loop_running) and wait for it; then join the worker threads.
+  // Threads are joined (not detached) so a component unload or shutdown
+  // cannot leave them running against a destroyed node.
+  {
+    std::lock_guard<std::mutex> lk(this->main_loop_running_mutex);
+    this->main_loop_running = false;
+  }
+  this->submap_build_cv.notify_all();
+  if (this->submap_future.valid()) { this->submap_future.wait(); }
+
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
+  if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
+  if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
+}
 
 void dlio::OdomNode::getParams() {
 
@@ -295,6 +330,16 @@ void dlio::OdomNode::getParams() {
   // Keyframe Threshold
   dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
+
+  // Bound on the keyframe map (0 = unlimited). When exceeded, the most
+  // spatially redundant processed keyframe is removed.
+  dlio::declare_param(this, "odom/keyframe/maxKeyframes", this->max_keyframes_, 0,
+      "Bound on the keyframe map; most redundant keyframe pruned when exceeded (0 = unlimited)");
+
+  // Terminal status dashboard (ANSI clear-screen); disable when logs are
+  // multiplexed (ros2 launch, containers, systemd).
+  dlio::declare_param(this, "odom/debug/dashboard", this->dashboard_, true,
+      "Terminal ANSI status dashboard; disable under multiplexed logging");
 
   // Submap
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
@@ -609,7 +654,7 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // copies fields whose datatype matches our struct (reflectivity is a float here,
   // but sensors publish it as uint8/uint16), so copy it explicitly with conversion.
   // Done before NaN removal so indices still line up 1:1 with the message.
-  if (this->use_reflectivity_) {
+  if (this->use_reflectivity_ && this->photometric_active_) {
     auto rfield = std::find_if(pc->fields.begin(), pc->fields.end(),
         [](const sensor_msgs::msg::PointField& f){ return f.name == "reflectivity"; });
     if (rfield != pc->fields.end()) {
@@ -646,8 +691,11 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // I_corrected = clamp( I_raw * (r / r_ref)^alpha , 0, 255 )
   // intensity_alpha_ : falloff exponent  (~2.0 for inverse-square law)
   // intensity_r_ref_ : reference range in metres (anchor point, typically 1.0 m)
-  // Skipped when using reflectivity, which is already range-normalized by the sensor.
-  if (!this->use_reflectivity_) {
+  // Skipped when using reflectivity (already range-normalized by the sensor)
+  // AND when the photometric term is disabled: the corrected values propagate
+  // into the published deskewed/keyframe clouds, so downstream consumers
+  // should only see modified intensities when the feature is actually in use.
+  if (!this->use_reflectivity_ && this->photometric_active_) {
     const float alpha   = static_cast<float>(this->intensity_alpha_);
     const float r_ref   = static_cast<float>(this->intensity_r_ref_);
     if (r_ref > 0.f) {  // r_ref <= 0 would divide-by-zero -> inf/NaN intensities
@@ -867,7 +915,10 @@ void dlio::OdomNode::deskewPointcloud() {
   // if there are no frames between the start and end of the sweep
   // that probably means that there's a sync issue
   if (frames.size() != timestamps.size()) {
-    RCLCPP_FATAL(this->get_logger(),"Bad time sync between LiDAR and IMU!");
+    // not fatal: gracefully degrades to a rigid (non-deskewed) transform below
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "IMU data does not cover the scan period (time sync / dropout?); "
+        "skipping motion correction for this scan");
 
     this->T_prior = this->T;
     pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
@@ -953,13 +1004,18 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   if (this->current_scan->points.size() <= this->gicp_min_num_points_) {
-    RCLCPP_FATAL(this->get_logger(), "Low number of points in the cloud!");
+    // not fatal: this scan is skipped; odometry continues on IMU propagation
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Low number of points in the cloud (%zu <= %d); skipping scan",
+        this->current_scan->points.size(), this->gicp_min_num_points_);
     return;
   }
 
-  // Compute Metrics
-  this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
-  this->metrics_thread.detach();
+  // Compute Metrics (inline: cheap relative to registration, removes the
+  // data race on original_scan/metrics vectors the old worker thread had,
+  // and setAdaptiveParams below now uses THIS scan's metrics, not the
+  // previous scan's)
+  this->computeMetrics();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
@@ -984,6 +1040,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Update current keyframe poses and map
   this->updateKeyframes();
+
+  // Optionally bound the keyframe map. Only safe while the background submap
+  // thread is idle (new_submap_is_ready), since pruning re-indexes the
+  // keyframe vectors that buildKeyframesAndSubmap iterates.
+  if (this->max_keyframes_ > 0 && this->new_submap_is_ready
+      && (int)this->keyframes.size() > this->max_keyframes_) {
+    this->pruneKeyframes();
+  }
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
@@ -1018,17 +1082,21 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   } else {
     published_cloud = this->deskewed_scan;
   }
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
-  this->publish_thread.detach();
 
   // Update some statistics
   this->comp_times.push_back(this->now().seconds() - then);
   cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
-  // Debug statements and publish custom DLIO message
-  this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
-  this->debug_thread.detach();
+  // Terminal dashboard (odom/debug/dashboard); disable under launch files,
+  // containers, or logging setups where the ANSI clear-screen output garbles
+  // multiplexed logs.
+  if (this->dashboard_) {
+    if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+    this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
+  }
 
   this->geo.first_opt_done = true;
 
@@ -1349,14 +1417,15 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it);
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it, this->gravity_);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
                                      boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it) {
+                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                                     double gravity) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -1365,7 +1434,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
   Eigen::Vector3f p = p_init;
   Eigen::Vector3f v = v_init;
   Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
-  a[2] -= this->gravity_;
+  a[2] -= gravity;
 
   // Iterate over IMU measurements and timestamps
   auto prev_imu_it = begin_imu_it;
@@ -1388,7 +1457,14 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Average angular velocity
     Eigen::Vector3f omega = f0.ang_vel + 0.5*alpha_dt;
 
-    // Orientation
+    // Orientation at f0: the interpolation below integrates forward from
+    // here with idt measured from f0.stamp, matching how position is
+    // interpolated. Using the already-advanced q double-counted one IMU
+    // sample of rotation (a constant omega*dt attitude offset on every
+    // deskewed point). Caught by test_imu_integration.
+    Eigen::Quaternionf q0 = q;
+
+    // Orientation at f
     q = Eigen::Quaternionf (
       q.w() - 0.5*( q.x()*omega[0] + q.y()*omega[1] + q.z()*omega[2] ) * dt,
       q.x() + 0.5*( q.w()*omega[0] - q.z()*omega[1] + q.y()*omega[2] ) * dt,
@@ -1400,7 +1476,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Acceleration
     Eigen::Vector3f a0 = a;
     a = q._transformVector(f.lin_accel);
-    a[2] -= this->gravity_;
+    a[2] -= gravity;
 
     // Jerk
     Eigen::Vector3f j_dt = a - a0;
@@ -1414,12 +1490,12 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       // Average angular velocity
       Eigen::Vector3f omega_i = f0.ang_vel + 0.5*alpha*idt;
 
-      // Orientation
+      // Orientation (integrated forward from f0, like the position below)
       Eigen::Quaternionf q_i (
-        q.w() - 0.5*( q.x()*omega_i[0] + q.y()*omega_i[1] + q.z()*omega_i[2] ) * idt,
-        q.x() + 0.5*( q.w()*omega_i[0] - q.z()*omega_i[1] + q.y()*omega_i[2] ) * idt,
-        q.y() + 0.5*( q.z()*omega_i[0] + q.w()*omega_i[1] - q.x()*omega_i[2] ) * idt,
-        q.z() + 0.5*( q.x()*omega_i[1] - q.y()*omega_i[0] + q.w()*omega_i[2] ) * idt
+        q0.w() - 0.5*( q0.x()*omega_i[0] + q0.y()*omega_i[1] + q0.z()*omega_i[2] ) * idt,
+        q0.x() + 0.5*( q0.w()*omega_i[0] - q0.z()*omega_i[1] + q0.y()*omega_i[2] ) * idt,
+        q0.y() + 0.5*( q0.z()*omega_i[0] + q0.w()*omega_i[1] - q0.x()*omega_i[2] ) * idt,
+        q0.z() + 0.5*( q0.x()*omega_i[1] - q0.y()*omega_i[0] + q0.w()*omega_i[2] ) * idt
       );
       q_i.normalize();
 
@@ -1791,6 +1867,13 @@ void dlio::OdomNode::updateKeyframes() {
   double theta_deg = theta_rad * (180.0/M_PI);
 
   // update keyframes
+  // Decision table of the cascade below (D = distance > threshD,
+  // R = rotation > threshR, N = num_nearby <= 1):
+  //   D                    -> new keyframe (regardless of R)
+  //   !D &&  R &&  N       -> new keyframe (pure rotation in an uncrowded spot)
+  //   !D &&  R && !N       -> no  (rotation trigger suppressed near other kfs)
+  //   !D && !R             -> no
+  // i.e. the rotation criterion only applies inside the num_nearby carve-out.
   bool newKeyframe = false;
 
   if (abs(dd) > this->keyframe_thresh_dist_ || abs(theta_deg) > this->keyframe_thresh_rot_) {
@@ -1816,6 +1899,53 @@ void dlio::OdomNode::updateKeyframes() {
     lock.unlock();
 
   }
+
+}
+
+void dlio::OdomNode::pruneKeyframes() {
+
+  // Bound the keyframe map by removing the most spatially redundant keyframe:
+  // the one with the smallest distance to its nearest neighbor. The first
+  // keyframe (origin anchor) and the most recent ones (likely in the current
+  // submap neighborhood) are never removed. Caller guarantees the background
+  // submap thread is idle -- pruning re-indexes the vectors it iterates.
+  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+
+  const int keep_recent = 10;
+
+  while ((int)this->keyframes.size() > this->max_keyframes_) {
+
+    // candidates: processed keyframes only, excluding the anchor and the tail
+    int last_candidate = std::min(this->num_processed_keyframes,
+                                  (int)this->keyframes.size() - keep_recent);
+    if (last_candidate <= 1) { break; }
+
+    int prune_idx = -1;
+    float min_nn_dist = std::numeric_limits<float>::max();
+    for (int i = 1; i < last_candidate; i++) {
+      float nn = std::numeric_limits<float>::max();
+      for (int j = 0; j < (int)this->keyframes.size(); j++) {
+        if (j == i) { continue; }
+        float d = (this->keyframes[i].first.first - this->keyframes[j].first.first).norm();
+        nn = std::min(nn, d);
+      }
+      if (nn < min_nn_dist) {
+        min_nn_dist = nn;
+        prune_idx = i;
+      }
+    }
+    if (prune_idx < 0) { break; }
+
+    this->keyframes.erase(this->keyframes.begin() + prune_idx);
+    this->keyframe_timestamps.erase(this->keyframe_timestamps.begin() + prune_idx);
+    this->keyframe_normals.erase(this->keyframe_normals.begin() + prune_idx);
+    this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
+    --this->num_processed_keyframes;
+  }
+
+  // indices into the keyframe vectors are no longer valid; force the next
+  // submap build to start fresh
+  this->submap_kf_idx_prev.clear();
 
 }
 
@@ -1994,8 +2124,8 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
     this->keyframes[i].second = transformed_keyframe;
     this->keyframe_normals[i] = transformed_covariances;
 
+    if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
     this->publish_keyframe_thread = std::thread( &dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i] );
-    this->publish_keyframe_thread.detach();
   }
 
   lock.unlock();

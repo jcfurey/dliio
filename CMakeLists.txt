@@ -13,7 +13,10 @@
 cmake_minimum_required(VERSION 3.12.4)
 project(direct_lidar_inertial_odometry)
 
-set(CMAKE_BUILD_TYPE "Release")
+# Default to Release but respect whatever the user/colcon asked for
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
@@ -27,15 +30,11 @@ find_package(PCL REQUIRED COMPONENTS common io registration kdtree search featur
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
 
-# OpenMP
-include(FindOpenMP)
-if(OPENMP_FOUND)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-  set(OpenMP_LIBS gomp)
-else()
-  message(WARNING "OpenMP could not be found.")
+# OpenMP via the imported target (carries compile options and link flags to
+# every dependent instead of mutating global CMAKE_*_FLAGS)
+find_package(OpenMP)
+if(NOT OpenMP_CXX_FOUND)
+  message(WARNING "OpenMP could not be found; building single-threaded.")
 endif()
 
 # CPUID test
@@ -58,8 +57,7 @@ rosidl_generate_interfaces(
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} rosidl_typesupport_cpp)
 
-# Include directories
-include_directories(include)
+# Include directories (project headers are target-scoped; see below)
 include_directories(${PCL_INCLUDE_DIRS})
 include_directories(${EIGEN3_INCLUDE_DIR})
 
@@ -67,9 +65,11 @@ link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
 # NanoFLANN
+# (PIC: linked into the shared component library)
 add_library(nanoflann STATIC src/nano_gicp/nanoflann.cc)
+set_target_properties(nanoflann PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nanoflann PRIVATE PCL_NO_PRECOMPILE)
-target_include_directories(nanoflann PUBLIC 
+target_include_directories(nanoflann PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
@@ -79,38 +79,42 @@ target_link_libraries(nanoflann PUBLIC ${PCL_LIBRARIES})
 add_library(nano_gicp STATIC
   src/nano_gicp/nano_gicp.cc
 )
+set_target_properties(nano_gicp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nano_gicp PRIVATE PCL_NO_PRECOMPILE)
-target_include_directories(nano_gicp PUBLIC 
+target_include_directories(nano_gicp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(nano_gicp PUBLIC 
-  nanoflann 
+target_link_libraries(nano_gicp PUBLIC
+  nanoflann
   ${PCL_LIBRARIES}
-  ${OpenMP_LIBS}
+  $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 
-# Odometry Node
-# ament_auto_add_executable links the ROS deps from package.xml (rclcpp,
-# tf2_ros, pcl_ros, pcl_conversions, sensor_msgs, nav_msgs, geometry_msgs)
-# and installs the target to lib/${PROJECT_NAME}.
-ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
-target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_odom_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_odom_node
+# Component library: both nodes, loadable into a component container for
+# intra-process communication; the classic executables link it too.
+ament_auto_add_library(dlio_components SHARED
+  src/dlio/odom.cc
+  src/dlio/map.cc
+  src/dlio/components.cc
+)
+target_compile_definitions(dlio_components PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_components
   nano_gicp
   Threads::Threads
   ${PCL_LIBRARIES}
-)
-
-# Mapping Node
-ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
-target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_map_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_map_node
-  ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
 )
+rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
+
+# Standalone executables
+ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc)
+target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_odom_node dlio_components)
+
+ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc)
+target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_map_node dlio_components)
 
 install(DIRECTORY cfg launch
   DESTINATION share/${PROJECT_NAME}
@@ -121,10 +125,15 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
   target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
-  target_compile_options(test_nano_gicp PRIVATE ${OpenMP_CXX_FLAGS})
   target_link_libraries(test_nano_gicp
     nano_gicp
     ${PCL_LIBRARIES}
+  )
+
+  ament_add_gtest(test_imu_integration test/test_imu_integration.cpp)
+  target_compile_definitions(test_imu_integration PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_imu_integration
+    dlio_components
   )
 endif()
 

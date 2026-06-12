@@ -56,6 +56,9 @@ public:
   // divided by this before gradient estimation and residuals, so
   // photometricWeight is in normalized units and transfers across sensors.
   void setPhotometricScale(float scale);
+  // Huber threshold on the (normalized) photometric residual; residuals
+  // beyond it are IRLS-downweighted. <= 0 disables robustification.
+  void setPhotometricHuberDelta(float delta);
 
   // Degeneracy gating (solution remapping): the rotation and translation
   // Hessian blocks are eigen-analyzed separately; the update is projected off
@@ -84,7 +87,7 @@ public:
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Eigen::Matrix4f& guess) override;
 
-  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<float, 6, 6>* H, Eigen::Matrix<float, 6, 1>* b);
+  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b, double* cost = nullptr);
   void update_correspondences(const Eigen::Isometry3f& trans);
 
   template<typename PointT>
@@ -112,7 +115,13 @@ protected:
   
   float rotation_epsilon_;
   float lambda_factor_;
-  float intensity_gradient_threshold_;
+
+  // Photometric gradient validity bounds (normalized channel units).
+  // Variance floor rejects intensity-uniform neighborhoods (channel^2);
+  // magnitude bounds reject noise-fit and non-physical gradients (channel/m).
+  static constexpr float kGradientVarianceFloor = 1e-6f;
+  static constexpr float kGradientMagMin = 1e-6f;
+  static constexpr float kGradientMagMax = 100.0f;
 
   std::shared_ptr<nanoflann::KdTreeFLANN<PointSource>> input_kdtree_;
   std::shared_ptr<const nanoflann::KdTreeFLANN<PointTarget>> target_kdtree_;
@@ -128,6 +137,7 @@ protected:
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
   float photometric_scale_;            // channel full-scale; channel is divided by this
+  float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float degeneracy_thresh_ratio_;
   int last_degenerate_directions_;
   
