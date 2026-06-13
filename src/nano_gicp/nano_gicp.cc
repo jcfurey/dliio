@@ -620,8 +620,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // For each geometrically-weak direction v:
         //   - SAFETY FLOOR (visual on): if the visual term actually stiffened v
         //     (combined Rayleigh quotient above threshold), allow motion there
-        //     but CLAMP the step to ±visual_gate_max_* so a wrong visual
-        //     constraint cannot run away; otherwise hold the prior.
+        //     but draw from a per-scan rescue BUDGET (the frame-to-frame cap, or
+        //     the larger frame-to-map cap when a map term is active) so a wrong
+        //     visual constraint cannot run away; otherwise hold the prior.
         //   - visual off: hold the prior (project the step off v) -- original
         //     gate behavior, bit-identical.
         // NOTE: discrimination is strongest with regularizationMethod 'plane'

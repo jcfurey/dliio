@@ -278,8 +278,8 @@ protected:
   cv::Mat visual_prev_;         // previous image (pose-dependent warp target), CV_32F 1ch
   Eigen::Isometry3f T_cw_cur_;  // world -> current camera (from prior pose)
   Eigen::Isometry3f T_cw_prev_; // world -> previous camera (previous optimized pose)
-  float visual_gate_max_trans_; // gate safety floor: max per-iter translation step [m]
-  float visual_gate_max_rot_;   // gate safety floor: max per-iter rotation step [rad]
+  float visual_gate_max_trans_; // gate rescue BUDGET: max total translation deviation per scan [m]
+  float visual_gate_max_rot_;   // gate rescue BUDGET: max total rotation deviation per scan [rad]
   float last_visual_rms_;
   int last_visual_count_;
   int last_visual_rescued_;

@@ -15,9 +15,9 @@ using ImuMeas = dlio::OdomNode::ImuMeas;
 
 // IMU stream sampled at `rate` Hz from t=0 to t=duration with constant body
 // angular velocity and constant (world == body for identity attitude tests)
-// linear acceleration. Buffer ordering matches production: newest at front.
-// Forward-time-ordered IMU samples (matches what imuMeasFromTimeRange now
-// hands integrateImuInternal: a private copy in forward-time order).
+// linear acceleration. Forward-time order (oldest at front) -- this matches the
+// private, forward-time copy imuMeasFromTimeRange hands integrateImuInternal in
+// production.
 std::vector<ImuMeas> makeImuStream(double duration, double rate,
                                    const Eigen::Vector3f& ang_vel,
                                    const Eigen::Vector3f& lin_accel) {

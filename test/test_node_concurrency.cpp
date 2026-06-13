@@ -185,9 +185,9 @@ TEST(NodeConcurrency, ConcurrentCallbacksRunRaceFreeAndShutDownClean) {
   spin_thread.join();
   exec.remove_node(node);
 
-  // Functional sanity: the node actually processed scans (the diagnostics
-  // gate-updates counter advances once the main loop runs). Mostly we care that
-  // the run completed without a sanitizer abort.
+  // No estimator output is asserted here -- this is SUCCEED(): the point is that
+  // the concurrent pipeline ran to completion without a sanitizer abort (and, in
+  // a normal build, that the worker-thread joins in ~OdomNode are clean).
   SUCCEED();
 }
 
