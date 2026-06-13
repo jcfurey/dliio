@@ -283,6 +283,12 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
     this->odom_ros.pose.covariance[i*7] = this->pose_cov_[i];
     this->odom_ros.twist.covariance[i*7] = this->twist_cov_[i];
   }
+  // Frame ids are constant too -- set them once here rather than re-assigning
+  // these std::string members on every 100 Hz publishPose tick (the reused
+  // message objects are only touched by the pose timer).
+  this->odom_ros.header.frame_id = this->odom_frame;
+  this->odom_ros.child_frame_id = this->baselink_frame;
+  this->pose_ros.header.frame_id = this->odom_frame;
 
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&dlio::OdomNode::publishPose, this));
@@ -683,10 +689,8 @@ void dlio::OdomNode::publishPose() {
     stamp = this->imu_stamp;
   }
 
-  // nav_msgs::msg::Odometry
+  // nav_msgs::msg::Odometry  (frame_id / child_frame_id set once in the ctor)
   this->odom_ros.header.stamp = stamp;
-  this->odom_ros.header.frame_id = this->odom_frame;
-  this->odom_ros.child_frame_id = this->baselink_frame;
 
   this->odom_ros.pose.pose.position.x = st.p[0];
   this->odom_ros.pose.pose.position.y = st.p[1];
@@ -707,9 +711,8 @@ void dlio::OdomNode::publishPose() {
 
   this->odom_pub->publish(this->odom_ros);
 
-  // geometry_msgs::msg::PoseStamped
+  // geometry_msgs::msg::PoseStamped  (frame_id set once in the ctor)
   this->pose_ros.header.stamp = stamp;
-  this->pose_ros.header.frame_id = this->odom_frame;
 
   this->pose_ros.pose.position.x = st.p[0];
   this->pose_ros.pose.position.y = st.p[1];

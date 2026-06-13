@@ -23,8 +23,20 @@ race:dlio::OdomNode::transformImu
 race:dlio::OdomNode::callbackImu
 race:dlio::OdomNode::propagateState
 # Pose timer (default MutuallyExclusive group): odom_ros/pose_ros message members
-# across serialized timer ticks, plus one constructor->first-tick ordering.
+# across serialized timer ticks. (The frame_id std::string writes that used to
+# race here are now set once in the constructor, so only the message-body writes
+# remain under this suppression.)
 race:dlio::OdomNode::publishPose
+
+# Worker-thread HANDLE join/reassign across serialized scan callbacks. The
+# `if (t.joinable()) t.join(); ... t = std::thread(...)` pattern (debug_thread,
+# publish_thread, publish_keyframe_thread) touches the std::thread handle from
+# the scan callback only; consecutive scans migrated across executor threads make
+# the handle read (joinable) and write (operator=/swap) look unsynchronized.
+# Scoped to the std::thread handle ops so real data races in the estimator logic
+# of callbackPointCloud are still reported.
+race:std::thread::joinable
+race:std::thread::swap
 
 # Third-party library noise (not dliio code):
 # OpenNI2 (pulled in transitively by PCL's I/O component) unlocks a global mutex
