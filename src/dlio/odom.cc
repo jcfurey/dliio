@@ -720,6 +720,11 @@ void dlio::OdomNode::publishStaticTransforms() {
 
 void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
 
+  // Skip the (per-scan) dense transform + serialize when nobody is listening,
+  // so RViz/Foxglove not subscribed to the deskewed cloud costs nothing -- the
+  // single biggest viz-vs-estimator CPU contention source.
+  if (this->deskewed_pub->get_subscription_count() == 0) { return; }
+
   if (this->wait_until_move_) {
     if (this->length_traversed < 0.1) { return; }
   }
@@ -755,8 +760,10 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   this->kf_pose_ros.header.frame_id = this->odom_frame;
   this->kf_pose_pub->publish(this->kf_pose_ros);
 
-  // publish keyframe scan for map
-  if (kf.second->points.size() == kf.second->width * kf.second->height) {
+  // publish keyframe scan for map (only when a consumer -- the map node and/or a
+  // viz client -- is subscribed; the toROSMsg of a full keyframe cloud is not free)
+  if (this->kf_cloud_pub->get_subscription_count() > 0 &&
+      kf.second->points.size() == kf.second->width * kf.second->height) {
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
     keyframe_cloud_ros.header.stamp = timestamp;
@@ -1234,9 +1241,27 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
 
   // Update some statistics
-  this->comp_times.push_back(this->now().seconds() - then);
+  const double comp_time = this->now().seconds() - then;
+  this->comp_times.push_back(comp_time);
   cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
+
+  // CPU-starvation indicator: a scan whose processing took longer than the scan
+  // period means the node cannot keep real time and WILL fall behind / drop
+  // scans under load -- the documented #1 cause of tunnel-run failures (and NOT
+  // an algorithm fault). Surface it in /diagnostics so a starved run is
+  // distinguishable from a genuine divergence at a glance.
+  const double scan_period = (this->scan_stamp > this->prev_scan_stamp)
+      ? (this->scan_stamp - this->prev_scan_stamp) : 0.0;
+  this->last_realtime_factor_ = (scan_period > 0.0) ? (comp_time / scan_period) : 0.0;
+  if (scan_period > 0.0 && comp_time > scan_period) { ++this->compute_overruns_; }
+  // Estimate scans dropped by the transport (best-effort) when the inter-scan
+  // gap is well over the nominal period.
+  if (scan_period > 0.0 && this->prev_scan_period_ > 0.0
+      && scan_period > 1.8 * this->prev_scan_period_) {
+    this->scans_dropped_est_ += static_cast<long>(scan_period / this->prev_scan_period_) - 1;
+  }
+  if (scan_period > 0.0) { this->prev_scan_period_ = scan_period; }
 
   // Publish /diagnostics every scan (independent of the dashboard toggle below).
   this->publishDiagnostics();
@@ -2707,6 +2732,12 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Keyframes", std::to_string(this->keyframes.size()));
   kv("Deskewed Points", std::to_string(this->deskew_size.load()));
   kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
+  // CPU starvation: realtime factor (>1 = slower than real time), cumulative
+  // compute overruns, and an estimate of transport-dropped scans.
+  kv("Realtime Factor", fnum(this->last_realtime_factor_, 2));
+  kv("CPU Starved", (this->last_realtime_factor_ > 1.0) ? "1" : "0");
+  kv("Compute Overruns (cumulative)", std::to_string(this->compute_overruns_.load()));
+  kv("Scans Dropped est (cumulative)", std::to_string(this->scans_dropped_est_.load()));
   kv("Degenerate Directions (current)", std::to_string(this->loc_gate_axes_current_));
   kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");

@@ -35,6 +35,12 @@
     map/waitUntilMove: true
     map/dense/filtered: false
     map/sparse/leafSize: 0.25
+    # Map republish rate [Hz] (0 disables). The map node accumulates every
+    # keyframe but only republishes the whole map on this timer, and only when a
+    # consumer (RViz/Foxglove) is subscribed -- keeps the heaviest output off the
+    # estimation critical path. Latched (transient_local), so late subscribers
+    # still get the current map.
+    map/publishRate: 1.0
 
     # Gravity magnitude [m/s^2].
     odom/gravity: 9.80665

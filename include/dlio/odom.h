@@ -329,6 +329,13 @@ private:
   int loc_gate_axes_current_ = 0;
   uint64_t loc_gate_updates_cumulative_ = 0;
 
+  // CPU-starvation indicators (see /diagnostics): scans whose compute time
+  // exceeded the scan period, and an estimate of transport-dropped scans.
+  std::atomic<long> compute_overruns_{0};
+  std::atomic<long> scans_dropped_est_{0};
+  double last_realtime_factor_ = 0.0;
+  double prev_scan_period_ = 0.0;
+
   // Separate CPU-time baseline for publishDiagnostics() so its utilization
   // delta is independent of debug()'s (each maintains its own since-last-call
   // window); -1 sentinel until the first sample.

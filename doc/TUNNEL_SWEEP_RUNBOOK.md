@@ -24,6 +24,26 @@ occlusion cull, OS non-uniform elevation LUT). Companion to
       bounded vs diverged; final `Distance Traveled (m)` (true length ~100 m,
       unconfirmed); cumulative yaw / "twist" magnitude; max |pos| excursion.
 
+## 0b. Visualization without starving the estimator
+
+Do the scored runs HEADLESS and record only the light outputs, then visualize
+later (the dense deskewed cloud and the full map are the heavy topics that
+starve the node):
+
+```
+ros2 launch direct_lidar_inertial_odometry record_outputs.launch.py out:=run1_outputs
+# ... later, offline:
+ros2 bag play run1_outputs --clock   # + RViz / Foxglove
+```
+
+Live viz is now safe-by-default too: the deskewed-cloud, keyframe-cloud, and map
+publishers skip their work when nobody is subscribed, and the map republishes on
+a low-rate latched timer (`map/publishRate`, default 1 Hz) rather than per
+keyframe. Prefer Foxglove via `foxglove_bridge` with the browser on another
+machine; its Diagnostics panel reads `/diagnostics` directly. If a run looks bad,
+check `CPU Starved` / `Compute Overruns` FIRST -- a starved run is not an
+algorithm failure.
+
 ## 1. What to run
 
 LiDAR-image series (no camera; not blocked by the unresolved cam2lidar/serial):
@@ -64,6 +84,10 @@ Secondary, only if needed:
 | `Visual Rescued Axes` | 1 when deg=1 | 0 while deg>=1 (gate not rescuing) |
 | `Distance Traveled (m)` | climbs to ~100 | stalls ~17-23 (map-lock) or runs away |
 | `Max Computation Time (ms)` | < scan period | spikes = starvation (see preconditions) |
+| `Realtime Factor` | < 1.0 | > 1.0 = can't keep real time |
+| `CPU Starved` | 0 | 1 = this scan overran the period |
+| `Compute Overruns (cumulative)` | 0 / flat | climbing = CPU-bound run, NOT divergence |
+| `Scans Dropped est (cumulative)` | 0 | > 0 = transport dropped scans (contention) |
 
 The fix-specific things to confirm engaged:
 - Startup log `LiDAR intensity image NxM; spherical model el=...` -> projection

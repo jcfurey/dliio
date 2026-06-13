@@ -26,13 +26,27 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
   this->keyframe_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("keyframes", 10,
       std::bind(&dlio::MapNode::callbackKeyframe, this, std::placeholders::_1), keyframe_sub_opt);
 
-  this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map", 100);
+  this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "map", rclcpp::QoS(1).transient_local());
 
   this->save_pcd_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   this->save_pcd_srv = this->create_service<direct_lidar_inertial_odometry::srv::SavePCD>("save_pcd",
       std::bind(&dlio::MapNode::savePCD, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), this->save_pcd_cb_group);
 
   this->dlio_map = std::make_shared<pcl::PointCloud<PointType>>();
+
+  // Republish the (growing) map on a low-rate timer instead of on every
+  // keyframe: republishing the whole accumulated corridor map per keyframe is
+  // the most expensive output on a long run. Rate is configurable; the publish
+  // is also skipped when nobody is subscribed.
+  double map_pub_rate;
+  this->declare_parameter<double>("map/publishRate", 1.0);
+  this->get_parameter("map/publishRate", map_pub_rate);
+  if (map_pub_rate > 0.0) {
+    this->map_pub_timer = this->create_wall_timer(
+        std::chrono::duration<double>(1.0 / map_pub_rate),
+        std::bind(&dlio::MapNode::publishMap, this));
+  }
 
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
 
@@ -64,19 +78,30 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   this->voxelgrid.setInputCloud(keyframe_pcl);
   this->voxelgrid.filter(*keyframe_pcl);
 
-  // save filtered keyframe to map for rviz
-  // (lock: savePCD runs in a different callback group and may read concurrently)
+  // Accumulate into the map; publishing happens on the low-rate timer below.
+  // (lock: savePCD and publishMap run in other callback groups and may read.)
   std::lock_guard<std::mutex> lock(this->map_mutex);
   *this->dlio_map += *keyframe_pcl;
+}
 
-  // publish full map
-  if (this->dlio_map->points.size() == this->dlio_map->width * this->dlio_map->height) {
-    sensor_msgs::msg::PointCloud2 map_ros;
-    pcl::toROSMsg(*this->dlio_map, map_ros);
-    map_ros.header.stamp = this->now();
-    map_ros.header.frame_id = this->odom_frame;
-    this->map_pub->publish(map_ros);
-  } 
+void dlio::MapNode::publishMap() {
+
+  // Skip the whole-map serialize when nobody is listening.
+  if (this->map_pub->get_subscription_count() == 0) { return; }
+
+  // Copy the cloud under the lock (brief), serialize outside it so keyframe
+  // accumulation isn't stalled by the toROSMsg of a large map.
+  pcl::PointCloud<PointType>::Ptr snapshot;
+  {
+    std::lock_guard<std::mutex> lock(this->map_mutex);
+    if (this->dlio_map->empty()) { return; }
+    snapshot = std::make_shared<pcl::PointCloud<PointType>>(*this->dlio_map);
+  }
+  sensor_msgs::msg::PointCloud2 map_ros;
+  pcl::toROSMsg(*snapshot, map_ros);
+  map_ros.header.stamp = this->now();
+  map_ros.header.frame_id = this->odom_frame;
+  this->map_pub->publish(map_ros);
 }
 
 void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
