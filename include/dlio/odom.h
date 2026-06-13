@@ -25,6 +25,7 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <deque>
+#include <map>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 
@@ -136,6 +137,18 @@ private:
   // published independently of the ANSI dashboard (debug() is gated on
   // dashboard_, diagnostics should flow regardless).
   void publishDiagnostics();
+
+  // Live parameter tuning: on_set callback stages new values under live_mtx_;
+  // applyLiveParams() (called on the scan thread, top of callbackPointCloud)
+  // commits them to the members / gicp -- so all estimator state stays mutated
+  // on one thread, race-free, while ros2 param set can retune during a run.
+  rcl_interfaces::msg::SetParametersResult onSetParams(const std::vector<rclcpp::Parameter>& params);
+  void applyLiveParams();
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr on_set_handle_;
+  std::mutex live_mtx_;
+  std::map<std::string, double> live_pending_;
+  std::atomic<bool> live_dirty_{false};
 
   rclcpp::TimerBase::SharedPtr publish_timer;
 

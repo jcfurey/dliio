@@ -167,6 +167,14 @@ TEST(NodeConcurrency, ConcurrentCallbacksRunRaceFreeAndShutDownClean) {
     const rclcpp::Time scan_stamp = t - rclcpp::Duration::from_seconds(scan_dt);
     cloud_pub->publish(makeScan(scan_stamp, 0.02 * s, scan_dt));  // ramping motion
     if (img_div++ % 2 == 0) img_pub->publish(makeImage(scan_stamp));
+    // Retune live params mid-run (exercises the on_set callback on the executor
+    // thread vs applyLiveParams on the scan thread -- a TSan/ASan target).
+    if (s % 5 == 4) {
+      node->set_parameters_atomically({
+          rclcpp::Parameter("odom/gicp/photometricWeight", 0.05 + 0.01 * s),
+          rclcpp::Parameter("odom/geo/Kp", 4.0 + 0.1 * s),
+          rclcpp::Parameter("odom/gicp/degeneracyThreshRatio", 0.004 + 0.0001 * s)});
+    }
     std::this_thread::sleep_for(std::chrono::duration<double>(scan_dt));
   }
 

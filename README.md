@@ -30,6 +30,17 @@ Added `photometricHuberDelta` (default value: 0.05), `maxKeyframes` (default val
 
 ## Configuration & wiring
 
+**Live tuning.** A subset of parameters can be retuned at runtime with
+`ros2 param set` (no restart) — the drift-hunt knobs: `odom/gicp/photometricWeight`,
+`photometricHuberDelta`, `photometricScale`, `degeneracyThreshRatio`,
+`maxCorrespondenceDistance`, `odom/keyframe/threshD|threshR`, and the observer
+gains `odom/geo/{Kp,Kv,Kq,Kab,Kgb,abias_max,gbias_max}`. These carry
+`FloatingPointRange` descriptors (so `ros2 param describe` shows bounds and rqt
+shows sliders); the change is staged in the parameter callback and applied on
+the scan thread, so it is race-free. Example:
+`ros2 param set /dlio_odom_node odom/gicp/photometricWeight 0.3`.
+
+
 **Config files** (all parameters are commented in the files themselves):
 
 | File | Contents |
