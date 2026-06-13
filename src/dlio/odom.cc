@@ -283,6 +283,12 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
     this->odom_ros.pose.covariance[i*7] = this->pose_cov_[i];
     this->odom_ros.twist.covariance[i*7] = this->twist_cov_[i];
   }
+  // Frame ids are constant too -- set them once here rather than re-assigning
+  // these std::string members on every 100 Hz publishPose tick (the reused
+  // message objects are only touched by the pose timer).
+  this->odom_ros.header.frame_id = this->odom_frame;
+  this->odom_ros.child_frame_id = this->baselink_frame;
+  this->pose_ros.header.frame_id = this->odom_frame;
 
   this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
       std::bind(&dlio::OdomNode::publishPose, this));
@@ -683,10 +689,8 @@ void dlio::OdomNode::publishPose() {
     stamp = this->imu_stamp;
   }
 
-  // nav_msgs::msg::Odometry
+  // nav_msgs::msg::Odometry  (frame_id / child_frame_id set once in the ctor)
   this->odom_ros.header.stamp = stamp;
-  this->odom_ros.header.frame_id = this->odom_frame;
-  this->odom_ros.child_frame_id = this->baselink_frame;
 
   this->odom_ros.pose.pose.position.x = st.p[0];
   this->odom_ros.pose.pose.position.y = st.p[1];
@@ -707,9 +711,8 @@ void dlio::OdomNode::publishPose() {
 
   this->odom_pub->publish(this->odom_ros);
 
-  // geometry_msgs::msg::PoseStamped
+  // geometry_msgs::msg::PoseStamped  (frame_id set once in the ctor)
   this->pose_ros.header.stamp = stamp;
-  this->pose_ros.header.frame_id = this->odom_frame;
 
   this->pose_ros.pose.position.x = st.p[0];
   this->pose_ros.pose.position.y = st.p[1];
@@ -936,6 +939,23 @@ float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_i
   return std::clamp(intensity * std::pow(range / r_ref, alpha) / c, 0.f, 255.f);
 }
 
+dlio::SensorType dlio::OdomNode::detectSensorType(
+    const std::vector<sensor_msgs::msg::PointField>& fields,
+    bool has_points, double first_timestamp) {
+  for (const auto& field : fields) {
+    if (field.name == "t") {
+      return dlio::SensorType::OUSTER;
+    } else if (field.name == "time") {
+      return dlio::SensorType::VELODYNE;
+    } else if (field.name == "timestamp" && has_points && first_timestamp < 1e14) {
+      return dlio::SensorType::HESAI;
+    } else if (field.name == "timestamp" && has_points && first_timestamp > 1e14) {
+      return dlio::SensorType::LIVOX;
+    }
+  }
+  return dlio::SensorType::UNKNOWN;
+}
+
 rcl_interfaces::msg::SetParametersResult
 dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   // Parameters that may be retuned live (the drift-hunt knobs). Others still
@@ -1106,24 +1126,9 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   this->crop.filter(*original_scan_);
 
   // automatically detect sensor type
-  this->sensor = dlio::SensorType::UNKNOWN;
-  for (auto &field : pc->fields) {
-    if (field.name == "t") {
-      this->sensor = dlio::SensorType::OUSTER;
-      break;
-    } else if (field.name == "time") {
-      this->sensor = dlio::SensorType::VELODYNE;
-      break;
-    } else if (field.name == "timestamp" && !original_scan_->points.empty()
-               && original_scan_->points[0].timestamp < 1e14) {
-      this->sensor = dlio::SensorType::HESAI;
-      break;
-    } else if (field.name == "timestamp" && !original_scan_->points.empty()
-               && original_scan_->points[0].timestamp > 1e14) {
-      this->sensor = dlio::SensorType::LIVOX;
-      break;
-    }
-  }
+  const bool has_points = !original_scan_->points.empty();
+  this->sensor = detectSensorType(pc->fields, has_points,
+      has_points ? original_scan_->points[0].timestamp : 0.0);
 
   if (this->sensor == dlio::SensorType::UNKNOWN) {
     this->deskew_ = false;

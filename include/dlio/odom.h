@@ -82,6 +82,14 @@ public:
   static float correctIntensity(float intensity, float range, float cos_incidence,
                                  float alpha, float r_ref, float cos_min);
 
+  // Map a cloud's point fields to the source sensor (for the per-point time
+  // accessor used in deskew): 't' = Ouster, 'time' = Velodyne, 'timestamp' =
+  // Hesai (absolute seconds, < 1e14) or Livox (absolute nanoseconds, > 1e14).
+  // first_timestamp is the first point's `timestamp` value (only consulted when
+  // a 'timestamp' field is present and has_points is true). Static for testing.
+  static SensorType detectSensorType(const std::vector<sensor_msgs::msg::PointField>& fields,
+                                     bool has_points, double first_timestamp);
+
 private:
 
   struct State;
