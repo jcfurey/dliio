@@ -17,6 +17,19 @@ using Mahalanobis = Eigen::Matrix4f;
 using MahalanobisList = std::vector<Mahalanobis, Eigen::aligned_allocator<Mahalanobis>>;
 using GradientList = std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>;
 
+// Per-map-point photometric reference for the FRAME-TO-MAP term: the brightness
+// (camera or LiDAR-intensity) of this map point as seen by the keyframe that
+// first observed it, plus that point's position in the observing keyframe's
+// camera frame (a fixed viewing ray, for viewpoint/occlusion gating). `valid`
+// marks points that were in-FOV / in-front / gradient-bearing at sampling time.
+struct VisualRef {
+  Eigen::Vector3f p_kf_cam{0.f, 0.f, 0.f};
+  float ref{0.f};
+  uint8_t valid{0};
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+using VisualRefList = std::vector<VisualRef, Eigen::aligned_allocator<VisualRef>>;
+
 enum class RegularizationMethod { NONE, MIN_EIG, NORMALIZED_MIN_EIG, PLANE, FROBENIUS };
 
 template<typename PointSource, typename PointTarget>
@@ -93,10 +106,25 @@ public:
   // the prior (LiDAR-only behavior). max_trans [m/scan], max_rot [rad/scan].
   void setVisualGateMaxStep(float max_trans, float max_rot);
 
+  // --- Frame-to-MAP camera term (absolute anchor; off until refs are set) ---
+  // Unlike the frame-to-frame term above, this projects FIXED map points (with
+  // a stored per-point reference brightness, see setTargetVisualRefs) into the
+  // CURRENT camera and compares to the reference, anchoring absolute position to
+  // map landmarks (e.g. tunnel-wall graffiti). Uses the same current image /
+  // intrinsics set above; reuses T_cw_cur_ as the world->current-camera built
+  // from the prior pose. Weight and per-scan gate budget are separate from the
+  // frame-to-frame term's.
+  void setVisualMapWeight(float weight);
+  void setVisualMapGateMaxStep(float max_trans, float max_rot);
+  void setVisualMapViewAngleMax(float radians);   // reject refs whose viewing ray moved more than this
+  void setTargetVisualRefs(const std::shared_ptr<const VisualRefList>& refs);
+
   // RMS of the (normalized) visual residual and number of points used in the
   // last align() (for diagnostics).
   float lastVisualRms() const;
   int lastVisualCount() const;
+  float lastVisualMapRms() const;
+  int lastVisualMapCount() const;
   // Geometrically-degenerate axes the visual term rescued (allowed bounded
   // motion on) during the last align(); for diagnostics.
   int lastVisualRescuedDirections() const;
@@ -148,6 +176,15 @@ protected:
                                 Eigen::Matrix<double, 6, 6>* H,
                                 Eigen::Matrix<double, 6, 1>* b,
                                 double* cost = nullptr);
+
+  // Frame-to-MAP camera contribution: iterates target (map) points that carry a
+  // valid VisualRef, projects each FIXED map point into the current camera under
+  // `trans`, and accumulates onto (H, b). Jacobian uses the trans-INVERSE
+  // perturbation: J = [ +G*skew(p_w) | -G ] (opposite the frame-to-frame term).
+  void accumulateVisualMapResidual(const Eigen::Isometry3f& trans,
+                                   Eigen::Matrix<double, 6, 6>* H,
+                                   Eigen::Matrix<double, 6, 1>* b,
+                                   double* cost = nullptr);
 
 protected:
   using pcl::Registration<PointSource, PointTarget>::reg_name_;
@@ -208,6 +245,15 @@ protected:
   float last_visual_rms_;
   int last_visual_count_;
   int last_visual_rescued_;
+
+  // --- Frame-to-MAP camera term state ---
+  float visual_map_weight_;
+  float visual_map_gate_max_trans_;
+  float visual_map_gate_max_rot_;
+  float visual_map_view_angle_max_;   // [rad] max viewing-ray deviation before a ref is rejected
+  std::shared_ptr<const VisualRefList> target_visual_refs_;
+  float last_visual_map_rms_;
+  int last_visual_map_count_;
 };
 
 } // namespace nano_gicp

@@ -115,12 +115,40 @@ The image topic remaps to `camera` (launch arg `camera_topic`). See
 `cfg/examples/ouster_tunnel_visual.yaml` for a full tunnel overlay (stack it
 over `ouster_tunnel.yaml`).
 
+## Frame-to-MAP camera term (absolute anchor)
+
+The frame-to-frame term above constrains *relative* motion/yaw but provides no
+absolute anchor — so in a self-similar tunnel the geometric GICP still drags the
+pose back toward the entrance. The frame-to-map term anchors absolute position
+to map landmarks (wall texture/graffiti):
+
+- **Reference data** (`nano_gicp::VisualRef`): each map point carries a reference
+  brightness sampled from the keyframe that first observed it, plus its position
+  in that keyframe's camera frame (`p_kf_cam`, a fixed viewing ray for viewpoint
+  gating). Sampled at keyframe creation (`sampleKeyframeVisualRefs`), threaded
+  keyframe→submap→target exactly like `keyframe_normals` (and copied in
+  `shareTargetDataFrom`). `p_kf_cam` is camera-frame, so it survives the world
+  re-transform in `buildKeyframesAndSubmap` untouched.
+- **Residual:** the FIXED map point is projected into the CURRENT (trans-dependent)
+  camera, `P_c = (T_prior·baselink2lidar·cam2lidar)⁻¹·trans⁻¹·p_w`,
+  `r = I_cur(π(P_c)) − I_ref`. Because `trans` appears INVERTED, the Jacobian is
+  **`J = [ +G·skew(p_w) | −G ]`** — *opposite* the frame-to-frame term's
+  `[−G·skew(x)|+G]` (guarded by `test_visual_residual`).
+- **Gate budget:** the absolute anchor gets a separate, larger per-scan rescue
+  budget (`odom/visual/map/gateMaxStep*`, default 1.0 m) — it can undo a real
+  drag-back, but is still bounded. Gate still judges degeneracy from `H_geo`.
+- **Robustness:** viewpoint-ray gating (`viewAngleMax`) + Huber.
+
+Keys (algorithm): `odom/visual/map/{enabled,weight,gateMaxStepTrans,gateMaxStepRot,viewAngleMax}`
+(all default off). Diagnostics: `Visual Map Active/Points/RMS`.
+
 ## Tests
 
 `test/test_visual_residual.cpp` (runs in CI, no hardware/extrinsic needed):
 residual→0 at truth; analytic-vs-finite-difference Jacobian; Gauss-Newton
-descent (sign guard); Hessian stiffness on a targeted axis; disabled = no-op.
-Full suite 15/15.
+descent (sign guard); Hessian stiffness on a targeted axis; disabled = no-op —
+for BOTH the frame-to-frame and frame-to-map terms (the f2m tests guard the
+trans-inverse sign flip). Full suite 18/18.
 
 ## Status / results (06042026 tunnel, n=3, see test-harness notes)
 
@@ -141,3 +169,21 @@ protect the startup window, illumination compensation, n≥5 confirmation.
 
 Treat this as a working, well-guarded mitigation and research scaffold — not a
 turnkey tunnel fix.
+
+### Frame-to-map camera A/B (2026-06-12, n=3)
+
+The frame-to-map term engages correctly (refs thread through; diverged runs show
+the whole submap flooding the frame) but is **measurement-starved on this rig**:
+in normal operation it sees only **2–64 map points** with **high residual RMS
+(0.4–0.6)**, so it cannot out-vote the geometric drag-back and does not make the
+tunnel reliable (f2f-only 2/3 OK vs f2f+f2m 1/3 OK — within chaotic-basin noise).
+Root cause is geometry, not the math: a **narrow, sideways camera + forward
+motion** means each keyframe sees only a small slice of the LiDAR points and each
+wall patch (graffiti) is briefly in view with a fast-changing viewing angle, so
+few landmarks persist and brightness constancy breaks down.
+
+**Implication:** the LiDAR intensity image (COIN-LIO path) is the better-suited
+absolute anchor for this rig — 360° FOV, continuous wall coverage, consistent
+range-normalized viewpoint — and reuses this same frame-to-map backbone (swap the
+camera image for the organized 64×1024 reflectivity image). The camera frame-to-map
+work built and validated the machinery and identified the LiDAR as the stronger anchor.

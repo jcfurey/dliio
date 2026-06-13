@@ -31,6 +31,19 @@ static void cap_history(std::vector<T>& v, size_t max_size = 1000) {
   }
 }
 
+// Bilinear sample of a single-channel CV_32F image (caller guarantees the 2x2
+// neighborhood is in bounds). Shared by the keyframe visual-ref sampler.
+static inline float bilinearF(const cv::Mat& img, float u, float v) {
+  const int x0 = static_cast<int>(std::floor(u));
+  const int y0 = static_cast<int>(std::floor(v));
+  const float ax = u - x0, ay = v - y0;
+  const float* r0 = img.ptr<float>(y0);
+  const float* r1 = img.ptr<float>(y0 + 1);
+  const float top = r0[x0] * (1.f - ax) + r0[x0 + 1] * ax;
+  const float bot = r1[x0] * (1.f - ax) + r1[x0 + 1] * ax;
+  return top * (1.f - ay) + bot * ay;
+}
+
 dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
     : Node("dlio_odom_node", options) {
 
@@ -449,6 +462,20 @@ void dlio::OdomNode::getParams() {
       "Visual gate safety floor: max per-scan translation correction on a rescued degenerate axis [m]");
   dlio::declare_param(this, "odom/visual/gateMaxStepRot", this->visual_gate_max_rot_, 0.05,
       "Visual gate safety floor: max per-scan rotation correction on a rescued degenerate axis [rad]");
+
+  // Frame-to-MAP camera term: anchors absolute position to map landmarks (wall
+  // texture/graffiti), breaking the geometric self-similarity that drags the
+  // pose back in a tunnel. Off by default; requires odom/visual/enabled too.
+  dlio::declare_param(this, "odom/visual/map/enabled", this->visual_map_enabled_, false,
+      "Enable the frame-to-MAP camera photometric term (absolute anchor to keyframe landmarks)");
+  dlio::declare_param(this, "odom/visual/map/weight", this->visual_map_weight_, 0.0,
+      "Weight of the frame-to-map camera residual relative to the geometric GICP term");
+  dlio::declare_param(this, "odom/visual/map/gateMaxStepTrans", this->visual_map_gate_max_trans_, 1.0,
+      "Per-scan rescue budget for the absolute map anchor on a degenerate translation axis [m]");
+  dlio::declare_param(this, "odom/visual/map/gateMaxStepRot", this->visual_map_gate_max_rot_, 0.1,
+      "Per-scan rescue budget for the absolute map anchor on a degenerate rotation axis [rad]");
+  dlio::declare_param(this, "odom/visual/map/viewAngleMax", this->visual_map_view_angle_, 0.6,
+      "Max viewing-ray deviation [rad] between a map ref and the current view before it is dropped");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
@@ -1024,6 +1051,16 @@ void dlio::OdomNode::initializeInputTarget() {
   this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_transformations.push_back(this->T_corr);
 
+  // Sample per-point camera reference brightness for the frame-to-map term
+  // (index-aligned with keyframes; p_kf_cam is camera-frame so it survives the
+  // later world re-transform in buildKeyframesAndSubmap untouched).
+  if (this->visual_map_enabled_) {
+    Eigen::Matrix4f T_wc = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+    Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
+    cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
+    this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+  }
+
 }
 
 void dlio::OdomNode::setInputSource() {
@@ -1366,10 +1403,14 @@ void dlio::OdomNode::callbackImage(const sensor_msgs::msg::Image::SharedPtr img)
 
 bool dlio::OdomNode::setupVisualForScan() {
 
-  if (!this->visual_enabled_ || this->visual_weight_ <= 0.0) {
-    this->gicp.setVisualEnabled(false);
-    return false;
-  }
+  // Default everything off for this scan; (re)enable below per term.
+  this->visual_cur_pending_valid_ = false;
+  this->gicp.setVisualEnabled(false);
+  this->gicp.setVisualMapWeight(0.f);
+
+  const bool want_f2f = this->visual_enabled_ && this->visual_weight_ > 0.0;
+  const bool want_f2m = this->visual_enabled_ && this->visual_map_enabled_ && this->visual_map_weight_ > 0.0;
+  if (!want_f2f && !want_f2m) { return false; }
 
   // Pick the buffered image nearest this scan's stamp (within tolerance).
   cv::Mat cur_img;
@@ -1381,14 +1422,10 @@ bool dlio::OdomNode::setupVisualForScan() {
       if (dt <= best_dt) { best_dt = dt; cur_img = kv.second; }
     }
   }
-  if (cur_img.empty()) {
-    this->gicp.setVisualEnabled(false);  // graceful LiDAR-only this scan
-    return false;
-  }
+  if (cur_img.empty()) { return false; }  // graceful LiDAR-only this scan
 
-  // world -> current camera, from the prior (predicted) pose. The current point
-  // in the current camera is pose-correction-independent, so this is the fixed
-  // reference frame; raw world points project here.
+  // world -> current camera, from the prior (predicted) pose. Shared by both the
+  // frame-to-frame (raw source points) and frame-to-map (fixed map points) terms.
   Eigen::Matrix4f T_wc_cur = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
   Eigen::Isometry3f T_cw_cur;
   T_cw_cur.matrix() = T_wc_cur.inverse();
@@ -1396,25 +1433,70 @@ bool dlio::OdomNode::setupVisualForScan() {
   this->gicp.setVisualIntrinsics(
       static_cast<float>(this->camera_intrinsics_[0]), static_cast<float>(this->camera_intrinsics_[1]),
       static_cast<float>(this->camera_intrinsics_[2]), static_cast<float>(this->camera_intrinsics_[3]));
-  this->gicp.setVisualWeight(static_cast<float>(this->visual_weight_));
   this->gicp.setVisualHuberDelta(static_cast<float>(this->visual_huber_delta_));
-  this->gicp.setVisualGateMaxStep(static_cast<float>(this->visual_gate_max_trans_),
-                                  static_cast<float>(this->visual_gate_max_rot_));
   this->gicp.setVisualCurrentFrame(cur_img, T_cw_cur);
 
-  // Stash for promotion to "previous" after align().
+  // Stash for promotion to "previous" after align() and for keyframe sampling.
   this->visual_cur_pending_ = cur_img;
   this->visual_cur_pending_valid_ = true;
 
-  if (this->visual_has_prev_) {
-    this->gicp.setVisualPreviousFrame(this->visual_prev_img_, this->visual_T_cw_prev_);
-    this->gicp.setVisualEnabled(true);
-    return true;
+  // Frame-to-MAP term: anchors to map landmarks; works on the first frame too.
+  if (want_f2m) {
+    this->gicp.setVisualMapWeight(static_cast<float>(this->visual_map_weight_));
+    this->gicp.setVisualMapGateMaxStep(static_cast<float>(this->visual_map_gate_max_trans_),
+                                       static_cast<float>(this->visual_map_gate_max_rot_));
+    this->gicp.setVisualMapViewAngleMax(static_cast<float>(this->visual_map_view_angle_));
   }
 
-  // First scan with an image: no previous frame yet to warp against.
-  this->gicp.setVisualEnabled(false);
-  return false;
+  // Frame-to-frame term: needs a previous frame to warp against.
+  if (want_f2f) {
+    this->gicp.setVisualWeight(static_cast<float>(this->visual_weight_));
+    this->gicp.setVisualGateMaxStep(static_cast<float>(this->visual_gate_max_trans_),
+                                    static_cast<float>(this->visual_gate_max_rot_));
+    if (this->visual_has_prev_) { this->gicp.setVisualEnabled(true); }
+    this->gicp.setVisualPreviousFrame(this->visual_prev_img_, this->visual_T_cw_prev_);
+  }
+
+  return want_f2m || (want_f2f && this->visual_has_prev_);
+}
+
+std::shared_ptr<const nano_gicp::VisualRefList>
+dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                                         const Eigen::Isometry3f& T_cw, const cv::Mat& img) {
+  // Always returns a list sized cloud->size() (all-invalid if no usable image),
+  // so it stays index-aligned with the keyframe cloud through submap assembly.
+  auto refs = std::make_shared<nano_gicp::VisualRefList>(cloud->size());
+  if (img.empty() || img.type() != CV_32FC1 || this->camera_intrinsics_.size() != 4) {
+    return refs;
+  }
+  const float fx = this->camera_intrinsics_[0], fy = this->camera_intrinsics_[1];
+  const float cx = this->camera_intrinsics_[2], cy = this->camera_intrinsics_[3];
+  const Eigen::Matrix3f R = T_cw.linear();
+  const Eigen::Vector3f t = T_cw.translation();
+  const float bw = 2.f;
+  const float umax = static_cast<float>(img.cols) - 1.f - bw;
+  const float vmax = static_cast<float>(img.rows) - 1.f - bw;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    const auto& p = cloud->at(i);
+    const Eigen::Vector3f Pc = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+    nano_gicp::VisualRef vr;
+    vr.valid = 0;
+    if (Pc.z() > 1e-3f) {
+      const float u = fx * Pc.x() / Pc.z() + cx;
+      const float v = fy * Pc.y() / Pc.z() + cy;
+      if (u >= bw && u <= umax && v >= bw && v <= vmax) {
+        const float gu = 0.5f * (bilinearF(img, u + 1.f, v) - bilinearF(img, u - 1.f, v));
+        const float gv = 0.5f * (bilinearF(img, u, v + 1.f) - bilinearF(img, u, v - 1.f));
+        if (std::abs(gu) > 1e-6f || std::abs(gv) > 1e-6f) {  // gradient-bearing only
+          vr.ref = bilinearF(img, u, v);
+          vr.p_kf_cam = Pc;
+          vr.valid = 1;
+        }
+      }
+    }
+    (*refs)[i] = vr;
+  }
+  return refs;
 }
 
 void dlio::OdomNode::getNextPose() {
@@ -1430,6 +1512,9 @@ void dlio::OdomNode::getNextPose() {
     // expensive is recomputed here on the registration hot path.
     this->gicp.shareTargetDataFrom(this->gicp_temp);
     this->gicp.setTargetCovariances(this->submap_normals);
+    if (this->visual_map_enabled_) {
+      this->gicp.setTargetVisualRefs(this->submap_visual_refs);
+    }
 
     this->submap_hasChanged = false;
   }
@@ -1468,7 +1553,9 @@ void dlio::OdomNode::getNextPose() {
     this->visual_T_cw_prev_.matrix() = T_wc.inverse();
     this->visual_prev_img_ = this->visual_cur_pending_;
     this->visual_has_prev_ = true;
-    this->visual_cur_pending_valid_ = false;
+    // NOTE: keep visual_cur_pending_valid_ true here so updateKeyframes() can
+    // sample this scan's image for keyframe visual refs; it is reset at the top
+    // of the next setupVisualForScan().
   }
 
   // Update next global pose
@@ -2077,6 +2164,12 @@ void dlio::OdomNode::updateKeyframes() {
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
     this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_transformations.push_back(this->T_corr);
+    if (this->visual_map_enabled_) {
+      Eigen::Matrix4f T_wc = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+      Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
+      cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
+      this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+    }
     lock.unlock();
 
   }
@@ -2121,6 +2214,9 @@ void dlio::OdomNode::pruneKeyframes() {
     this->keyframe_timestamps.erase(this->keyframe_timestamps.begin() + prune_idx);
     this->keyframe_normals.erase(this->keyframe_normals.begin() + prune_idx);
     this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
+    if (this->visual_map_enabled_ && prune_idx < (int)this->keyframe_visual_refs.size()) {
+      this->keyframe_visual_refs.erase(this->keyframe_visual_refs.begin() + prune_idx);
+    }
     --this->num_processed_keyframes;
   }
 
@@ -2248,6 +2344,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // reinitialize submap cloud and normals
     pcl::PointCloud<PointType>::Ptr submap_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
     std::shared_ptr<nano_gicp::CovarianceList> submap_normals_ (std::make_shared<nano_gicp::CovarianceList>());
+    // Concatenate the per-point visual refs in the SAME order as the cloud so
+    // indices line up with the target points (only when the map term is on and
+    // the refs are index-aligned with the keyframes).
+    const bool build_visual_refs = this->visual_map_enabled_
+        && this->keyframe_visual_refs.size() == this->keyframes.size();
+    std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
+        build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
 
     for (auto k : this->submap_kf_idx_curr) {
 
@@ -2259,10 +2362,16 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
       // grab corresponding submap cloud's normals
       submap_normals_->insert( std::end(*submap_normals_),
           std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])) );
+
+      if (build_visual_refs) {
+        submap_visual_refs_->insert( std::end(*submap_visual_refs_),
+            std::begin(*(this->keyframe_visual_refs[k])), std::end(*(this->keyframe_visual_refs[k])) );
+      }
     }
 
     this->submap_cloud = submap_cloud_;
     this->submap_normals = submap_normals_;
+    this->submap_visual_refs = submap_visual_refs_;
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
@@ -2432,6 +2541,9 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));
   kv("Visual Rescued Axes", std::to_string(this->gicp.lastVisualRescuedDirections()));
+  kv("Visual Map Active", (this->visual_map_enabled_ && this->gicp.lastVisualMapCount() > 0) ? "1" : "0");
+  kv("Visual Map Points", std::to_string(this->gicp.lastVisualMapCount()));
+  kv("Visual Map RMS", fnum(this->gicp.lastVisualMapRms(), 4));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);

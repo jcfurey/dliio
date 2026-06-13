@@ -38,6 +38,17 @@ class TestableGICP : public nano_gicp::NanoGICP<dlio::Point, dlio::Point> {
     this->accumulateVisualResidual(trans, &H, &b, &cost);
     return cost;
   }
+
+  // Returns (H, b, cost) for the frame-to-MAP term alone at pose `trans`.
+  double visualMapSystem(const Eigen::Isometry3f& trans,
+                         Eigen::Matrix<double, 6, 6>& H,
+                         Eigen::Matrix<double, 6, 1>& b) {
+    H.setZero();
+    b.setZero();
+    double cost = 0.0;
+    this->accumulateVisualMapResidual(trans, &H, &b, &cost);
+    return cost;
+  }
 };
 
 dlio::Point makePoint(float x, float y, float z) {
@@ -60,6 +71,18 @@ cv::Mat makeRampImage(int w, int h, float a, float b, float c) {
     }
   }
   return img;
+}
+
+// Bilinear sample matching NanoGICP's internal sampler, so a reference computed
+// here equals the residual's I_mov at the truth pose (r == 0 exactly).
+float bilinearSampleRamp(const cv::Mat& img, float u, float v) {
+  int x0 = static_cast<int>(std::floor(u)), y0 = static_cast<int>(std::floor(v));
+  float ax = u - x0, ay = v - y0;
+  const float* r0 = img.ptr<float>(y0);
+  const float* r1 = img.ptr<float>(y0 + 1);
+  float top = r0[x0] * (1.f - ax) + r0[x0 + 1] * ax;
+  float bot = r1[x0] * (1.f - ax) + r1[x0 + 1] * ax;
+  return top * (1.f - ay) + bot * ay;
 }
 
 // Camera at (0,0,height) looking straight down (-z_world), right-handed:
@@ -264,6 +287,155 @@ TEST(VisualResidual, DisabledContributesNothing) {
   EXPECT_EQ(H.norm(), 0.0);
   EXPECT_EQ(b.norm(), 0.0);
   EXPECT_EQ(gicp.lastVisualCount(), 0);
+}
+
+// ---- Frame-to-MAP camera term ----------------------------------------------
+namespace {
+// Build a VisualRefList for a target/map cloud: sample the reference brightness
+// from `img` at each point's projection under world->cam `T_cw`, store the
+// keyframe-camera ray, mark in-FOV points valid.
+nano_gicp::VisualRefList makeMapRefs(const Cloud& target, const cv::Mat& img,
+                                     const Eigen::Isometry3f& T_cw) {
+  nano_gicp::VisualRefList refs(target.size());
+  for (size_t i = 0; i < target.size(); ++i) {
+    Eigen::Vector3f p_w(target[i].x, target[i].y, target[i].z);
+    Eigen::Vector3f Pc = T_cw * p_w;
+    nano_gicp::VisualRef r;
+    r.p_kf_cam = Pc;
+    r.valid = 0;
+    if (Pc.z() > 1e-3f) {
+      float u = kFx * Pc.x() / Pc.z() + kCx;
+      float v = kFy * Pc.y() / Pc.z() + kCy;
+      if (u >= 2.f && u <= img.cols - 3.f && v >= 2.f && v <= img.rows - 3.f) {
+        r.ref = 0.f;  // each test sets the reference along its own sampling path
+        r.valid = 1;
+      }
+    }
+    refs[i] = r;
+  }
+  return refs;
+}
+}  // namespace
+
+TEST(VisualMapResidual, ResidualIsZeroAtTruth) {
+  TestableGICP gicp;
+  gicp.setVisualMapWeight(1.0f);
+  gicp.setVisualMapViewAngleMax(3.14f);  // disable viewpoint gating for this test
+  gicp.setVisualHuberDelta(0.f);
+  gicp.setVisualIntrinsics(kFx, kFy, kCx, kCy);
+
+  cv::Mat img = makeRampImage(kW, kH, 0.012f, 0.008f, 0.2f);
+  Eigen::Isometry3f T_cw = lookingDownCamera(5.f);
+  gicp.setVisualCurrentFrame(img, T_cw);
+
+  auto target = makeWorldPoints();
+  gicp.setInputTarget(target);
+
+  // Reference sampled exactly along the residual's own path at trans=Identity,
+  // so r==0 by construction.
+  auto refs = std::make_shared<nano_gicp::VisualRefList>(makeMapRefs(*target, img, T_cw));
+  for (size_t i = 0; i < target->size(); ++i) {
+    auto& r = (*refs)[i];
+    if (!r.valid) continue;
+    Eigen::Vector3f Pc = T_cw * Eigen::Vector3f(target->at(i).x, target->at(i).y, target->at(i).z);
+    float u = kFx * Pc.x() / Pc.z() + kCx, v = kFy * Pc.y() / Pc.z() + kCy;
+    r.ref = bilinearSampleRamp(img, u, v);
+  }
+  gicp.setTargetVisualRefs(refs);
+
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  double cost = gicp.visualMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_GT(gicp.lastVisualMapCount(), 10);
+  EXPECT_NEAR(cost, 0.0, 1e-9);
+  EXPECT_LT(b.norm(), 1e-4);
+}
+
+TEST(VisualMapResidual, AnalyticJacobianMatchesFiniteDifference) {
+  TestableGICP gicp;
+  gicp.setVisualMapWeight(1.0f);
+  gicp.setVisualMapViewAngleMax(3.14f);
+  gicp.setVisualHuberDelta(0.f);
+  gicp.setVisualIntrinsics(kFx, kFy, kCx, kCy);
+
+  cv::Mat img = makeRampImage(kW, kH, 0.012f, 0.008f, 0.2f);
+  Eigen::Isometry3f T_cw = lookingDownCamera(5.f);
+  gicp.setVisualCurrentFrame(img, T_cw);
+  auto target = makeWorldPoints();
+  gicp.setInputTarget(target);
+
+  // References sampled at a SHIFTED pose so the residual is non-trivial at I.
+  Eigen::Isometry3f T_cw_ref = T_cw;
+  T_cw_ref.pretranslate(Eigen::Vector3f(0.05f, -0.03f, 0.02f));
+  auto refs = std::make_shared<nano_gicp::VisualRefList>(makeMapRefs(*target, img, T_cw));
+  for (size_t i = 0; i < target->size(); ++i) {
+    auto& r = (*refs)[i];
+    if (!r.valid) continue;
+    Eigen::Vector3f Pc = T_cw_ref * Eigen::Vector3f(target->at(i).x, target->at(i).y, target->at(i).z);
+    if (Pc.z() <= 1e-3f) { r.valid = 0; continue; }
+    float u = kFx * Pc.x() / Pc.z() + kCx, v = kFy * Pc.y() / Pc.z() + kCy;
+    r.ref = bilinearSampleRamp(img, u, v);
+  }
+  gicp.setTargetVisualRefs(refs);
+
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  gicp.visualMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  const int count0 = gicp.lastVisualMapCount();
+  ASSERT_GT(count0, 10);
+
+  const float eps = 1e-3f;
+  Eigen::Matrix<double, 6, 1> num_grad;
+  Eigen::Matrix<double, 6, 6> Hd; Eigen::Matrix<double, 6, 1> bd;
+  for (int k = 0; k < 6; ++k) {
+    double cp = gicp.visualMapSystem(perturbLeft(Eigen::Isometry3f::Identity(), k, eps), Hd, bd);
+    ASSERT_EQ(gicp.lastVisualMapCount(), count0) << "point set changed +eps dof " << k;
+    double cm = gicp.visualMapSystem(perturbLeft(Eigen::Isometry3f::Identity(), k, -eps), Hd, bd);
+    ASSERT_EQ(gicp.lastVisualMapCount(), count0) << "point set changed -eps dof " << k;
+    num_grad(k) = (cp - cm) / (2.0 * eps);
+  }
+  Eigen::Matrix<double, 6, 1> analytic = 2.0 * b;
+  EXPECT_LT((num_grad - analytic).norm(), 0.02 * analytic.norm() + 1e-6)
+      << "num=" << num_grad.transpose() << "\nana=" << analytic.transpose();
+}
+
+TEST(VisualMapResidual, GaussNewtonStepDescendsCost) {
+  TestableGICP gicp;
+  gicp.setVisualMapWeight(1.0f);
+  gicp.setVisualMapViewAngleMax(3.14f);
+  gicp.setVisualHuberDelta(0.f);
+  gicp.setVisualIntrinsics(kFx, kFy, kCx, kCy);
+
+  cv::Mat img = makeRampImage(kW, kH, 0.012f, 0.008f, 0.2f);
+  Eigen::Isometry3f T_cw = lookingDownCamera(5.f);
+  gicp.setVisualCurrentFrame(img, T_cw);
+  auto target = makeWorldPoints();
+  gicp.setInputTarget(target);
+
+  Eigen::Isometry3f T_cw_ref = T_cw;
+  T_cw_ref.pretranslate(Eigen::Vector3f(0.08f, -0.05f, 0.0f));
+  auto refs = std::make_shared<nano_gicp::VisualRefList>(makeMapRefs(*target, img, T_cw));
+  for (size_t i = 0; i < target->size(); ++i) {
+    auto& r = (*refs)[i];
+    if (!r.valid) continue;
+    Eigen::Vector3f Pc = T_cw_ref * Eigen::Vector3f(target->at(i).x, target->at(i).y, target->at(i).z);
+    if (Pc.z() <= 1e-3f) { r.valid = 0; continue; }
+    float u = kFx * Pc.x() / Pc.z() + kCx, v = kFy * Pc.y() / Pc.z() + kCy;
+    r.ref = bilinearSampleRamp(img, u, v);
+  }
+  gicp.setTargetVisualRefs(refs);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  double cost0 = gicp.visualMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  H.diagonal().array() += 1e-6;
+  Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(-b);
+  Eigen::Isometry3f stepped = Eigen::Isometry3f::Identity();
+  const Eigen::Vector3f rot = dx.head<3>().cast<float>();
+  if (rot.norm() > 1e-12f) stepped.prerotate(Eigen::AngleAxisf(rot.norm(), rot / rot.norm()));
+  stepped.pretranslate(dx.tail<3>().cast<float>());
+  Eigen::Matrix<double, 6, 6> H1; Eigen::Matrix<double, 6, 1> b1;
+  double cost1 = gicp.visualMapSystem(stepped, H1, b1);
+  EXPECT_LT(cost1, cost0);  // a flipped Jacobian sign would ascend
 }
 
 int main(int argc, char** argv) {

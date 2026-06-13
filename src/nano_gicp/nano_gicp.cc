@@ -71,6 +71,12 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->last_visual_rms_ = 0.0f;
   this->last_visual_count_ = 0;
   this->last_visual_rescued_ = 0;
+  this->visual_map_weight_ = 0.0f;
+  this->visual_map_gate_max_trans_ = 1.0f;
+  this->visual_map_gate_max_rot_ = 0.1f;
+  this->visual_map_view_angle_max_ = 0.6f;  // ~34 deg
+  this->last_visual_map_rms_ = 0.0f;
+  this->last_visual_map_count_ = 0;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -190,6 +196,37 @@ int NanoGICP<PointSource, PointTarget>::lastVisualRescuedDirections() const {
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualMapWeight(float weight) {
+    this->visual_map_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualMapGateMaxStep(float max_trans, float max_rot) {
+    this->visual_map_gate_max_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
+    this->visual_map_gate_max_rot_ = (max_rot > 0.f) ? max_rot : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualMapViewAngleMax(float radians) {
+    this->visual_map_view_angle_max_ = radians;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setTargetVisualRefs(const std::shared_ptr<const VisualRefList>& refs) {
+    this->target_visual_refs_ = refs;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastVisualMapRms() const {
+    return this->last_visual_map_rms_;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualMapCount() const {
+    return this->last_visual_map_count_;
+}
+
+template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setDegeneracyThreshRatio(float ratio) {
     this->degeneracy_thresh_ratio_ = ratio;
 }
@@ -261,6 +298,7 @@ void NanoGICP<PointSource, PointTarget>::shareTargetDataFrom(const NanoGICP& oth
   target_covs_ = other.target_covs_;
   target_intensity_gradients_ = other.target_intensity_gradients_;
   gradient_valid_ = other.gradient_valid_;
+  target_visual_refs_ = other.target_visual_refs_;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -399,6 +437,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     this->last_visual_count_ = 0;
     this->last_visual_rms_ = 0.0f;
     this->last_visual_rescued_ = 0;
+    this->last_visual_map_count_ = 0;
+    this->last_visual_map_rms_ = 0.0f;
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -459,6 +499,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         if (visual_enabled_) {
             accumulateVisualResidual(trans, &H, &b, nullptr);
         }
+        // Frame-to-MAP camera term (absolute anchor): also into H/b before the
+        // gate, so it can rescue the degenerate axis with map landmarks.
+        if (visual_map_weight_ > 0.f) {
+            accumulateVisualMapResidual(trans, &H, &b, nullptr);
+        }
 
         // Add regularization / damping
         H.diagonal().array() += lambda;
@@ -492,6 +537,14 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         int degenerate = 0;
         int rescued = 0;
         if (degeneracy_thresh_ratio_ > 0.f) {
+            // Per-scan rescue budget: the frame-to-MAP term is an ABSOLUTE
+            // anchor, so when it is contributing this scan it gets the larger
+            // map budget (it can undo a real drag-back); otherwise the tighter
+            // frame-to-frame budget applies.
+            const double cap_t = (last_visual_map_count_ > 0)
+                ? static_cast<double>(visual_map_gate_max_trans_) : static_cast<double>(visual_gate_max_trans_);
+            const double cap_r = (last_visual_map_count_ > 0)
+                ? static_cast<double>(visual_map_gate_max_rot_) : static_cast<double>(visual_gate_max_rot_);
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H_geo.template block<3, 3>(0, 0));
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H_geo.template block<3, 3>(3, 3));
             // Combined (geometric + visual) blocks, to test visual rescue.
@@ -506,7 +559,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     const double comp = v.dot(dx.head<3>());
                     if (visual_enabled_ && v.dot(Hrr * v) > rr_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
-                        const double cap = std::max(0.0, (double)visual_gate_max_rot_ - rescued_r_used);
+                        const double cap = std::max(0.0, cap_r - rescued_r_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
                         dx.head<3>() += v * (cl - comp);
                         rescued_r_used += std::abs(cl);
@@ -524,7 +577,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     const double comp = v.dot(dx.tail<3>());
                     if (visual_enabled_ && v.dot(Htt * v) > tt_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
-                        const double cap = std::max(0.0, (double)visual_gate_max_trans_ - rescued_t_used);
+                        const double cap = std::max(0.0, cap_t - rescued_t_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
                         dx.tail<3>() += v * (cl - comp);
                         rescued_t_used += std::abs(cl);
@@ -794,6 +847,109 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
     if (cost != nullptr) { *cost += cost_sum; }
     this->last_visual_count_ = static_cast<int>(count);
     this->last_visual_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::accumulateVisualMapResidual(
+    const Eigen::Isometry3f& trans,
+    Eigen::Matrix<double, 6, 6>* H,
+    Eigen::Matrix<double, 6, 1>* b,
+    double* cost) {
+
+    this->last_visual_map_count_ = 0;
+    this->last_visual_map_rms_ = 0.0f;
+
+    if (visual_map_weight_ <= 0.f) { return; }
+    if (visual_cur_.empty() || visual_cur_.type() != CV_32FC1) { return; }
+    if (!target_ || !target_visual_refs_ || target_visual_refs_->size() != target_->size()) { return; }
+
+    const float fx = visual_fx_, fy = visual_fy_, cx = visual_cx_, cy = visual_cy_;
+    if (fx <= 0.f || fy <= 0.f) { return; }
+
+    // world -> current camera INCLUDING the correction: T_cw_cur_ = (T_prior*T_bc)^-1
+    // (set from the prior pose by the caller), composed with trans^-1 so the
+    // FIXED map point sees the corrected camera. This is the source of pose
+    // observability (the f2f term moved the point instead).
+    const Eigen::Isometry3f T_cw = T_cw_cur_ * trans.inverse();
+    const Eigen::Matrix3f R_cw = T_cw.linear();
+
+    const float zmin = 1e-3f;
+    const float bw = 2.f;
+    const float umax = static_cast<float>(visual_cur_.cols) - 1.f - bw;
+    const float vmax = static_cast<float>(visual_cur_.rows) - 1.f - bw;
+    const float cos_view_max = std::cos(visual_map_view_angle_max_);
+
+    std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
+    double cost_sum = 0.0, sq_sum = 0.0;
+    long count = 0;
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
+    for (int j = 0; j < target_->size(); ++j) {
+        const VisualRef& vr = (*target_visual_refs_)[j];
+        if (!vr.valid) { continue; }
+
+        const auto& tp = target_->at(j);
+        const Eigen::Vector3f p_w(tp.x, tp.y, tp.z);   // FIXED map point (world)
+        const Eigen::Vector3f Pc = R_cw * p_w + T_cw.translation();
+        if (Pc.z() <= zmin) { continue; }
+
+        // Viewpoint gating: brightness constancy breaks down when the current
+        // viewing ray differs much from the keyframe ray the reference was
+        // sampled along.
+        const float vn = vr.p_kf_cam.norm();
+        if (vn > 1e-6f) {
+            const float cosang = (Pc.normalized()).dot(vr.p_kf_cam / vn);
+            if (cosang < cos_view_max) { continue; }
+        }
+
+        const float invz = 1.f / Pc.z();
+        const float u = fx * Pc.x() * invz + cx;
+        const float v = fy * Pc.y() * invz + cy;
+        if (u < bw || u > umax || v < bw || v > vmax) { continue; }
+
+        const float I_mov = bilinearSample(visual_cur_, u, v);
+        const float gu = 0.5f * (bilinearSample(visual_cur_, u + 1.f, v) - bilinearSample(visual_cur_, u - 1.f, v));
+        const float gv = 0.5f * (bilinearSample(visual_cur_, u, v + 1.f) - bilinearSample(visual_cur_, u, v - 1.f));
+        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { continue; }
+
+        const float r = I_mov - vr.ref;
+
+        Eigen::Matrix<float, 2, 3> dpi;
+        dpi << fx * invz, 0.f,      -fx * Pc.x() * invz * invz,
+               0.f,       fy * invz, -fy * Pc.y() * invz * invz;
+        Eigen::Matrix<float, 1, 2> gI;
+        gI << gu, gv;
+        // FIXED map point under the trans-INVERSE perturbation:
+        // d(trans^-1 p_w)/dxi = [ skew(p_w) | -I ], so J = G*[skew(p_w)|-I]
+        // = [ +G*skew(p_w) | -G ]. NOTE: OPPOSITE the frame-to-frame term's
+        // [ -G*skew(x) | +G ] -- guarded by test_visual_residual.
+        const Eigen::Matrix<float, 1, 3> G = gI * dpi * R_cw;
+        Eigen::Matrix<float, 1, 6> J;
+        J.block<1, 3>(0, 0) = G * skew(p_w);
+        J.block<1, 3>(0, 3) = -G;
+
+        float weight = visual_map_weight_;
+        const float abs_r = std::abs(r);
+        if (visual_huber_delta_ > 0.f && abs_r > visual_huber_delta_) {
+            weight *= visual_huber_delta_ / abs_r;
+        }
+
+        const int tn = omp_get_thread_num();
+        H_private[tn] += (weight * J.transpose() * J).cast<double>();
+        b_private[tn] += (weight * J.transpose() * r).cast<double>();
+        cost_sum += weight * r * r;
+        sq_sum += static_cast<double>(r) * r;
+        count += 1;
+    }
+
+    for (int t = 0; t < num_threads_; ++t) {
+        (*H) += H_private[t];
+        (*b) += b_private[t];
+    }
+    if (cost != nullptr) { *cost += cost_sum; }
+    this->last_visual_map_count_ = static_cast<int>(count);
+    this->last_visual_map_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
 
 template <typename PointSource, typename PointTarget>

@@ -39,6 +39,14 @@
     odom/visual/gateMaxStepTrans: 0.2   # [m] per scan
     odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
 
+    # Frame-to-MAP camera term: the absolute anchor that breaks the tunnel
+    # drag-back (registers the current image to per-keyframe wall-texture refs).
+    odom/visual/map/enabled: true
+    odom/visual/map/weight: 0.3           # UNTUNED starting point; sweep on the bag
+    odom/visual/map/gateMaxStepTrans: 1.0 # absolute anchor gets a larger per-scan budget
+    odom/visual/map/gateMaxStepRot: 0.1
+    odom/visual/map/viewAngleMax: 0.6
+
     # 06042026 /lucid_camera_1 intrinsics (bag camera_info) + plumb_bob distortion.
     camera/intrinsics: [ 1094.19, 1092.23, 969.58, 721.31 ]
     camera/distortion: [ -0.04409, 0.05337, -0.00124, 0.00002, 0.0 ]

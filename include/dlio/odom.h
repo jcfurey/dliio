@@ -430,4 +430,21 @@ private:
   cv::Mat visual_cur_pending_;
   bool visual_cur_pending_valid_;
 
+  // --- Frame-to-MAP camera term (absolute anchor to map landmarks) ---
+  bool visual_map_enabled_;
+  double visual_map_weight_;
+  double visual_map_gate_max_trans_;   // [m]  per-scan rescue budget (absolute anchor)
+  double visual_map_gate_max_rot_;     // [rad]
+  double visual_map_view_angle_;       // [rad] max viewing-ray deviation before a ref is dropped
+  // Per-keyframe reference brightness/ray (sampled at creation, index-aligned
+  // with `keyframes`); concatenated into submap_visual_refs in buildSubmap.
+  std::vector<std::shared_ptr<const nano_gicp::VisualRefList>> keyframe_visual_refs;
+  std::shared_ptr<const nano_gicp::VisualRefList> submap_visual_refs;
+
+  // Sample per-point camera reference brightness for a keyframe cloud (world
+  // points at the prior) given that keyframe's world->camera transform + image.
+  std::shared_ptr<const nano_gicp::VisualRefList>
+  sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                           const Eigen::Isometry3f& T_cw, const cv::Mat& img);
+
 };

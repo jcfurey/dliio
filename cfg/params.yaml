@@ -153,6 +153,16 @@
     odom/visual/gateMaxStepTrans: 0.3   # [m] per scan
     odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
 
+    # Frame-to-MAP camera term: anchors absolute position to map landmarks (wall
+    # texture/graffiti) by registering the current image against per-keyframe
+    # reference brightness, breaking the geometric self-similarity that drags the
+    # pose back in a tunnel. Needs odom/visual/enabled too. OFF by default.
+    odom/visual/map/enabled: false
+    odom/visual/map/weight: 0.0
+    odom/visual/map/gateMaxStepTrans: 1.0   # [m] per scan (absolute anchor: larger budget)
+    odom/visual/map/gateMaxStepRot: 0.1     # [rad] per scan
+    odom/visual/map/viewAngleMax: 0.6       # [rad] drop refs whose viewing ray moved more than this
+
     # Diagonal covariance stamped on the published nav_msgs/Odometry
     # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
     # Constant and intentionally conservative; tune for your fusion stack
