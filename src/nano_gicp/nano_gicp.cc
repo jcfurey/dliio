@@ -21,6 +21,30 @@ inline float bilinearSample(const cv::Mat& img, float u, float v) {
   const float bot = r1[x0] * (1.f - ax) + r1[x0 + 1] * ax;
   return top * (1.f - ay) + bot * ay;
 }
+
+// Invert a monotonic per-row elevation LUT: given an elevation [rad], return
+// the fractional row and the local slope d(el)/d(row) [rad/row] used by the
+// projection Jacobian. Returns false if el is outside the LUT's coverage.
+// Handles both increasing- and decreasing-with-row beam orderings.
+inline bool rowFromElevationLut(const std::vector<float>& lut, float el,
+                                float& row_out, float& slope_out) {
+  const int n = static_cast<int>(lut.size());
+  if (n < 2) { return false; }
+  const bool inc = lut[n - 1] >= lut[0];
+  for (int k = 0; k < n - 1; ++k) {
+    const float a = lut[k], b = lut[k + 1];
+    const float lo = inc ? a : b;
+    const float hi = inc ? b : a;
+    if (el >= lo && el <= hi) {
+      const float denom = b - a;
+      if (std::abs(denom) < 1e-9f) { continue; }
+      row_out = static_cast<float>(k) + (el - a) / denom;
+      slope_out = denom;  // [rad/row] between row k and k+1
+      return true;
+    }
+  }
+  return false;
+}
 }  // namespace
 
 template class nano_gicp::NanoGICP<dlio::Point, dlio::Point>;
@@ -81,6 +105,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->lidar_az_a_ = 1.0f; this->lidar_az_b_ = 0.0f;
   this->lidar_el_a_ = 1.0f; this->lidar_el_b_ = 0.0f;
   this->T_lw_cur_ = Eigen::Isometry3f::Identity();
+  this->lidar_range_abs_tol_ = 0.5f;
+  this->lidar_range_rel_tol_ = 0.1f;
   this->last_lidar_map_rms_ = 0.0f;
   this->last_lidar_map_count_ = 0;
 }
@@ -251,6 +277,22 @@ void NanoGICP<PointSource, PointTarget>::setLidarProjection(float az_a, float az
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setLidarFrame(const Eigen::Isometry3f& T_lidar_world) {
     this->T_lw_cur_ = T_lidar_world;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarElevationLut(const std::vector<float>& el_per_row) {
+    this->lidar_el_lut_ = el_per_row;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarRangeImage(const cv::Mat& range_img) {
+    this->lidar_range_img_ = range_img;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarRangeConsistency(float abs_tol, float rel_tol) {
+    this->lidar_range_abs_tol_ = (abs_tol > 0.f) ? abs_tol : 0.f;
+    this->lidar_range_rel_tol_ = (rel_tol > 0.f) ? rel_tol : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -548,6 +590,14 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             accumulateLidarMapResidual(trans, &H, &b, nullptr);
         }
 
+        // Snapshot the combined (geometric + photometric) Hessian BEFORE
+        // damping: the visual-rescue Rayleigh test below must measure the
+        // photometric stiffening of a weak axis, not the LM damping term. If it
+        // read H after the diagonal += lambda, an escalated lambda (after a
+        // rejected step) could by itself exceed the rescue threshold and
+        // falsely "rescue" an axis no photometric term constrained.
+        const Eigen::Matrix<double, 6, 6> H_combined = H;
+
         // Add regularization / damping
         H.diagonal().array() += lambda;
 
@@ -592,8 +642,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H_geo.template block<3, 3>(0, 0));
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H_geo.template block<3, 3>(3, 3));
             // Combined (geometric + visual) blocks, to test visual rescue.
-            const Eigen::Matrix3d Hrr = H.template block<3, 3>(0, 0);
-            const Eigen::Matrix3d Htt = H.template block<3, 3>(3, 3);
+            // Pre-damping (H_combined) so the Rayleigh quotient reflects
+            // photometric stiffening, not the LM lambda on the diagonal.
+            const Eigen::Matrix3d Hrr = H_combined.template block<3, 3>(0, 0);
+            const Eigen::Matrix3d Htt = H_combined.template block<3, 3>(3, 3);
 
             const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
@@ -1021,6 +1073,12 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
     const float vmax = static_cast<float>(lidar_image_.rows) - 1.f - bw;
     const float inv_az_a = 1.f / lidar_az_a_;
     const float inv_el_a = 1.f / lidar_el_a_;
+    const bool use_el_lut = (static_cast<int>(lidar_el_lut_.size()) == lidar_image_.rows);
+    // Occlusion check active only when a same-size range image was supplied.
+    const bool use_range = (!lidar_range_img_.empty()
+                            && lidar_range_img_.type() == CV_32FC1
+                            && lidar_range_img_.rows == lidar_image_.rows
+                            && lidar_range_img_.cols == lidar_image_.cols);
 
     std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
     std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
@@ -1050,8 +1108,32 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
         const float az = std::atan2(Y, X);
         const float el = std::atan2(Z, rxy);
         const float u = (az - lidar_az_b_) * inv_az_a;   // col
-        const float v = (el - lidar_el_b_) * inv_el_a;   // row
+        // Row from the per-row elevation LUT (non-uniform beams) or the linear
+        // fallback; inv_el_eff is the local rows-per-radian used by the Jacobian.
+        float v, inv_el_eff;
+        if (use_el_lut) {
+            float slope;
+            if (!rowFromElevationLut(lidar_el_lut_, el, v, slope)) { continue; }
+            inv_el_eff = 1.f / slope;
+        } else {
+            v = (el - lidar_el_b_) * inv_el_a;
+            inv_el_eff = inv_el_a;
+        }
         if (u < bw || u > umax || v < bw || v > vmax) { continue; }  // (drops the azimuth seam strip)
+
+        // Occlusion / wrong-surface rejection: the FIXED map point must be the
+        // surface actually visible at this pixel. Without this, the whole-corridor
+        // submap projects far-side / occluded points onto near walls and floods
+        // the residual with mismatches (the dominant cause of high frame-to-map RMS).
+        if (use_range) {
+            const int ui = static_cast<int>(std::lround(u));
+            const int vi = static_cast<int>(std::lround(v));
+            const float ri = lidar_range_img_.ptr<float>(vi)[ui];
+            if (ri <= 0.f) { continue; }                       // no return: can't verify
+            const float rng_p = std::sqrt(rr2);                // map point range from current sensor
+            const float tol = std::max(lidar_range_abs_tol_, lidar_range_rel_tol_ * ri);
+            if (std::abs(rng_p - ri) > tol) { continue; }      // occluded / different surface
+        }
 
         const float I_mov = bilinearSample(lidar_image_, u, v);
         const float gu = 0.5f * (bilinearSample(lidar_image_, u + 1.f, v) - bilinearSample(lidar_image_, u - 1.f, v));
@@ -1062,14 +1144,15 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
 
         // Spherical projection Jacobian dpi_L/dP_l (2x3):
         //   col: d/dP (az)/az_a,  az=atan2(Y,X) -> daz/dP = (-Y/rxy2, X/rxy2, 0)
-        //   row: d/dP (el)/el_a,  el=atan2(Z,rxy) -> del/dP = (-ZX/(rxy*rr2), -ZY/(rxy*rr2), rxy/rr2)
+        //   row: d/dP (el)*drow/del, el=atan2(Z,rxy) -> del/dP = (-ZX/(rxy*rr2), -ZY/(rxy*rr2), rxy/rr2)
+        //   (drow/del = inv_el_eff: local LUT slope, or the linear 1/el_a)
         Eigen::Matrix<float, 2, 3> dpi;
         dpi(0, 0) = inv_az_a * (-Y / rxy2);
         dpi(0, 1) = inv_az_a * ( X / rxy2);
         dpi(0, 2) = 0.f;
-        dpi(1, 0) = inv_el_a * (-Z * X / (rxy * rr2));
-        dpi(1, 1) = inv_el_a * (-Z * Y / (rxy * rr2));
-        dpi(1, 2) = inv_el_a * ( rxy / rr2);
+        dpi(1, 0) = inv_el_eff * (-Z * X / (rxy * rr2));
+        dpi(1, 1) = inv_el_eff * (-Z * Y / (rxy * rr2));
+        dpi(1, 2) = inv_el_eff * ( rxy / rr2);
         Eigen::Matrix<float, 1, 2> gI;
         gI << gu, gv;
         // Same trans-inverse perturbation as the camera map term:

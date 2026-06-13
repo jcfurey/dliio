@@ -131,6 +131,20 @@ public:
   // Linear spherical model: col = (atan2(Y,X) - az_b)/az_a, row = (elev - el_b)/el_a.
   void setLidarProjection(float az_a, float az_b, float el_a, float el_b);
   void setLidarFrame(const Eigen::Isometry3f& T_lidar_world);  // world->lidar from the prior pose
+  // Optional per-row elevation LUT (size = image rows). OS-series beam
+  // elevations are NON-uniform, so the linear el(row) above leaves a
+  // row-dependent projection bias; when this LUT is set it supersedes el_a/el_b
+  // (el->row by monotonic interpolation, Jacobian uses the local slope). Empty
+  // = use the linear model.
+  void setLidarElevationLut(const std::vector<float>& el_per_row);
+  // Optional range image (CV_32FC1, same dims as the reflectivity image, range
+  // in metres, <=0 = no return) + consistency tolerance. When set, a map point
+  // whose range to the current sensor disagrees with the pixel's range by more
+  // than tol = max(abs_tol, rel_tol*range) is rejected as occluded / wrong-
+  // surface, removing the dominant source of spurious frame-to-map residuals.
+  // Empty image = no occlusion check (original behavior).
+  void setLidarRangeImage(const cv::Mat& range_img);
+  void setLidarRangeConsistency(float abs_tol, float rel_tol);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
 
@@ -283,8 +297,12 @@ protected:
   float lidar_map_weight_;
   cv::Mat lidar_image_;               // current reflectivity image, CV_32FC1, /scale
   float lidar_az_a_, lidar_az_b_;     // col = (atan2(Y,X) - az_b) / az_a
-  float lidar_el_a_, lidar_el_b_;     // row = (elev - el_b) / el_a
+  float lidar_el_a_, lidar_el_b_;     // row = (elev - el_b) / el_a (fallback)
+  std::vector<float> lidar_el_lut_;   // per-row elevation [rad]; supersedes el_a/el_b when non-empty
   Eigen::Isometry3f T_lw_cur_;        // world -> lidar from the prior pose
+  cv::Mat lidar_range_img_;           // current range image [m], CV_32FC1, <=0 invalid (optional)
+  float lidar_range_abs_tol_;         // occlusion tolerance: absolute [m]
+  float lidar_range_rel_tol_;         // occlusion tolerance: relative (fraction of range)
   float last_lidar_map_rms_;
   int last_lidar_map_count_;
 };

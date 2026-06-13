@@ -451,7 +451,10 @@ private:
   bool lidar_image_enabled_;
   double lidar_image_weight_;
   cv::Mat lidar_refl_img_;             // current scan reflectivity image (/scale), CV_32FC1
+  cv::Mat lidar_range_img_;            // current scan range image [m], CV_32FC1 (occlusion check)
   float lidar_az_a_, lidar_az_b_, lidar_el_a_, lidar_el_b_;  // self-calibrated spherical model
+  std::vector<float> lidar_el_lut_;    // per-row mean elevation [rad] (non-uniform beams)
+  double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
   bool lidar_proj_ready_;
   bool lidar_img_ready_;               // a usable image was built for this scan
   // Build the reflectivity image + spherical projection model from an organized

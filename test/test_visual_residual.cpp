@@ -578,6 +578,75 @@ TEST(LidarMapResidual, GaussNewtonStepDescendsCost) {
   EXPECT_LT(cost1, cost0);
 }
 
+// Occlusion gate: a map point whose range disagrees with the range image at its
+// pixel is rejected; a consistent one is kept.
+TEST(LidarMapResidual, RangeImageRejectsOccludedPoints) {
+  TestableGICP gicp;
+  gicp.setLidarMapWeight(1.0f);
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  gicp.setLidarImage(img);
+
+  auto target = makeLidarTarget();
+  for (auto& p : target->points) {
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    p.reflectivity = bilinearSampleRamp(img, u, v) * 255.f;
+  }
+  gicp.setInputTarget(target);
+
+  // Baseline (no range image): all points counted.
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  const int count_all = gicp.lastLidarMapCount();
+  ASSERT_GT(count_all, 20);
+
+  // Range image holding each point's TRUE range -> nothing rejected.
+  cv::Mat rng(kLH, kLW, CV_32FC1, cv::Scalar(0.f));
+  for (const auto& p : target->points) {
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    rng.at<float>(static_cast<int>(std::lround(v)), static_cast<int>(std::lround(u))) =
+        std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+  }
+  gicp.setLidarRangeImage(rng);
+  gicp.setLidarRangeConsistency(0.5f, 0.1f);
+  gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_EQ(gicp.lastLidarMapCount(), count_all);
+
+  // Range image claiming a much NEARER surface everywhere -> all occluded out.
+  cv::Mat rng_near(kLH, kLW, CV_32FC1, cv::Scalar(1.0f));  // 1 m vs points at 6-10 m
+  gicp.setLidarRangeImage(rng_near);
+  gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_EQ(gicp.lastLidarMapCount(), 0);
+}
+
+// Elevation LUT projection reproduces the linear model when the LUT is the exact
+// linear elevations (residual still zero at truth).
+TEST(LidarMapResidual, ElevationLutMatchesLinearAtTruth) {
+  TestableGICP gicp;
+  gicp.setLidarMapWeight(1.0f);
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  gicp.setLidarImage(img);
+
+  std::vector<float> lut(kLH);
+  for (int row = 0; row < kLH; ++row) { lut[row] = kLElA * row + kLElB; }
+  gicp.setLidarElevationLut(lut);
+
+  auto target = makeLidarTarget();
+  for (auto& p : target->points) {
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    p.reflectivity = bilinearSampleRamp(img, u, v) * 255.f;
+  }
+  gicp.setInputTarget(target);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  double cost = gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_GT(gicp.lastLidarMapCount(), 20);
+  EXPECT_NEAR(cost, 0.0, 1e-9);
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

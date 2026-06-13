@@ -489,6 +489,10 @@ void dlio::OdomNode::getParams() {
       "Enable the COIN-LIO LiDAR intensity-image frame-to-map term (organized scan + reflectivity)");
   dlio::declare_param(this, "odom/lidar_image/weight", this->lidar_image_weight_, 0.0,
       "Weight of the LiDAR intensity-image residual relative to the geometric GICP term");
+  dlio::declare_param(this, "odom/lidar_image/rangeAbsTol", this->lidar_range_abs_tol_, 0.5,
+      "Occlusion check: absolute range tolerance [m] for accepting a projected map point");
+  dlio::declare_param(this, "odom/lidar_image/rangeRelTol", this->lidar_range_rel_tol_, 0.1,
+      "Occlusion check: relative range tolerance (fraction of pixel range)");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
@@ -1528,16 +1532,20 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
   // the same /scale units as the residual reference (point.reflectivity/scale).
   const float inv_scale = 1.f / 255.0f;
   cv::Mat img(height, width, CV_32FC1, cv::Scalar(0.f));
+  cv::Mat rng(height, width, CV_32FC1, cv::Scalar(0.f));  // range [m]; 0 = no return
   for (int row = 0; row < height; ++row) {
     float* dst = img.ptr<float>(row);
+    float* drng = rng.ptr<float>(row);
     for (int col = 0; col < width; ++col) {
       const auto& p = organized->at(col, row);   // organized access (col, row)
       if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
         dst[col] = p.reflectivity * inv_scale;
+        drng[col] = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
       }
     }
   }
   this->lidar_refl_img_ = img;
+  this->lidar_range_img_ = rng;
   this->lidar_img_ready_ = true;
 
   // Self-calibrate the spherical model once (sensor geometry is fixed):
@@ -1545,7 +1553,8 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
   //   az(col) ~ az_a*col + az_b   (least-squares over one well-populated row, unwrapped)
   if (this->lidar_proj_ready_) { return; }
 
-  // Elevation vs row.
+  // Elevation vs row (also captured as a per-row LUT for the non-uniform beams).
+  this->lidar_el_lut_.assign(height, std::numeric_limits<float>::quiet_NaN());
   double sr = 0, se = 0, sre = 0, srr = 0; int ne = 0;
   for (int row = 0; row < height; ++row) {
     double accum = 0; int cnt = 0;
@@ -1557,6 +1566,7 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
     if (cnt > 0) {
       const double el = accum / cnt;
       sr += row; se += el; sre += row * el; srr += (double)row * row; ++ne;
+      this->lidar_el_lut_[row] = static_cast<float>(el);
     }
   }
   // Azimuth vs col on the most-populated row.
@@ -1635,6 +1645,18 @@ void dlio::OdomNode::getNextPose() {
     T_lw.matrix() = T_wl.inverse();
     this->gicp.setLidarImage(this->lidar_refl_img_);
     this->gicp.setLidarProjection(this->lidar_az_a_, this->lidar_az_b_, this->lidar_el_a_, this->lidar_el_b_);
+    // Per-row elevation LUT (non-uniform OS beams): pass only if fully finite
+    // and strictly monotonic, else fall back to the linear el model.
+    bool lut_ok = this->lidar_el_lut_.size() == (size_t)this->lidar_refl_img_.rows && !this->lidar_el_lut_.empty();
+    for (size_t k = 1; k < this->lidar_el_lut_.size() && lut_ok; ++k) {
+      const float a = this->lidar_el_lut_[k - 1], b = this->lidar_el_lut_[k];
+      if (!std::isfinite(a) || !std::isfinite(b) || a == b) { lut_ok = false; }
+    }
+    this->gicp.setLidarElevationLut(lut_ok ? this->lidar_el_lut_ : std::vector<float>{});
+    // Range image + tolerance for the occlusion / wrong-surface rejection.
+    this->gicp.setLidarRangeImage(this->lidar_range_img_);
+    this->gicp.setLidarRangeConsistency(static_cast<float>(this->lidar_range_abs_tol_),
+                                        static_cast<float>(this->lidar_range_rel_tol_));
     this->gicp.setLidarFrame(T_lw);
     this->gicp.setLidarMapWeight(static_cast<float>(this->lidar_image_weight_));
   } else {
