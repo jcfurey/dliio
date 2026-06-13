@@ -32,3 +32,88 @@ jobs:
           source /opt/ros/jazzy/setup.bash
           colcon test --event-handlers console_cohesion+
           colcon test-result --verbose
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer: catches heap overflow,
+  # use-after-free, and UB in the test paths (GICP math, IMU integration,
+  # photometric/occlusion loops). Leaks are ignored (one-shot statics in
+  # PCL/OpenCV/rclcpp); the memory-safety / UB checks are what matter.
+  asan-ubsan:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/direct_lidar_inertial_odometry
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src -y
+
+      - name: Build (ASan + UBSan)
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --event-handlers console_cohesion+ \
+            --cmake-args -DDLIIO_SANITIZE=address -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Run gtests under ASan/UBSan
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          # include the concurrency harness: ASan has no false-positive problem
+          # and catches use-after-free in the worker-thread lifecycle / keyframe
+          # vectors under real concurrency. OMP_NUM_THREADS kept default here.
+          rc=0
+          for t in test_nano_gicp test_imu_integration test_visual_residual test_node_concurrency; do
+            echo "::group::$t"
+            ./build/direct_lidar_inertial_odometry/$t || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+  # ThreadSanitizer on the live-node concurrency harness. INFORMATIONAL
+  # (continue-on-error): rclcpp's executor is not TSan-instrumented, so a
+  # MutuallyExclusive callback group's serialized-but-thread-migrated accesses
+  # look like races to TSan and cannot be suppressed by function name without
+  # also masking genuine races in those same functions (TSan suppresses a race
+  # if EITHER stack matches). The harness is therefore a triage tool -- it found
+  # the 5 real cross-thread races that were fixed -- run here for visibility, not
+  # as a merge gate. Inspect the log: a GENUINE race has its two stacks in
+  # DIFFERENT callback-group domains (e.g. timer vs IMU, or background-submap vs
+  # main); same-group pairs are the executor-migration false positives.
+  tsan-informational:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/direct_lidar_inertial_odometry
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src -y
+
+      - name: Build (TSan)
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --event-handlers console_cohesion+ \
+            --cmake-args -DDLIIO_SANITIZE=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Run concurrency harness under TSan (report only)
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          export OMP_NUM_THREADS=1
+          export TSAN_OPTIONS="halt_on_error=0:report_thread_leaks=0:suppressions=$(pwd)/src/direct_lidar_inertial_odometry/test/tsan.supp"
+          ./build/direct_lidar_inertial_odometry/test_node_concurrency
+

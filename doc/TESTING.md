@@ -42,9 +42,25 @@ TSAN_OPTIONS="suppressions=$(pwd)/src/direct_lidar_inertial_odometry/test/tsan.s
   ./build_tsan/direct_lidar_inertial_odometry/test_node_concurrency
 ```
 `OMP_NUM_THREADS=1` silences the (uninstrumented) OpenMP runtime; `test/tsan.supp`
-suppresses callback-group-serialized accesses TSan can't reason about and one
-third-party (OpenNI2) library issue. **Status: clean (0 warnings)** after the
-2026-06-13 race fixes; the harness building this set of fixes is what found them.
+covers the most common callback-group-serialized accesses and one third-party
+(OpenNI2) library issue.
+
+**What this is and isn't.** The harness is a *triage tool*, not a hard gate. It
+found the 5 genuine cross-thread races below, which were fixed. As a permanent
+"zero reports" gate it is unreliable: rclcpp's executor is not TSan-instrumented,
+so a MutuallyExclusive callback group's serialized-but-thread-migrated accesses
+look like races to TSan, and they cannot be suppressed by function name without
+also masking *real* races in those same functions (TSan suppresses a race if
+EITHER access stack matches a suppression). The set of false positives that
+surfaces also varies run to run (the harness is concurrent). It therefore runs
+in CI as an **informational, continue-on-error job**; ASan/UBSan is the hard gate.
+
+**Reading the output:** a GENUINE race has its two access stacks in DIFFERENT
+callback-group domains -- e.g. the pose timer vs the IMU callback, the dashboard
+thread vs the IMU callback, or the background submap thread vs the main scan
+callback. Two stacks within the SAME MutuallyExclusive group (both in
+callbackImu/transformImu, both in callbackPointCloud, both in publishPose) are
+the executor-migration false positives.
 
 ### Races this harness found and fixed (not suppressed)
 - `publishPose` / `debug()` read `state`+`imu_stamp` cross-group -> snapshot under `geo.mtx`.
