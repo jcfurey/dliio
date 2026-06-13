@@ -63,7 +63,7 @@ This repo's approach — a per-point photometric residual added directly into th
 ### II.3 Intensity pipeline logic
 
 18. **Range correction is applied unconditionally** — even when `photometricWeight: 0` (pure wasted per-point `pow()`), and the *modified* intensities are what get published in the deskewed cloud and keyframes. Downstream consumers (clustering, semantics, rviz coloring) silently receive `I·(r/r_ref)^α` instead of sensor output. Gate it on the photometric term being active, or correct a scratch channel. **[FIXED on this branch: range correction and reflectivity extraction only run when photometricWeight > 0]**
-19. **No incidence-angle term.** The literature's standard model divides by `cos α` (Part I.4); at grazing angles on the ground plane — *the* dominant surface for a ground robot — pure range correction systematically darkens distant ground points, which then look like intensity gradients. You already compute surface normals (GICP covariances!); the cosine is one dot product away.
+19. **No incidence-angle term.** The literature's standard model divides by `cos α` (Part I.4); at grazing angles on the ground plane — *the* dominant surface for a ground robot — pure range correction systematically darkens distant ground points, which then look like intensity gradients. You already compute surface normals (GICP covariances!); the cosine is one dot product away. **[FIXED: `OdomNode::correctIntensity` implements `I·(r/r_ref)^α / max(cosα, cosMin)`; normals estimated from the organized grid (Ouster) before NaN removal; opt-in `odom/preprocessing/intensityIncidence`, default off; unit-tested (`test_intensity`).]**
 20. **`clamp(..., 0, 255)` bakes in an 8-bit assumption.** Ouster calibrated reflectivity is uint16 (0–65535) with values >255 for retroreflectors — precisely the most informative landmarks — and the reflectivity path copies the raw uint16 then later clamps photometric inputs as if 8-bit. Retroreflective signs saturate to the same value as white paint. **[PARTLY FIXED: `photometricScale` makes the working range explicit and configurable (65535 for raw 16-bit); the intensity-path clamp at 255 remains, and retroreflector saturation is inherent to 8-bit calibrated reflectivity]**
 21. **The α=2 inverse-square default contradicts the near-range literature** (≈exponential below ~10 m, per the radiometric review) — fine as a default, but `intensityRRef: 1.0` meters anchors the correction in exactly the regime where the model is worst. A README sentence noting "calibrate α on your sensor, anchor R_ref in mid-range" would save users a bad week. **[DOCUMENTED in cfg/params.yaml: near-range caveat noted at the parameter]**
 
@@ -107,7 +107,7 @@ Original grades from the first review, with re-grades after the fix series (PR #
 |---|---|---|---|
 | Deskew & observer math | A− | **A** | Faithful to two strong papers; startup-dt bug fixed **[PR #1]**; orientation-interpolation off-by-one found by unit test and fixed **[PR #3]** |
 | Registration engine | C | **B+** | Honest regularization, double-precision solve, SO(3) updates, degeneracy gate, LM-style step acceptance |
-| Intensity feature | B− | **B+** | Normalized, Huber-robustified, query-centered gradients, channel selection; awaits field validation and incidence-angle physics |
+| Intensity feature | B− | **A−** | Normalized, Huber-robustified, query-centered gradients, channel selection, incidence-angle correction; awaits field validation |
 | Concurrency | C− | **B+** | Joinable workers, bounded waits, unload-safe destructor, metrics inlined (race removed) |
 | ROS 2 idiom | D+ | **B+** | Components + intra-process, SensorDataQoS, static TF, covariance wiring, descriptors, launch args; ranges/live-set and URDF extrinsics open |
 | Testing & CI | F | **B−** | NanoGICP + IMU-integration gtest suites (the latter caught a real upstream deskew bug) + Jazzy CI; no bag-replay regression, no lint |
@@ -126,7 +126,7 @@ Everything still open after PR #1–#3, consolidated. Items link back to the num
 
 **Code, tractable without data** *(items 4, 7–10 part, 12–13 part closed in PR #3)*:
 4. ~~GN step control (#2)~~ — **done in PR #3** (retrospective LM-style step acceptance).
-5. **Incidence-angle intensity correction** (#19) — needs normals at preprocessing time; cheapest path is reusing the GICP covariance normals one stage later, or estimating coarse normals on the voxelized scan.
+5. ~~Incidence-angle intensity correction (#19)~~ — **done** (`correctIntensity` + organized-grid normals, opt-in).
 6. **URDF/tf2-sourced extrinsics** (#24) — requires deferred initialization (a constructor can't block on TF before the node spins); small dedicated PR.
 7. **Parameter ranges, read-only flags, live-set callbacks** (#26) — descriptions exist (PR #3); ranges and `add_on_set_parameters_callback` for the live-tunable gains/weights do not.
 8. ~~Named constants (#7)~~ / ~~metrics races (#9)~~ — **done in PR #3**.
