@@ -57,6 +57,11 @@ Added `photometricHuberDelta` (default value: 0.05), `maxKeyframes` (default val
 
 Wiring into a fusion/navigation stack: feed `dlio/odom_node/odom` to `robot_localization` (or use it directly as the `odom`→`base_link` source for Nav2, in which case let DLIO own that TF and do **not** also fuse a second publisher of the same transform). The LiDAR subscription uses best-effort `SensorDataQoS`; drivers publishing reliable still match.
 
+## Notes & findings
+
+- `doc/VISUAL_TERM.md` — design of the optional direct-photometric anchors (camera frame-to-frame / frame-to-map, and the COIN-LIO LiDAR intensity-image term), the degeneracy-gate safety floor, parameters, and tests.
+- `doc/TUNNEL_FINDINGS.md` — consolidated empirical findings from the `resple_test_ws` harness on the 06042026 tunnel: the degeneracy-gate and reflectivity-weight sweeps, the visual-term A/Bs, the COIN-LIO results, recommended configs, the chaotic-basin / co-scheduling caveats, and open next steps.
+
 ---
 
 # Original ReadMe
