@@ -84,6 +84,8 @@ DLIO has been extensively tested using a variety of sensor configurations and cu
 
 For best performance, extrinsic calibration between the LiDAR/IMU sensors and the robot's center-of-gravity should be inputted into `cfg/dlio.yaml`. If the exact values of these are unavailable, a rough LiDAR-to-IMU extrinsics can also be used (note however that performance will be degraded).
 
+If your robot already publishes its sensor frames from a URDF (via `robot_state_publisher`), set `extrinsics/source: tf` in `cfg/dlio.yaml` instead of hand-copying the matrices. The node then looks up `base_link`→`imu`, `base_link`→`lidar` (and `lidar`→`camera` when the visual term is on) from tf2 at startup, holding off scan/IMU processing until they resolve. It does not publish its own `/tf_static` in this mode, and falls back to the YAML extrinsics if the transforms never arrive (~10 s).
+
 IMU intrinsics are also necessary for best performance, and there are several open-source calibration tools to get these values. These values should also go into `cfg/dlio.yaml`. In practice however, if you are just testing this work, using the default ideal values and performing the initial calibration procedure should be fine.
 
 Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized, otherwise DLIO will not work. We recommend using a LiDAR with an integrated IMU (such as an Ouster) for simplicity of extrinsics and synchronization.
