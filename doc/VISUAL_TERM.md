@@ -229,3 +229,51 @@ the term real-time; re-tuning the normalized weight is the open Phase-2 step
 starves the node (IMU-drop scan-skips) — the documented dliio hazard; headless on
 free cores is clean (0 warnings, full 21k poses). See
 `results/dliio_lidarimg_ab/NOTES.md`.
+
+## Literature cross-reference (the three 2026-06-13 fixes)
+
+The review fixes on branch `claude/visual-term-fixes` were each checked against
+the primary sources; all three align with established practice.
+
+- **Degeneracy-gate damping leak (rescue judged on the un-damped information
+  matrix).** Zhang, Kaess & Singh, *On Degeneracy of Optimization-based State
+  Estimation* (ICRA 2016, [paper](https://frc.ri.cmu.edu/~zhangji/publications/ICRA_2016.pdf))
+  remap the solution using the **information matrix's** conditioning. Mixing the
+  LM damping term `λI` into the block the rescue test reads contaminates exactly
+  that conditioning judgement; snapshotting the combined geometric+photometric
+  Hessian *before* `+= λ` keeps the test faithful to the paper.
+
+- **Occlusion / depth-consistency culling of projected map points.** This is the
+  one the literature is most explicit about. FAST-LIVO
+  ([arXiv:2203.00893](https://arxiv.org/abs/2203.00893)) and FAST-LIVO2
+  ([arXiv:2408.14035](https://arxiv.org/abs/2408.14035)) add "a novel outlier
+  rejection method … to reject unstable map points that lie on edges or are
+  **occluded in the image view** … identifies occluded and **depth-discontinuous**
+  visual map points." Our per-scan range image + `|range_p − range_pixel| > tol`
+  reject is the direct LiDAR-image analogue. COIN-LIO
+  ([arXiv:2310.01235](https://arxiv.org/abs/2310.01235), [code](https://github.com/ethz-asl/COIN-LIO))
+  likewise operates on a structured intensity image with brightness/range
+  filtering rather than blindly projecting a whole world map. Projecting the
+  entire corridor submap with **no** visibility test (the original code) is the
+  one thing all of these explicitly avoid — consistent with the high frame-to-map
+  RMS in `TUNNEL_FINDINGS.md`.
+
+- **Per-beam (non-uniform) elevation instead of a linear `el(row)`.** Ouster OS
+  sensors ship Uniform, **Gradient**, and **Below-Horizon** beam configurations
+  with per-beam `beam_altitude_angles` in the metadata
+  ([Ouster sensor docs](https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html)).
+  COIN-LIO requires Ouster specifically *"as we use the calibration in the
+  metadata file for the image projection model"* and a per-sensor column-shift
+  calibration. A single linear elevation slope is therefore wrong for two of the
+  three modes; our self-calibrated per-row elevation LUT (local-slope Jacobian)
+  empirically recovers what COIN-LIO reads from the metadata.
+
+**Where this fork still differs from the references (open, not bugs):** COIN-LIO
+and FAST-LIVO attach patches to *sparse, selected* map points and pick patches
+**complementary to the degenerate directions**, whereas this term accumulates an
+isotropic residual over a strided subset and relies on the gate for
+complementarity (REVIEW.md item #8, condition-scaled weighting). None of the
+terms here do affine brightness-constancy compensation, which FAST-LIVO/COIN-LIO
+do (TUNNEL_FINDINGS open item 5). The occlusion + per-beam fixes close the two
+gaps that were outright deviations; patch selection and photometric calibration
+remain genuine, literature-backed next steps.

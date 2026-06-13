@@ -18,6 +18,7 @@ Quick-reference for the papers, algorithms, and framework docs relevant to this 
 
 | Reference | Venue | Link | Key idea relevant here |
 |---|---|---|---|
+| Zheng, Zhu et al. — *FAST-LIVO / FAST-LIVO2: Fast Direct LiDAR-Inertial-Visual Odometry* | IROS 2022 / T-RO 2024 | [arXiv:2203.00893](https://arxiv.org/abs/2203.00893) · [arXiv:2408.14035](https://arxiv.org/abs/2408.14035) | Sparse-direct photometric map-point alignment; **occlusion + depth-discontinuity outlier rejection** — the reference for the frame-to-map range/occlusion cull |
 | Pfreundschuh et al. — *COIN-LIO: Complementary Intensity-Augmented LiDAR Inertial Odometry* | ICRA 2024 | [arXiv:2310.01235](https://arxiv.org/abs/2310.01235) · [code](https://github.com/ethz-asl/COIN-LIO) | Intensity-image patches selected to be *complementary to degenerate geometric directions*; brightness/range filtering; IEKF fusion. The benchmark for the tunnel scenario |
 | Zhang et al. — *RI-LIO: Reflectivity Image Assisted Tightly-Coupled LiDAR-Inertial Odometry* | RA-L 2023 | [IEEE](https://ieeexplore.ieee.org/document/10041769) | Photometric residuals from calibrated reflectivity images blended with geometric residuals — closest published analogue to this repo's photometric term |
 | *PG-LIO: Photometric-Geometric Fusion for Robust LiDAR-Inertial Odometry* | 2025 | [arXiv:2506.18583](https://arxiv.org/abs/2506.18583) | Recent photometric-geometric fusion formulation |
