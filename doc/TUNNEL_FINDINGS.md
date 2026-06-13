@@ -135,6 +135,9 @@ bit-identical when disabled.
 
 ## Open items / next steps
 
+> The concrete, reproducible procedure for the next series (branch, headless/free-core, sim-time+clock, the weight sweep, occlusion-tol sanity check, n>=5, metric, and exact /diagnostics keys to read) is in **`doc/TUNNEL_SWEEP_RUNBOOK.md`**.
+
+
 1. **Re-tune the normalized LiDAR-image weight** (~0.05) and validate n≥5 headless
    on free cores — the most promising remaining lever.
 2. **Confirm the camera↔LiDAR extrinsic** (`extrinsics/cam2lidar`) and **which

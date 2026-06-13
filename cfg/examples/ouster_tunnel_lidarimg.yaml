@@ -4,30 +4,44 @@
 # mode. Unlike the narrow sideways camera (ouster_tunnel_visual.yaml), the LiDAR
 # sees the walls 360deg with consistent, range-normalized reflectivity, so it has
 # far more persistent landmarks to anchor the degenerate tunnel axis against.
-# Requires an ORGANIZED scan (Ouster publishes 64xN); the image + spherical model
-# are self-calibrated from the first organized scan.
+# Requires an ORGANIZED scan (Ouster publishes 64xN); the image, spherical model,
+# and per-row elevation LUT are self-calibrated from the first organized scan.
 #
 # Overlay ON TOP of ouster_tunnel.yaml (reflectivity + plane + gate), then this.
 # No camera needed.
 #
-# Usage:
+# Usage (headless, sim time, free cores -- see doc/TUNNEL_SWEEP_RUNBOOK.md):
 #   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
-#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
-#     params_file:=.../cfg/params.yaml
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu use_sim_time:=true
 #   #   --ros-args --params-file .../cfg/examples/ouster_tunnel.yaml \
 #   #               --params-file .../cfg/examples/ouster_tunnel_lidarimg.yaml
 #
-# NOTE: lidar_image/weight is an UNTUNED starting point — sweep on the bag.
-# Watch "Lidar Map Points" / "Lidar Map RMS" / "Degenerate Directions" in
-# /diagnostics.
+# Watch in /diagnostics: "Lidar Map Points" (want thousands), "Lidar Map RMS"
+# (lower is better; the occlusion cull should drop it vs the pre-fix ~0.4-0.6),
+# "Degenerate Directions (current)", "Visual Rescued Axes".
 
 /**:
   ros__parameters:
     odom/lidar_image/enabled: true
-    odom/lidar_image/weight: 0.3          # UNTUNED starting point; sweep on the bag
 
-    # The LiDAR anchor reuses the absolute-anchor gate budget (shared with the
-    # camera map term): vision/LiDAR may correct the IMU prior on a degenerate
-    # axis by at most this per scan, bounded so a wrong anchor can't run away.
+    # Count-normalized weight (the term's Hessian mass is normalized to a nominal
+    # point count, so this is comparable to the geometric term and stable
+    # regardless of how many points are visible). ~0.05 is the first cut after
+    # normalization -- SWEEP 0.02 / 0.05 / 0.1 on the bag (n>=5). The old raw
+    # weight 0.3 over-travelled because it scaled with the 5k-75k point count.
+    odom/lidar_image/weight: 0.05
+
+    # Occlusion / wrong-surface rejection (frame-to-map): a projected map point
+    # whose range to the current sensor disagrees with the pixel's range by more
+    # than max(rangeAbsTol, rangeRelTol*range) is dropped. Without this the whole
+    # corridor map floods near-wall pixels with far-side mismatches (the dominant
+    # cause of high RMS). If "Lidar Map Points" collapses to hundreds, loosen
+    # these; if RMS stays high, tighten.
+    odom/lidar_image/rangeAbsTol: 0.5     # [m]
+    odom/lidar_image/rangeRelTol: 0.1     # fraction of pixel range
+
+    # The LiDAR anchor reuses the absolute-anchor gate budget: it may correct the
+    # IMU prior on a degenerate axis by at most this per scan, bounded so a wrong
+    # anchor can't run away.
     odom/visual/map/gateMaxStepTrans: 1.0
     odom/visual/map/gateMaxStepRot: 0.1
