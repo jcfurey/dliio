@@ -29,6 +29,9 @@
     frames/baselink: base_link
     frames/lidar: lidar
     frames/imu: imu
+    # Camera frame, only used to look up the lidar->camera extrinsic when
+    # extrinsics/source: tf and odom/visual/enabled (see dlio.yaml).
+    frames/camera: camera
 
     # Map node: delay publishing until the robot has moved 0.1 m; publish the
     # unfiltered (dense) or voxelized clouds; sparse map voxel size [m].

@@ -46,8 +46,21 @@
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]
 
+    # Extrinsics source:
+    #   yaml (default) - use the extrinsics/baselink2{imu,lidar} (and
+    #                    cam2lidar) values below; published once on /tf_static.
+    #   tf             - look the extrinsics up from tf2 at startup (e.g.
+    #                    base_link->imu, base_link->lidar published by
+    #                    robot_state_publisher from the robot URDF). The node
+    #                    does NOT publish those static transforms in this mode;
+    #                    it waits (up to ~10 s) for them, then falls back to the
+    #                    YAML values below if they never arrive. The YAML
+    #                    extrinsics therefore double as the fallback.
+    extrinsics/source: yaml
+
     # Rigid extrinsics from base_link to each sensor: translation [m] and
-    # row-major rotation matrix. Published once on /tf_static at startup.
+    # row-major rotation matrix. Published once on /tf_static at startup
+    # (extrinsics/source: yaml), or used as the fallback (extrinsics/source: tf).
     # The defaults below are the Ouster OS1's internal IMU offset; replace
     # with your robot's calibration.
     extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]

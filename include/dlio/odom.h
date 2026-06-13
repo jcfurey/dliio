@@ -28,6 +28,8 @@
 #include <map>
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/static_transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 // BOOST
 #include <boost/format.hpp>
@@ -97,6 +99,11 @@ private:
 
   void publishPose();
   void publishStaticTransforms();
+  // Resolve base_link->{imu,lidar} (and lidar->camera) extrinsics from tf2
+  // (populated by robot_state_publisher from URDF) when extrinsics/source==tf.
+  // Runs on a timer until the transforms are available (or attempts exhausted,
+  // then falls back to the YAML values). Sets extrinsics_ready_ when done.
+  void resolveExtrinsicsFromTf();
 
   void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
   void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
@@ -178,6 +185,18 @@ private:
   // TF
   std::shared_ptr<tf2_ros::TransformBroadcaster> br;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_br;
+
+  // Extrinsics source: "yaml" (default) or "tf" (URDF via robot_state_publisher).
+  std::string extrinsics_source_;
+  std::string camera_frame_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  rclcpp::TimerBase::SharedPtr extrinsics_timer_;
+  int extrinsics_attempts_ = 0;
+  // Gates scan/imu processing until the extrinsics are resolved (true for the
+  // yaml path; set false until tf resolves so the extrinsics writes happen-
+  // before any reader -- the atomic provides the synchronization).
+  std::atomic<bool> extrinsics_ready_{true};
 
   // ROS Msgs
   nav_msgs::msg::Odometry odom_ros;

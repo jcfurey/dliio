@@ -200,7 +200,22 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
-  this->publishStaticTransforms();
+  if (this->extrinsics_source_ == "tf") {
+    // robot_state_publisher owns base_link->sensor TF from the URDF; resolve the
+    // extrinsics from tf2 instead of publishing our own static transforms.
+    // Gate processing until they're available (the YAML values remain as a
+    // fallback if the lookups never succeed).
+    this->extrinsics_ready_.store(false);
+    this->tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    this->tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*this->tf_buffer_);
+    this->extrinsics_timer_ = this->create_wall_timer(
+        std::chrono::duration<double>(0.5),
+        std::bind(&dlio::OdomNode::resolveExtrinsicsFromTf, this));
+    RCLCPP_INFO(this->get_logger(),
+        "extrinsics/source=tf: waiting for base_link->{imu,lidar} from tf2...");
+  } else {
+    this->publishStaticTransforms();
+  }
 
   // constant diagonal covariance on the published odometry (set once;
   // the message object is reused by publishPose)
@@ -372,6 +387,10 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "frames/baselink", this->baselink_frame, "base_link");
   dlio::declare_param(this, "frames/lidar", this->lidar_frame, "lidar");
   dlio::declare_param(this, "frames/imu", this->imu_frame, "imu");
+  dlio::declare_param(this, "frames/camera", this->camera_frame_, "camera");
+  // Extrinsics source: "yaml" (the extrinsics/* params below) or "tf" (look them
+  // up from tf2, e.g. published by robot_state_publisher from the robot URDF).
+  dlio::declare_param(this, "extrinsics/source", this->extrinsics_source_, std::string("yaml"));
 
   // Deskew Flag
   dlio::declare_param(this, "pointcloud/deskew", this->deskew_, true);
@@ -728,6 +747,68 @@ void dlio::OdomNode::publishStaticTransforms() {
 
   this->static_br->sendTransform(transformStamped);
 
+}
+
+void dlio::OdomNode::resolveExtrinsicsFromTf() {
+  // Look up the latest available transforms. base_link<-imu and base_link<-lidar
+  // are required; lidar<-camera only when the visual term is enabled.
+  auto toMatrix = [](const geometry_msgs::msg::TransformStamped& tf) {
+    const auto& q = tf.transform.rotation;
+    const auto& t = tf.transform.translation;
+    Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+    M.block<3, 3>(0, 0) = Eigen::Quaternionf(static_cast<float>(q.w), static_cast<float>(q.x),
+                                             static_cast<float>(q.y), static_cast<float>(q.z))
+                              .normalized().toRotationMatrix();
+    M.block<3, 1>(0, 3) = Eigen::Vector3f(static_cast<float>(t.x), static_cast<float>(t.y),
+                                          static_cast<float>(t.z));
+    return M;
+  };
+
+  try {
+    if (!this->tf_buffer_->canTransform(this->baselink_frame, this->imu_frame, tf2::TimePointZero) ||
+        !this->tf_buffer_->canTransform(this->baselink_frame, this->lidar_frame, tf2::TimePointZero)) {
+      throw tf2::TransformException("pending");
+    }
+    const auto T_bi = toMatrix(
+        this->tf_buffer_->lookupTransform(this->baselink_frame, this->imu_frame, tf2::TimePointZero));
+    const auto T_bl = toMatrix(
+        this->tf_buffer_->lookupTransform(this->baselink_frame, this->lidar_frame, tf2::TimePointZero));
+    Eigen::Matrix4f T_lc = this->cam2lidar_T_;  // keep YAML cam2lidar unless tf has it
+    if (this->visual_enabled_ &&
+        this->tf_buffer_->canTransform(this->lidar_frame, this->camera_frame_, tf2::TimePointZero)) {
+      T_lc = toMatrix(
+          this->tf_buffer_->lookupTransform(this->lidar_frame, this->camera_frame_, tf2::TimePointZero));
+    }
+
+    // Commit the extrinsics, then release via the atomic store so the scan/imu
+    // threads (which acquire-load extrinsics_ready_ before reading) see them.
+    this->extrinsics.baselink2imu_T = T_bi;
+    this->extrinsics.baselink2imu.t = T_bi.block<3, 1>(0, 3);
+    this->extrinsics.baselink2imu.R = T_bi.block<3, 3>(0, 0);
+    this->extrinsics.baselink2lidar_T = T_bl;
+    this->extrinsics.baselink2lidar.t = T_bl.block<3, 1>(0, 3);
+    this->extrinsics.baselink2lidar.R = T_bl.block<3, 3>(0, 0);
+    this->cam2lidar_T_ = T_lc;
+
+    this->extrinsics_ready_.store(true);
+    this->extrinsics_timer_->cancel();
+    RCLCPP_INFO(this->get_logger(), "extrinsics resolved from tf2 "
+        "(base_link->imu t=[%.4f %.4f %.4f], base_link->lidar t=[%.4f %.4f %.4f]).",
+        this->extrinsics.baselink2imu.t[0], this->extrinsics.baselink2imu.t[1],
+        this->extrinsics.baselink2imu.t[2], this->extrinsics.baselink2lidar.t[0],
+        this->extrinsics.baselink2lidar.t[1], this->extrinsics.baselink2lidar.t[2]);
+  } catch (const tf2::TransformException& e) {
+    if (++this->extrinsics_attempts_ >= 20) {  // ~10 s
+      RCLCPP_WARN(this->get_logger(),
+          "extrinsics/source=tf: transforms unavailable after %d attempts (%s); "
+          "falling back to the YAML extrinsics.", this->extrinsics_attempts_, e.what());
+      this->extrinsics_ready_.store(true);
+      this->extrinsics_timer_->cancel();
+    } else {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "extrinsics/source=tf: still waiting for base_link->{imu,lidar} (%s)...", e.what());
+    }
+  }
 }
 
 void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
@@ -1236,6 +1317,8 @@ void dlio::OdomNode::initializeDLIO() {
 
 void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc) {
 
+  if (!this->extrinsics_ready_.load()) { return; }  // tf extrinsics not resolved yet
+
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
   this->main_loop_running = true;
   lock.unlock();
@@ -1394,6 +1477,10 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 }
 
 void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
+
+  // transformImu uses the baselink<-imu extrinsic; wait until it's resolved
+  // (tf mode). Drops the brief startup window before tf is available.
+  if (!this->extrinsics_ready_.load()) { return; }
 
   this->first_imu_received = true;
 
