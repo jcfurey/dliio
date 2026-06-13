@@ -772,8 +772,9 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
 
   br->sendTransform(transformStamped);
 
-  // baselink->imu and baselink->lidar are fixed extrinsics from YAML and are
-  // published once, latched, by the static broadcaster (see constructor).
+  // baselink->imu and baselink->lidar are fixed extrinsics, so they are NOT
+  // re-sent here: in extrinsics/source=yaml they are published once (latched) by
+  // the static broadcaster; in =tf robot_state_publisher owns them (see ctor).
 
 }
 
