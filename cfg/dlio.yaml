@@ -37,6 +37,10 @@
     # while STATIONARY for odom/imu/calibration/time seconds at startup.
     # If false, the intrinsics below are used as-is.
     imu/calibration: true
+    # Some IMUs (notably Livox built-in IMUs) report linear acceleration in units
+    # of g rather than m/s^2. Set true to scale the incoming accel by odom/gravity
+    # on intake; leave false for IMUs already in m/s^2 (the usual case).
+    imu/normalized: false
     # Accelerometer bias [m/s^2] and gyro bias [rad/s], used when
     # imu/calibration is false (e.g. from a prior calibration run).
     imu/intrinsics/accel/bias: [ 0.0, 0.0, 0.0 ]

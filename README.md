@@ -101,6 +101,8 @@ IMU intrinsics are also necessary for best performance, and there are several op
 
 Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized, otherwise DLIO will not work. We recommend using a LiDAR with an integrated IMU (such as an Ouster) for simplicity of extrinsics and synchronization.
 
+**Livox notes.** Livox point clouds are consumed as `PointCloud2` (the per-point `timestamp` field selects the Livox deskew path). If you have `livox_ros_driver2` in your workspace, the node also builds an optional ingester that subscribes to a raw `CustomMsg` on `livox` and republishes it as `PointCloud2` on `livox2dlio` — remap the cloud input to use it (`pointcloud:=livox2dlio`). Livox _built-in_ IMUs report acceleration in units of g, so set `imu/normalized: true` in `cfg/dlio.yaml` to scale it to m/s².
+
 ### Dependencies
 The following has been verified to be compatible, although other configurations may work too:
 

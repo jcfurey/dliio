@@ -23,6 +23,46 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 
+#ifdef HAVE_LIVOX_ROS_DRIVER2
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+
+namespace {
+// Convert a Livox custom message to a PointType cloud and serialize it as a
+// PointCloud2. Each point's timestamp is stored as ABSOLUTE nanoseconds (a
+// double = base_ns + per-point offset_time) so getScanFromROS classifies the
+// cloud as LIVOX (timestamp > 1e14) and deskew recovers absolute seconds via
+// the existing LIVOX branch -- no separate point struct needed.
+sensor_msgs::msg::PointCloud2 livoxToPointCloud2(
+    const livox_ros_driver2::msg::CustomMsg& livox, const std::string& frame_id) {
+  const double base_ns = static_cast<double>(livox.header.stamp.sec) * 1e9
+                       + static_cast<double>(livox.header.stamp.nanosec);
+
+  pcl::PointCloud<dlio::Point> cloud;
+  cloud.points.reserve(livox.point_num);
+  for (std::uint32_t i = 0; i < livox.point_num; ++i) {
+    const auto& src = livox.points[i];
+    dlio::Point p;
+    p.x = src.x;
+    p.y = src.y;
+    p.z = src.z;
+    p.intensity = static_cast<float>(src.reflectivity);
+    p.reflectivity = static_cast<float>(src.reflectivity);
+    p.timestamp = base_ns + static_cast<double>(src.offset_time);
+    cloud.points.push_back(p);
+  }
+  cloud.width = static_cast<std::uint32_t>(cloud.points.size());
+  cloud.height = 1;
+  cloud.is_dense = true;
+
+  sensor_msgs::msg::PointCloud2 out;
+  pcl::toROSMsg(cloud, out);
+  out.header.stamp = livox.header.stamp;
+  out.header.frame_id = frame_id;
+  return out;
+}
+}  // namespace
+#endif
+
 // Keep statistics history vectors bounded: drop the oldest half once they
 // exceed max_size, so long runs don't grow memory (and debug() stays O(window)).
 template <typename T>
@@ -188,6 +228,26 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->kf_pose_pub  = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+
+#ifdef HAVE_LIVOX_ROS_DRIVER2
+  // Optional raw Livox ingestion: subscribe to a livox_ros_driver2 CustomMsg on
+  // 'livox', republish it as PointCloud2 on 'livox2dlio'. To use a raw Livox
+  // stream, remap the cloud input to it (pointcloud:=livox2dlio). Decoupled from
+  // the estimator threading -- it's purely a format shim in its own callback group.
+  this->livox_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  auto livox_sub_opt = rclcpp::SubscriptionOptions();
+  livox_sub_opt.callback_group = this->livox_cb_group;
+  this->livox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "livox2dlio", rclcpp::SensorDataQoS().keep_last(1));
+  this->livox_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+      "livox", rclcpp::SensorDataQoS().keep_last(1),
+      [this](const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
+        this->livox_pub->publish(livoxToPointCloud2(*msg, this->lidar_frame));
+      }, livox_sub_opt);
+  RCLCPP_INFO(this->get_logger(),
+      "Livox CustomMsg ingestion ENABLED: converting 'livox' -> 'livox2dlio' "
+      "(remap pointcloud:=livox2dlio to use it).");
+#endif
   // Absolute /diagnostics (unlike the relative pubs above, this is NOT remapped
   // by the launch file) so the standard diagnostics topic always lands at /diagnostics.
   this->diag_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
@@ -544,6 +604,9 @@ void dlio::OdomNode::getParams() {
 
   dlio::declare_param(this, "odom/imu/approximateGravity", this->gravity_align_, true);
   dlio::declare_param(this, "imu/calibration", this->imu_calibrate_, true);
+  // Scale incoming accel by gravity (for IMUs that report it in units of g,
+  // e.g. Livox built-in IMUs); default off keeps the m/s^2 convention.
+  dlio::declare_param(this, "imu/normalized", this->imu_normalized_, false);
   dlio::declare_param(this, "imu/intrinsics/accel/bias", prior_accel_bias, accel_default);
   dlio::declare_param(this, "imu/intrinsics/gyro/bias", prior_gyro_bias, gyro_default);
 
@@ -1500,9 +1563,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   ang_vel[1] = imu->angular_velocity.y;
   ang_vel[2] = imu->angular_velocity.z;
 
-  lin_accel[0] = imu->linear_acceleration.x;
-  lin_accel[1] = imu->linear_acceleration.y;
-  lin_accel[2] = imu->linear_acceleration.z;
+  // Livox-style IMUs report acceleration in units of g; scale to m/s^2.
+  const float accel_scale = this->imu_normalized_ ? static_cast<float>(this->gravity_) : 1.0f;
+  lin_accel[0] = imu->linear_acceleration.x * accel_scale;
+  lin_accel[1] = imu->linear_acceleration.y * accel_scale;
+  lin_accel[2] = imu->linear_acceleration.z * accel_scale;
 
   if (this->first_imu_stamp == 0.) {
     this->first_imu_stamp = imu_stamp_secs;

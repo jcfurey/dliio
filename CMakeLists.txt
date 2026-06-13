@@ -49,6 +49,17 @@ find_package(Threads REQUIRED)
 # OpenCV: direct visual photometric residual (nano_gicp) + image undistort (odom)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
+# Optional: raw Livox CustomMsg ingestion. Only built when livox_ros_driver2 is
+# present in the workspace; without it the node consumes Livox data already in
+# PointCloud2 form (the default), so this is NOT a required build dependency.
+find_package(livox_ros_driver2 QUIET)
+if(livox_ros_driver2_FOUND)
+  message(STATUS "livox_ros_driver2 found: enabling raw Livox CustomMsg ingestion.")
+else()
+  message(STATUS "livox_ros_driver2 not found: Livox CustomMsg ingestion disabled "
+                 "(feed Livox as PointCloud2 instead).")
+endif()
+
 # OpenMP via the imported target (carries compile options and link flags to
 # every dependent instead of mutating global CMAKE_*_FLAGS)
 find_package(OpenMP)
@@ -126,6 +137,12 @@ target_link_libraries(dlio_components
   ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
 )
+if(livox_ros_driver2_FOUND)
+  # PRIVATE: only odom.cc compiles the Livox path; odom.h stays livox-free so the
+  # OdomNode layout is identical for every translation unit (no ODR mismatch).
+  target_compile_definitions(dlio_components PRIVATE HAVE_LIVOX_ROS_DRIVER2)
+  ament_target_dependencies(dlio_components livox_ros_driver2)
+endif()
 rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
 # Standalone executables

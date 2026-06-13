@@ -172,6 +172,12 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
   rclcpp::CallbackGroup::SharedPtr lidar_cb_group, imu_cb_group, image_cb_group;
+  // Optional raw Livox CustomMsg ingestion (built only with livox_ros_driver2).
+  // Type-erased so odom.h carries no livox_ros_driver2 dependency and the class
+  // layout is identical with or without it; wired up in the constructor (.cc).
+  rclcpp::SubscriptionBase::SharedPtr livox_sub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr livox_pub;
+  rclcpp::CallbackGroup::SharedPtr livox_cb_group;
 
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
@@ -417,6 +423,9 @@ private:
   bool calibrate_gyro_;
   bool calibrate_accel_;
   bool gravity_align_;
+  // Some IMUs (e.g. Livox built-in) report linear acceleration in units of g
+  // rather than m/s^2; when true the accel is scaled by gravity on intake.
+  bool imu_normalized_;
   double imu_calib_time_;
   int imu_buffer_size_;
   Eigen::Matrix3f imu_accel_sm_;
