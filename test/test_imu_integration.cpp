@@ -16,21 +16,23 @@ using ImuMeas = dlio::OdomNode::ImuMeas;
 // IMU stream sampled at `rate` Hz from t=0 to t=duration with constant body
 // angular velocity and constant (world == body for identity attitude tests)
 // linear acceleration. Buffer ordering matches production: newest at front.
-boost::circular_buffer<ImuMeas> makeImuStream(double duration, double rate,
-                                              const Eigen::Vector3f& ang_vel,
-                                              const Eigen::Vector3f& lin_accel) {
+// Forward-time-ordered IMU samples (matches what imuMeasFromTimeRange now
+// hands integrateImuInternal: a private copy in forward-time order).
+std::vector<ImuMeas> makeImuStream(double duration, double rate,
+                                   const Eigen::Vector3f& ang_vel,
+                                   const Eigen::Vector3f& lin_accel) {
   const double dt = 1.0 / rate;
   const int n = static_cast<int>(duration * rate) + 1;
-  boost::circular_buffer<ImuMeas> buf(n + 8);
+  std::vector<ImuMeas> v;
   for (int k = 0; k < n; k++) {
     ImuMeas m;
     m.stamp = k * dt;
     m.dt = dt;
     m.ang_vel = ang_vel;
     m.lin_accel = lin_accel;
-    buf.push_front(m);
+    v.push_back(m);
   }
-  return buf;
+  return v;
 }
 
 }  // namespace
@@ -44,7 +46,7 @@ TEST(ImuIntegration, ConstantAccelerationMatchesClosedForm) {
   std::vector<double> stamps{0.25, 0.5, 0.75, 1.0};
   auto frames = dlio::OdomNode::integrateImuInternal(
       Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
-      stamps, buf.rbegin(), buf.rend(), /*gravity=*/0.0);
+      stamps, buf, /*gravity=*/0.0);
 
   ASSERT_EQ(frames.size(), stamps.size());
   for (size_t i = 0; i < stamps.size(); i++) {
@@ -70,7 +72,7 @@ TEST(ImuIntegration, ConstantAngularVelocityMatchesClosedForm) {
   std::vector<double> stamps{0.2, 0.6, 1.0};
   auto frames = dlio::OdomNode::integrateImuInternal(
       Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
-      stamps, buf.rbegin(), buf.rend(), /*gravity=*/0.0);
+      stamps, buf, /*gravity=*/0.0);
 
   ASSERT_EQ(frames.size(), stamps.size());
   for (size_t i = 0; i < stamps.size(); i++) {
@@ -95,7 +97,7 @@ TEST(ImuIntegration, GravityIsSubtracted) {
   std::vector<double> stamps{0.5, 1.0};
   auto frames = dlio::OdomNode::integrateImuInternal(
       Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
-      stamps, buf.rbegin(), buf.rend(), g);
+      stamps, buf, g);
 
   ASSERT_EQ(frames.size(), stamps.size());
   for (const auto& T : frames) {

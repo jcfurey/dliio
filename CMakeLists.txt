@@ -164,6 +164,15 @@ if(BUILD_TESTING)
     ${PCL_LIBRARIES}
     ${OpenCV_LIBS}
   )
+
+  # Live-node concurrency / TSan harness (longer; generous timeout).
+  ament_add_gtest(test_node_concurrency test/test_node_concurrency.cpp TIMEOUT 120)
+  target_compile_definitions(test_node_concurrency PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_node_concurrency
+    dlio_components
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
 endif()
 
 ament_auto_package()

@@ -68,8 +68,7 @@ public:
   static std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                          const std::vector<double>& sorted_timestamps,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                         boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                         const std::vector<ImuMeas>& imu,
                          double gravity);
 
 private:
@@ -104,9 +103,7 @@ private:
   void initializeDLIO();
 
   void getNextPose();
-  bool imuMeasFromTimeRange(double start_time, double end_time,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-                            boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it);
+  bool imuMeasFromTimeRange(double start_time, double end_time, std::vector<ImuMeas>& imu_range);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                  const std::vector<double>& sorted_timestamps);
@@ -277,7 +274,7 @@ private:
 
   // Geometric Observer
   struct Geo {
-    bool first_opt_done;
+    std::atomic<bool> first_opt_done;
     std::mutex mtx;
     double dp;
     double dq_deg;

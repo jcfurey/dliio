@@ -25,7 +25,39 @@ ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 heap-overflow / use-after-free / UB checks are what matter for the hot-path math.
 **Status: clean on all 25 tests** (2026-06-13).
 
-## TSan — scope and how to make it useful
+## TSan — clean (via the live-node harness)
+
+`test_node_concurrency` constructs a real `OdomNode` with every optional path
+enabled and pumps synthetic IMU + organized Ouster-like scans + camera frames
+through a MultiThreadedExecutor, so the IMU / scan / image callbacks, the 100 Hz
+pose timer, the background submap thread, and the dashboard thread all run
+concurrently. This is the configuration that actually reaches the cross-thread
+state, so TSan can see it.
+
+```
+colcon build --build-base build_tsan --install-base install_tsan \
+  --cmake-args -DDLIIO_SANITIZE=thread -DCMAKE_BUILD_TYPE=RelWithDebInfo
+OMP_NUM_THREADS=1 \
+TSAN_OPTIONS="suppressions=$(pwd)/src/direct_lidar_inertial_odometry/test/tsan.supp" \
+  ./build_tsan/direct_lidar_inertial_odometry/test_node_concurrency
+```
+`OMP_NUM_THREADS=1` silences the (uninstrumented) OpenMP runtime; `test/tsan.supp`
+suppresses callback-group-serialized accesses TSan can't reason about and one
+third-party (OpenNI2) library issue. **Status: clean (0 warnings)** after the
+2026-06-13 race fixes; the harness building this set of fixes is what found them.
+
+### Races this harness found and fixed (not suppressed)
+- `publishPose` / `debug()` read `state`+`imu_stamp` cross-group -> snapshot under `geo.mtx`.
+- `imu_rates` written by the IMU callback, read by `publishDiagnostics` every scan -> `mtx_imu`.
+- IMU-buffer iteration on the scan thread vs `push_front` -> range copied under `mtx_imu`.
+- `geo.first_opt_done` cross-group bool -> `std::atomic<bool>`.
+- background submap concat reads `keyframe_normals` / `keyframe_visual_refs` vs main `push_back` -> copy shared_ptrs under `keyframes_mutex`.
+
+What `test/tsan.supp` covers (NOT bugs): accesses serialized by rclcpp
+MutuallyExclusive callback groups (the executor's happens-before is invisible to
+TSan because rclcpp/rmw are uninstrumented), verified single-group by inspection.
+
+## TSan caveats (general)
 
 The unit tests are **single-threaded** drivers (they call the registration/
 integration functions directly), so TSan on them exercises only the OpenMP

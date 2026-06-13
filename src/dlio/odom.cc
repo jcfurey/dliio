@@ -578,42 +578,53 @@ void dlio::OdomNode::start() {
 
 void dlio::OdomNode::publishPose() {
 
+  // This timer runs on its own thread; snapshot the state + stamp under geo.mtx
+  // (the IMU thread writes them via propagateState/updateState under the same
+  // lock) so the published pose is internally consistent, not a torn read.
+  State st;
+  rclcpp::Time stamp;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    st = this->state;
+    stamp = this->imu_stamp;
+  }
+
   // nav_msgs::msg::Odometry
-  this->odom_ros.header.stamp = this->imu_stamp;
+  this->odom_ros.header.stamp = stamp;
   this->odom_ros.header.frame_id = this->odom_frame;
   this->odom_ros.child_frame_id = this->baselink_frame;
 
-  this->odom_ros.pose.pose.position.x = this->state.p[0];
-  this->odom_ros.pose.pose.position.y = this->state.p[1];
-  this->odom_ros.pose.pose.position.z = this->state.p[2];
+  this->odom_ros.pose.pose.position.x = st.p[0];
+  this->odom_ros.pose.pose.position.y = st.p[1];
+  this->odom_ros.pose.pose.position.z = st.p[2];
 
-  this->odom_ros.pose.pose.orientation.w = this->state.q.w();
-  this->odom_ros.pose.pose.orientation.x = this->state.q.x();
-  this->odom_ros.pose.pose.orientation.y = this->state.q.y();
-  this->odom_ros.pose.pose.orientation.z = this->state.q.z();
+  this->odom_ros.pose.pose.orientation.w = st.q.w();
+  this->odom_ros.pose.pose.orientation.x = st.q.x();
+  this->odom_ros.pose.pose.orientation.y = st.q.y();
+  this->odom_ros.pose.pose.orientation.z = st.q.z();
 
-  this->odom_ros.twist.twist.linear.x = this->state.v.lin.w[0];
-  this->odom_ros.twist.twist.linear.y = this->state.v.lin.w[1];
-  this->odom_ros.twist.twist.linear.z = this->state.v.lin.w[2];
+  this->odom_ros.twist.twist.linear.x = st.v.lin.w[0];
+  this->odom_ros.twist.twist.linear.y = st.v.lin.w[1];
+  this->odom_ros.twist.twist.linear.z = st.v.lin.w[2];
 
-  this->odom_ros.twist.twist.angular.x = this->state.v.ang.b[0];
-  this->odom_ros.twist.twist.angular.y = this->state.v.ang.b[1];
-  this->odom_ros.twist.twist.angular.z = this->state.v.ang.b[2];
+  this->odom_ros.twist.twist.angular.x = st.v.ang.b[0];
+  this->odom_ros.twist.twist.angular.y = st.v.ang.b[1];
+  this->odom_ros.twist.twist.angular.z = st.v.ang.b[2];
 
   this->odom_pub->publish(this->odom_ros);
 
   // geometry_msgs::msg::PoseStamped
-  this->pose_ros.header.stamp = this->imu_stamp;
+  this->pose_ros.header.stamp = stamp;
   this->pose_ros.header.frame_id = this->odom_frame;
 
-  this->pose_ros.pose.position.x = this->state.p[0];
-  this->pose_ros.pose.position.y = this->state.p[1];
-  this->pose_ros.pose.position.z = this->state.p[2];
+  this->pose_ros.pose.position.x = st.p[0];
+  this->pose_ros.pose.position.y = st.p[1];
+  this->pose_ros.pose.position.z = st.p[2];
 
-  this->pose_ros.pose.orientation.w = this->state.q.w();
-  this->pose_ros.pose.orientation.x = this->state.q.x();
-  this->pose_ros.pose.orientation.y = this->state.q.y();
-  this->pose_ros.pose.orientation.z = this->state.q.z();
+  this->pose_ros.pose.orientation.w = st.q.w();
+  this->pose_ros.pose.orientation.x = st.q.x();
+  this->pose_ros.pose.orientation.y = st.q.y();
+  this->pose_ros.pose.orientation.z = st.q.z();
 
   this->pose_pub->publish(this->pose_ros);
 
@@ -1247,7 +1258,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   this->first_imu_received = true;
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
-  this->imu_stamp = imu->header.stamp;
+  {
+    // imu_stamp is read by publishPose (timer thread) under geo.mtx; guard the write.
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    this->imu_stamp = imu->header.stamp;
+  }
   double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
 
   Eigen::Vector3f lin_accel;
@@ -1724,13 +1739,15 @@ void dlio::OdomNode::getNextPose() {
 }
 
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
-                                          boost::circular_buffer<ImuMeas>::reverse_iterator& begin_imu_it,
-                                          boost::circular_buffer<ImuMeas>::reverse_iterator& end_imu_it) {
+                                          std::vector<ImuMeas>& imu_range) {
+
+  // Hold mtx_imu for the WHOLE operation -- the wait, the range scan, AND the
+  // copy -- so the concurrent callbackImu push_front (which can overwrite the
+  // circular buffer's oldest slot) cannot mutate the elements while we read
+  // them. The integration then runs on the private copy, lock-free.
+  std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
 
   if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    // Wait (bounded) for the latest IMU data; an unbounded wait parks the
-    // odometry callback forever if the IMU stream drops mid-flight.
-    std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
     bool imu_arrived = this->cv_imu_stamp.wait_for(lock, std::chrono::seconds(1),
         [this, &end_time]{ return !this->imu_buffer.empty()
                                   && this->imu_buffer.front().stamp >= end_time; });
@@ -1756,16 +1773,17 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
   }
 
   if (imu_it == this->imu_buffer.end()) {
-    // not enough IMU measurements, return false
     return false;
   }
   imu_it++;
 
-  // Set reverse iterators (to iterate forward in time)
-  end_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(last_imu_it);
-  begin_imu_it = boost::circular_buffer<ImuMeas>::reverse_iterator(imu_it);
+  // Copy the range in forward-time order (reverse iterators over the
+  // newest-at-front buffer) into the caller's vector, under the lock.
+  boost::circular_buffer<ImuMeas>::reverse_iterator e(last_imu_it);
+  boost::circular_buffer<ImuMeas>::reverse_iterator b(imu_it);
+  imu_range.assign(b, e);
 
-  return true;
+  return imu_range.size() >= 2;  // need >=2 samples for the back-integration
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
@@ -1779,16 +1797,15 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
     return empty;
   }
 
-  boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it;
-  boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it;
-  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), begin_imu_it, end_imu_it) == false) {
+  std::vector<ImuMeas> imu_range;
+  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_range) == false) {
     // not enough IMU measurements, return empty vector
     return empty;
   }
 
   // Backwards integration to find pose at first IMU sample
-  const ImuMeas& f1 = *begin_imu_it;
-  const ImuMeas& f2 = *(begin_imu_it+1);
+  const ImuMeas& f1 = imu_range[0];
+  const ImuMeas& f2 = imu_range[1];
 
   // Time between first two IMU samples
   double dt = f2.dt;
@@ -1841,14 +1858,13 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, begin_imu_it, end_imu_it, this->gravity_);
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, this->gravity_);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator begin_imu_it,
-                                     boost::circular_buffer<ImuMeas>::reverse_iterator end_imu_it,
+                                     const std::vector<ImuMeas>& imu,
                                      double gravity) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
@@ -1857,19 +1873,16 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
   Eigen::Quaternionf q = q_init;
   Eigen::Vector3f p = p_init;
   Eigen::Vector3f v = v_init;
-  Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
+  Eigen::Vector3f a = q._transformVector(imu[0].lin_accel);
   a[2] -= gravity;
 
-  // Iterate over IMU measurements and timestamps
-  auto prev_imu_it = begin_imu_it;
-  auto imu_it = prev_imu_it + 1;
-
+  // Iterate over IMU measurements (forward in time) and timestamps
   auto stamp_it = sorted_timestamps.begin();
 
-  for (; imu_it != end_imu_it; imu_it++) {
+  for (size_t k = 1; k < imu.size(); ++k) {
 
-    const ImuMeas& f0 = *prev_imu_it;
-    const ImuMeas& f = *imu_it;
+    const ImuMeas& f0 = imu[k-1];
+    const ImuMeas& f = imu[k];
 
     // Time between IMU samples
     double dt = f.dt;
@@ -1941,8 +1954,6 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
 
     // Velocity
     v += a0*dt + 0.5*j_dt*dt;
-
-    prev_imu_it = imu_it;
 
   }
 
@@ -2718,6 +2729,11 @@ void dlio::OdomNode::publishDiagnostics() {
 
 void dlio::OdomNode::debug() {
 
+  // Snapshot the geo-protected state once under the lock; the IMU thread writes
+  // it via propagateState/updateState under geo.mtx. (dashboard read only.)
+  State dbg_state;
+  { std::lock_guard<std::mutex> lock(this->geo.mtx); dbg_state = this->state; }
+
   // Total length traversed is maintained incrementally in callbackPointCloud
   double length_traversed = this->length_traversed;
 
@@ -2840,35 +2856,35 @@ void dlio::OdomNode::debug() {
   std::cout << "|===================================================================|" << std::endl;
 
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Position     {W}  [xyz] :: " + to_string_with_precision(this->state.p[0], 4) + " "
-                                + to_string_with_precision(this->state.p[1], 4) + " "
-                                + to_string_with_precision(this->state.p[2], 4)
+    << "Position     {W}  [xyz] :: " + to_string_with_precision(dbg_state.p[0], 4) + " "
+                                + to_string_with_precision(dbg_state.p[1], 4) + " "
+                                + to_string_with_precision(dbg_state.p[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Orientation  {W} [wxyz] :: " + to_string_with_precision(this->state.q.w(), 4) + " "
-                                + to_string_with_precision(this->state.q.x(), 4) + " "
-                                + to_string_with_precision(this->state.q.y(), 4) + " "
-                                + to_string_with_precision(this->state.q.z(), 4)
+    << "Orientation  {W} [wxyz] :: " + to_string_with_precision(dbg_state.q.w(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.x(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.y(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.z(), 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Lin Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.lin.b[0], 4) + " "
-                                + to_string_with_precision(this->state.v.lin.b[1], 4) + " "
-                                + to_string_with_precision(this->state.v.lin.b[2], 4)
+    << "Lin Velocity {B}  [xyz] :: " + to_string_with_precision(dbg_state.v.lin.b[0], 4) + " "
+                                + to_string_with_precision(dbg_state.v.lin.b[1], 4) + " "
+                                + to_string_with_precision(dbg_state.v.lin.b[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Ang Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.ang.b[0], 4) + " "
-                                + to_string_with_precision(this->state.v.ang.b[1], 4) + " "
-                                + to_string_with_precision(this->state.v.ang.b[2], 4)
+    << "Ang Velocity {B}  [xyz] :: " + to_string_with_precision(dbg_state.v.ang.b[0], 4) + " "
+                                + to_string_with_precision(dbg_state.v.ang.b[1], 4) + " "
+                                + to_string_with_precision(dbg_state.v.ang.b[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Accel Bias        [xyz] :: " + to_string_with_precision(this->state.b.accel[0], 8) + " "
-                                + to_string_with_precision(this->state.b.accel[1], 8) + " "
-                                + to_string_with_precision(this->state.b.accel[2], 8)
+    << "Accel Bias        [xyz] :: " + to_string_with_precision(dbg_state.b.accel[0], 8) + " "
+                                + to_string_with_precision(dbg_state.b.accel[1], 8) + " "
+                                + to_string_with_precision(dbg_state.b.accel[2], 8)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Gyro Bias         [xyz] :: " + to_string_with_precision(this->state.b.gyro[0], 8) + " "
-                                + to_string_with_precision(this->state.b.gyro[1], 8) + " "
-                                + to_string_with_precision(this->state.b.gyro[2], 8)
+    << "Gyro Bias         [xyz] :: " + to_string_with_precision(dbg_state.b.gyro[0], 8) + " "
+                                + to_string_with_precision(dbg_state.b.gyro[1], 8) + " "
+                                + to_string_with_precision(dbg_state.b.gyro[2], 8)
     << "|" << std::endl;
 
   std::cout << "|                                                                   |" << std::endl;
@@ -2878,9 +2894,9 @@ void dlio::OdomNode::debug() {
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
     << "Distance to Origin :: "
-      + to_string_with_precision( sqrt(pow(this->state.p[0]-this->origin[0],2) +
-                                       pow(this->state.p[1]-this->origin[1],2) +
-                                       pow(this->state.p[2]-this->origin[2],2)), 4) + " meters"
+      + to_string_with_precision( sqrt(pow(dbg_state.p[0]-this->origin[0],2) +
+                                       pow(dbg_state.p[1]-this->origin[1],2) +
+                                       pow(dbg_state.p[2]-this->origin[2],2)), 4) + " meters"
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
     << "Registration       :: keyframes: " + std::to_string(this->keyframes.size()) + ", "
