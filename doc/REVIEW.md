@@ -109,8 +109,8 @@ Original grades from the first review, with re-grades after the fix series (PR #
 | Registration engine | C | **B+** | Honest regularization, double-precision solve, SO(3) updates, degeneracy gate, LM-style step acceptance |
 | Intensity feature | B− | **A−** | Normalized, Huber-robustified, query-centered gradients, channel selection, incidence-angle correction; awaits field validation |
 | Concurrency | C− | **B+** | Joinable workers, bounded waits, unload-safe destructor, metrics inlined (race removed) |
-| ROS 2 idiom | D+ | **B+** | Components + intra-process, SensorDataQoS, static TF, covariance wiring, descriptors, launch args; ranges/live-set and URDF extrinsics open |
-| Testing & CI | F | **B−** | NanoGICP + IMU-integration gtest suites (the latter caught a real upstream deskew bug) + Jazzy CI; no bag-replay regression, no lint |
+| ROS 2 idiom | D+ | **A−** | Components + intra-process, SensorDataQoS, static **and tf2/URDF-sourced** extrinsics, covariance wiring, descriptors **+ `FloatingPointRange` ranges + live `param set`**, launch args |
+| Testing & CI | F | **B** | 48 tests / 7 suites — registration, observer, intensity, visual & LiDAR-image residuals, sensor-detection, a live-node TSan harness, and an **end-to-end accuracy regression** — plus ASan/UBSan hard-gate CI (TSan informational); still no bag-replay regression, no lint |
 | Docs/config | B | **A−** | Fully commented configs, examples, wiring guide, this review + reference card |
 
 ---
@@ -127,8 +127,8 @@ Everything still open after PR #1–#3, consolidated. Items link back to the num
 **Code, tractable without data** *(items 4, 7–10 part, 12–13 part closed in PR #3)*:
 4. ~~GN step control (#2)~~ — **done in PR #3** (retrospective LM-style step acceptance).
 5. ~~Incidence-angle intensity correction (#19)~~ — **done** (`correctIntensity` + organized-grid normals, opt-in).
-6. **URDF/tf2-sourced extrinsics** (#24) — requires deferred initialization (a constructor can't block on TF before the node spins); small dedicated PR.
-7. **Parameter ranges, read-only flags, live-set callbacks** (#26) — descriptions exist (PR #3); ranges and `add_on_set_parameters_callback` for the live-tunable gains/weights do not.
+6. ~~URDF/tf2-sourced extrinsics (#24)~~ — **done** (`extrinsics/source: tf`: a deferred timer resolves `base_link`→`{imu,lidar}` (and `lidar`→`camera`) from tf2 and gates processing via an atomic until ready, with YAML fallback).
+7. ~~Parameter ranges, live-set callbacks (#26)~~ — **done** (`FloatingPointRange` descriptors + `add_on_set_parameters_callback`: the drift-hunt knobs and observer gains are retunable with `ros2 param set`, staged in the callback and applied on the scan thread). Read-only flags still open.
 8. ~~Named constants (#7)~~ / ~~metrics races (#9)~~ — **done in PR #3**.
 9. **ament_lint** (#28) — gtest suites and CI exist; lint wiring (and fixing what it flags) remains.
 10. **Vendored nanoflann** (#29) — *de-vendoring is NOT a drop-in*: the vendored header contains a custom `SO3_Adaptor` absent from upstream nanoflann. Porting the adaptor to an upstream metric (or upstreaming SO3) is the actual task.

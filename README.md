@@ -28,6 +28,18 @@ Added `photometricHuberDelta` (default value: 0.05), `maxKeyframes` (default val
 
 `photometricHuberDelta` Huber-robustifies the photometric residual so specular/wet-surface outliers are downweighted instead of shoving the pose at full weight. `maxKeyframes` optionally bounds the keyframe map by pruning the most spatially redundant keyframe when exceeded (0 = unlimited, the historical behavior). `odom/debug/dashboard` toggles the ANSI terminal dashboard — disable it under multiplexed logging; the composed launch file disables it automatically.
 
+Added `intensityIncidence` (default value: `false`) and `intensityCosMin` (default value: 0.2) to cfg/params.yaml.
+
+The incidence-angle (cos α) extension of the radiometric model (Kashani et al.): when `photometricChannel: intensity`, also divide the corrected intensity by `max(|beam·surface_normal|, intensityCosMin)`, undoing the grazing-angle darkening of distant ground/wall points that the range model alone leaves (and which otherwise reads as spurious intensity gradients). Per-point normals come from the organized scan grid; `intensityCosMin` floors the divisor against blow-up at grazing angles (0.2 ≈ 78°). Organized scans only; off by default.
+
+Added `imu/normalized` (default value: `false`) to cfg/dlio.yaml.
+
+Some IMUs (notably Livox built-in IMUs) report linear acceleration in units of g rather than m/s²; set true to scale the incoming accel by `odom/gravity` on intake. See the **Livox notes** under [Sensor Setup](#sensor-setup).
+
+Added `extrinsics/source` (default value: `yaml`) and `frames/camera` (default value: `camera`) to cfg/dlio.yaml / cfg/params.yaml.
+
+`extrinsics/source` selects where the sensor extrinsics come from: `yaml` uses the `extrinsics/baselink2{imu,lidar}` matrices (published once on `/tf_static`), while `tf` looks them up from tf2 at startup (e.g. `base_link`→`imu`/`lidar` published by `robot_state_publisher` from a URDF), holding off scan/IMU processing until they resolve and falling back to the YAML values if they never arrive. `frames/camera` is the camera frame used for the optional `lidar`→`camera` lookup in tf mode. See [Sensor Setup](#sensor-setup).
+
 ## Configuration & wiring
 
 **Live tuning.** A subset of parameters can be retuned at runtime with
@@ -49,6 +61,8 @@ the scan thread, so it is race-free. Example:
 | `cfg/params.yaml` | Algorithm tuning: registration, keyframing, observer gains, photometric term, degeneracy gate, published covariance. Override via `params_file:=`. |
 | `cfg/examples/ouster_reflectivity.yaml` | Overlay: Ouster calibrated-reflectivity photometric channel + plane regularization for tunnel-like environments. |
 | `cfg/examples/ouster_tunnel.yaml` | Overlay: full tunnel mode — reflectivity + plane + degeneracy gate **with photometricWeight 0.3** (strong enough to re-constrain the tunnel axis; the gate alone diverges). Supersedes `ouster_reflectivity.yaml` for tunnels. |
+| `cfg/examples/ouster_tunnel_lidarimg.yaml` | Overlay **on top of** `ouster_tunnel.yaml`: adds the COIN-LIO LiDAR reflectivity-image frame-to-map anchor (360° wall texture; self-calibrated from the first organized scan). No camera needed. |
+| `cfg/examples/ouster_tunnel_visual.yaml` | Overlay **on top of** `ouster_tunnel.yaml`: adds the direct camera photometric term to constrain the LiDAR-unobservable along-axis translation (needs a camera topic + intrinsics + `cam2lidar`). |
 | `cfg/examples/simulation.yaml` | Overlay: sim time, no IMU calibration wait, ideal extrinsics. |
 
 **Launch arguments** (`dlio.launch.py`): `pointcloud_topic`, `imu_topic`, `rviz`, `use_sim_time` (default **false**; set true under Gazebo or `ros2 bag play --clock`), `robot_config`, `params_file`. Overlays can be appended at run time with `--ros-args --params-file <overlay.yaml>` (later files win).
@@ -61,7 +75,7 @@ the scan thread, so it is race-free. Example:
 |---|---|---|
 | Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; constant diagonal covariance from `odom/covariance/*` (tune for your EKF) |
 | Pose | `dlio/odom_node/pose` (`PoseStamped`) | same state, no twist |
-| TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` | follows REP-105; no `map` frame is published — DLIO is odometry, not SLAM with loop closure |
+| TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` (only in `extrinsics/source: yaml`; in `tf` mode the node *consumes* those static transforms instead) | follows REP-105; no `map` frame is published — DLIO is odometry, not SLAM with loop closure |
 | Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; intensity is range-corrected when the intensity channel is active |
 | Keyframes / map | `dlio/odom_node/keyframes`, `dlio/map_node/map` | map is keyframe accumulation (unbounded; for visualization/export) |
 | Save map | `/save_pcd` service | absolute existing directory required |
