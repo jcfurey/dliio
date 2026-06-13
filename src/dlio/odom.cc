@@ -1183,8 +1183,12 @@ void dlio::OdomNode::preprocessPoints() {
 
   // Voxel Grid Filter
   if (this->vf_use_) {
-    pcl::PointCloud<PointType>::Ptr current_scan_ = std::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan);
-    this->voxel.setInputCloud(current_scan_);
+    // Filter straight from deskewed_scan into a fresh output cloud: VoxelGrid
+    // reads its input and writes a separate output, so there is no need to
+    // deep-copy the (full-resolution) deskewed cloud first. deskewed_scan is
+    // left untouched for the dense-map publish path.
+    pcl::PointCloud<PointType>::Ptr current_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
+    this->voxel.setInputCloud(this->deskewed_scan);
     this->voxel.filter(*current_scan_);
     this->current_scan = current_scan_;
   } else {
@@ -2424,18 +2428,19 @@ void dlio::OdomNode::computeMetrics() {
 
 void dlio::OdomNode::computeSpaciousness() {
 
-  // compute range of points
+  // compute range of points (work with SQUARED range to skip a per-point sqrt:
+  // sqrt is monotonic, so median(sqrt(.)) == sqrt(median(.)) -- one sqrt total
+  // instead of one per point on the full-resolution scan).
   std::vector<float> ds;
+  ds.reserve(this->original_scan->points.size());
 
-  for (int i = 0; i < this->original_scan->points.size(); i++) {
-    float d = std::sqrt(pow(this->original_scan->points[i].x, 2) +
-                        pow(this->original_scan->points[i].y, 2));
-    ds.push_back(d);
+  for (const auto& pt : this->original_scan->points) {
+    ds.push_back(pt.x * pt.x + pt.y * pt.y);
   }
 
   // median
   std::nth_element(ds.begin(), ds.begin() + ds.size()/2, ds.end());
-  float median_curr = ds[ds.size()/2];
+  float median_curr = std::sqrt(ds[ds.size()/2]);
   static float median_prev = median_curr;
   float median_lpf = 0.95*median_prev + 0.05*median_curr;
   median_prev = median_lpf;
@@ -2551,9 +2556,10 @@ void dlio::OdomNode::updateKeyframes() {
   for (const auto& k : this->keyframes) {
 
     // calculate distance between current pose and pose in keyframes
-    float delta_d = sqrt( pow(this->state.p[0] - k.first.first[0], 2) +
-                          pow(this->state.p[1] - k.first.first[1], 2) +
-                          pow(this->state.p[2] - k.first.first[2], 2) );
+    const float kdx = this->state.p[0] - k.first.first[0];
+    const float kdy = this->state.p[1] - k.first.first[1];
+    const float kdz = this->state.p[2] - k.first.first[2];
+    float delta_d = std::sqrt(kdx*kdx + kdy*kdy + kdz*kdz);
 
     // count the number nearby current pose
     if (delta_d <= this->keyframe_thresh_dist_ * 1.5){
@@ -2575,9 +2581,10 @@ void dlio::OdomNode::updateKeyframes() {
   Eigen::Quaternionf closest_pose_r = this->keyframes[closest_idx].first.second;
 
   // calculate distance between current pose and closest pose from above
-  float dd = sqrt( pow(this->state.p[0] - closest_pose[0], 2) +
-                   pow(this->state.p[1] - closest_pose[1], 2) +
-                   pow(this->state.p[2] - closest_pose[2], 2) );
+  const float cdx = this->state.p[0] - closest_pose[0];
+  const float cdy = this->state.p[1] - closest_pose[1];
+  const float cdz = this->state.p[2] - closest_pose[2];
+  float dd = std::sqrt(cdx*cdx + cdy*cdy + cdz*cdz);
 
   // calculate difference in orientation using SLERP
   Eigen::Quaternionf dq;
@@ -2748,11 +2755,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
   std::vector<float> ds;
   std::vector<int> keyframe_nn;
+  ds.reserve(this->num_processed_keyframes);
+  keyframe_nn.reserve(this->num_processed_keyframes);
   for (int i = 0; i < this->num_processed_keyframes; i++) {
-    float d = sqrt( pow(vehicle_state.p[0] - this->keyframes[i].first.first[0], 2) +
-                    pow(vehicle_state.p[1] - this->keyframes[i].first.first[1], 2) +
-                    pow(vehicle_state.p[2] - this->keyframes[i].first.first[2], 2) );
-    ds.push_back(d);
+    const float dx = vehicle_state.p[0] - this->keyframes[i].first.first[0];
+    const float dy = vehicle_state.p[1] - this->keyframes[i].first.first[1];
+    const float dz = vehicle_state.p[2] - this->keyframes[i].first.first[2];
+    ds.push_back(std::sqrt(dx*dx + dy*dy + dz*dz));
     keyframe_nn.push_back(i);
   }
   lock.unlock();
