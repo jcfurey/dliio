@@ -180,6 +180,12 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_sensor_detection test/test_sensor_detection.cpp)
+  target_compile_definitions(test_sensor_detection PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_sensor_detection
+    dlio_components
+  )
+
   ament_add_gtest(test_visual_residual test/test_visual_residual.cpp)
   target_compile_definitions(test_visual_residual PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_visual_residual
@@ -192,6 +198,16 @@ if(BUILD_TESTING)
   ament_add_gtest(test_node_concurrency test/test_node_concurrency.cpp TIMEOUT 120)
   target_compile_definitions(test_node_concurrency PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_node_concurrency
+    dlio_components
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+
+  # End-to-end pipeline: accuracy regression, feature behavior, perf smoke
+  # (drives a real node; longer wall-clock, generous timeout).
+  ament_add_gtest(test_pipeline test/test_pipeline.cpp TIMEOUT 180)
+  target_compile_definitions(test_pipeline PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_pipeline
     dlio_components
     ${PCL_LIBRARIES}
     ${OpenCV_LIBS}

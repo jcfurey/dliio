@@ -936,6 +936,23 @@ float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_i
   return std::clamp(intensity * std::pow(range / r_ref, alpha) / c, 0.f, 255.f);
 }
 
+dlio::SensorType dlio::OdomNode::detectSensorType(
+    const std::vector<sensor_msgs::msg::PointField>& fields,
+    bool has_points, double first_timestamp) {
+  for (const auto& field : fields) {
+    if (field.name == "t") {
+      return dlio::SensorType::OUSTER;
+    } else if (field.name == "time") {
+      return dlio::SensorType::VELODYNE;
+    } else if (field.name == "timestamp" && has_points && first_timestamp < 1e14) {
+      return dlio::SensorType::HESAI;
+    } else if (field.name == "timestamp" && has_points && first_timestamp > 1e14) {
+      return dlio::SensorType::LIVOX;
+    }
+  }
+  return dlio::SensorType::UNKNOWN;
+}
+
 rcl_interfaces::msg::SetParametersResult
 dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   // Parameters that may be retuned live (the drift-hunt knobs). Others still
@@ -1106,24 +1123,9 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   this->crop.filter(*original_scan_);
 
   // automatically detect sensor type
-  this->sensor = dlio::SensorType::UNKNOWN;
-  for (auto &field : pc->fields) {
-    if (field.name == "t") {
-      this->sensor = dlio::SensorType::OUSTER;
-      break;
-    } else if (field.name == "time") {
-      this->sensor = dlio::SensorType::VELODYNE;
-      break;
-    } else if (field.name == "timestamp" && !original_scan_->points.empty()
-               && original_scan_->points[0].timestamp < 1e14) {
-      this->sensor = dlio::SensorType::HESAI;
-      break;
-    } else if (field.name == "timestamp" && !original_scan_->points.empty()
-               && original_scan_->points[0].timestamp > 1e14) {
-      this->sensor = dlio::SensorType::LIVOX;
-      break;
-    }
-  }
+  const bool has_points = !original_scan_->points.empty();
+  this->sensor = detectSensorType(pc->fields, has_points,
+      has_points ? original_scan_->points[0].timestamp : 0.0);
 
   if (this->sensor == dlio::SensorType::UNKNOWN) {
     this->deskew_ = false;
