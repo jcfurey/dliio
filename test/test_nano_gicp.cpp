@@ -144,6 +144,51 @@ TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   EXPECT_EQ(gicp.getSourceCovariances().size(), tiny->size());
 }
 
+// Covariance regularization (synthetic plane): PLANE forces the scale-free
+// (1,1,1e-3) disc; MIN_EIG only clamps the smallest eigenvalue, leaving the two
+// in-plane eigenvalues at the data variance. Locks the "honest regularization"
+// behavior (these were silently identical before the PLANE/MIN_EIG split).
+TEST(NanoGICP, PlaneRegularizationProducesUnitDisc) {
+  auto cloud = makePlane(2.0f, 0.04f);   // z=0 plane
+  nano_gicp::NanoGICP<dlio::Point, dlio::Point> gicp;
+  gicp.setCorrespondenceRandomness(16);
+  gicp.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
+  gicp.setInputSource(cloud);
+
+  const auto& covs = gicp.getSourceCovariances();
+  ASSERT_EQ(covs.size(), cloud->size());
+  int checked = 0;
+  for (size_t i = 0; i < covs.size(); i += 37) {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(covs[i].block<3,3>(0,0));
+    Eigen::Vector3f ev = es.eigenvalues();  // ascending
+    EXPECT_NEAR(ev(2), 1.0f, 1e-4) << "i=" << i;   // two unit eigenvalues
+    EXPECT_NEAR(ev(1), 1.0f, 1e-4) << "i=" << i;
+    EXPECT_NEAR(ev(0), 1e-3f, 1e-4) << "i=" << i;  // flattened normal
+    ++checked;
+  }
+  EXPECT_GT(checked, 5);
+}
+
+TEST(NanoGICP, MinEigRegularizationKeepsInPlaneVariance) {
+  auto cloud = makePlane(2.0f, 0.04f);
+  nano_gicp::NanoGICP<dlio::Point, dlio::Point> gicp;
+  gicp.setCorrespondenceRandomness(16);
+  gicp.setRegularizationMethod(nano_gicp::RegularizationMethod::MIN_EIG);
+  gicp.setInputSource(cloud);
+
+  const auto& covs = gicp.getSourceCovariances();
+  ASSERT_EQ(covs.size(), cloud->size());
+  bool any_non_unit_inplane = false;
+  for (size_t i = 0; i < covs.size(); i += 37) {
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(covs[i].block<3,3>(0,0));
+    Eigen::Vector3f ev = es.eigenvalues();
+    EXPECT_GE(ev(0), 1e-3f - 1e-5f);              // smallest clamped up to >= 1e-3
+    if (std::abs(ev(2) - 1.0f) > 1e-2f) { any_non_unit_inplane = true; }
+  }
+  // unlike PLANE, the in-plane eigenvalues are the data variance, not 1.0
+  EXPECT_TRUE(any_non_unit_inplane);
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

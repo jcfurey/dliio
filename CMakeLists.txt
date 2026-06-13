@@ -18,6 +18,23 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_CXX_STANDARD 17)
+
+# Reproducible sanitizer builds:  colcon build --cmake-args -DDLIIO_SANITIZE=address
+# Accepts: address (ASan+UBSan), thread (TSan), or undefined (UBSan only).
+# For TSan, also force single-threaded OpenMP at runtime (OMP_NUM_THREADS=1) to
+# avoid false positives from the OpenMP runtime; the node's own callback threads
+# are what TSan should observe.
+set(DLIIO_SANITIZE "" CACHE STRING "Sanitizer: address|thread|undefined (empty=off)")
+if(DLIIO_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+elseif(DLIIO_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+elseif(DLIIO_SANITIZE STREQUAL "undefined")
+  add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=undefined)
+endif()
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 
