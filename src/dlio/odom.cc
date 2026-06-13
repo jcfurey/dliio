@@ -1112,6 +1112,13 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   this->main_loop_running = true;
   lock.unlock();
 
+  // Join the previous scan's dashboard thread before this scan mutates any of
+  // the stats vectors it reads (comp_times / lidar_rates / metrics, all
+  // push_back + cap_history). Doing it here -- before computeMetrics below --
+  // closes the iterator-invalidation race for the scan-thread-written stats.
+  // (imu_rates is written by the IMU thread and is guarded by mtx_imu instead.)
+  if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
   double then = this->now().seconds();
 
   if (this->first_scan_stamp == 0.) {
@@ -1227,7 +1234,7 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // containers, or logging setups where the ANSI clear-screen output garbles
   // multiplexed logs.
   if (this->dashboard_) {
-    if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+    // (previous dashboard thread already joined at the top of this callback)
     this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
   }
 
@@ -1356,8 +1363,14 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
     double dt = imu_stamp_secs - this->prev_imu_stamp;
     if (dt == 0) { dt = 1.0/200.0; }
-    this->imu_rates.push_back( 1./dt );
-    cap_history(this->imu_rates);
+    {
+      // imu_rates is read by publishDiagnostics (scan thread, every scan) and
+      // the dashboard thread; guard the push+cap_history so the erase can't
+      // invalidate a concurrent reader's iterators.
+      std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu);
+      this->imu_rates.push_back( 1./dt );
+      cap_history(this->imu_rates);
+    }
 
     // Apply the calibrated bias to the new IMU measurements
     this->imu_meas.stamp = imu_stamp_secs;
@@ -1417,13 +1430,13 @@ void dlio::OdomNode::callbackImage(const sensor_msgs::msg::Image::SharedPtr img)
   cv::Mat undistorted;
   cv::remap(cvp->image, undistorted, this->vis_map1_, this->vis_map2_, cv::INTER_LINEAR);
 
-  cv::Mat norm;
-  undistorted.convertTo(norm, CV_32FC1, 1.0 / 255.0);
-
+  // Buffer the UNDISTORTED MONO8 image (1 byte/px). The single frame matched to
+  // a scan is converted to normalized float in setupVisualForScan -- storing 30
+  // full-res CV_32FC1 frames here would be ~4x the memory (hundreds of MB at 2MP).
   const double stamp = rclcpp::Time(img->header.stamp).seconds();
   {
     std::lock_guard<std::mutex> lock(this->image_mtx_);
-    this->image_buffer_.emplace_back(stamp, norm);
+    this->image_buffer_.emplace_back(stamp, undistorted);
     while (this->image_buffer_.size() > 30) { this->image_buffer_.pop_front(); }
   }
 }
@@ -1440,16 +1453,19 @@ bool dlio::OdomNode::setupVisualForScan() {
   if (!want_f2f && !want_f2m) { return false; }
 
   // Pick the buffered image nearest this scan's stamp (within tolerance).
-  cv::Mat cur_img;
+  cv::Mat cur_mono;  // mono8 (the buffer stores 8-bit to save memory)
   double best_dt = this->visual_max_dt_;
   {
     std::lock_guard<std::mutex> lock(this->image_mtx_);
     for (const auto& kv : this->image_buffer_) {
       const double dt = std::abs(kv.first - this->scan_stamp);
-      if (dt <= best_dt) { best_dt = dt; cur_img = kv.second; }
+      if (dt <= best_dt) { best_dt = dt; cur_mono = kv.second; }
     }
   }
-  if (cur_img.empty()) { return false; }  // graceful LiDAR-only this scan
+  if (cur_mono.empty()) { return false; }  // graceful LiDAR-only this scan
+  // Convert the single matched frame to normalized float (the residual unit).
+  cv::Mat cur_img;
+  cur_mono.convertTo(cur_img, CV_32FC1, 1.0 / 255.0);
 
   // world -> current camera, from the prior (predicted) pose. Shared by both the
   // frame-to-frame (raw source points) and frame-to-map (fixed map points) terms.
@@ -2494,18 +2510,24 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
 
     for (auto k : this->submap_kf_idx_curr) {
 
-      // create current submap cloud
+      // Copy the cloud + per-keyframe shared_ptrs (normals, visual refs) under
+      // the lock: the main thread's updateKeyframes() push_back can REALLOCATE
+      // these vectors, so reading element [k] unlocked races a concurrent
+      // reallocation (use-after-free). shared_ptr copies are cheap; the heavy
+      // insert() work is done after unlocking.
       lock.lock();
-      *submap_cloud_ += *this->keyframes[k].second;
+      pcl::PointCloud<PointType>::ConstPtr kf_cloud = this->keyframes[k].second;
+      std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
+      std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
+          build_visual_refs ? this->keyframe_visual_refs[k] : nullptr;
       lock.unlock();
 
-      // grab corresponding submap cloud's normals
+      *submap_cloud_ += *kf_cloud;
       submap_normals_->insert( std::end(*submap_normals_),
-          std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])) );
-
-      if (build_visual_refs) {
+          std::begin(*kf_normals), std::end(*kf_normals) );
+      if (build_visual_refs && kf_refs) {
         submap_visual_refs_->insert( std::end(*submap_visual_refs_),
-            std::begin(*(this->keyframe_visual_refs[k])), std::end(*(this->keyframe_visual_refs[k])) );
+            std::begin(*kf_refs), std::end(*kf_refs) );
       }
     }
 
@@ -2589,7 +2611,8 @@ void dlio::OdomNode::publishDiagnostics() {
     if ((int)v.size() < win) return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
     return std::accumulate(v.end() - win, v.end(), 0.0) / win;
   };
-  double imu_rate = avg_tail(this->imu_rates);
+  double imu_rate;
+  { std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu); imu_rate = avg_tail(this->imu_rates); }
   double lidar_rate = avg_tail(this->lidar_rates);
 
   // RAM (resident set, MB) from /proc/self/stat.
@@ -2706,12 +2729,15 @@ void dlio::OdomNode::debug() {
   int win_size = 100;
   double avg_imu_rate;
   double avg_lidar_rate;
-  if (this->imu_rates.size() < win_size) {
-    avg_imu_rate =
-      std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size();
-  } else {
-    avg_imu_rate =
-      std::accumulate(this->imu_rates.end()-win_size, this->imu_rates.end(), 0.0) / win_size;
+  {
+    std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu);
+    if ((int)this->imu_rates.size() < win_size) {
+      avg_imu_rate = this->imu_rates.empty() ? 0.0 :
+        std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size();
+    } else {
+      avg_imu_rate =
+        std::accumulate(this->imu_rates.end()-win_size, this->imu_rates.end(), 0.0) / win_size;
+    }
   }
   if (this->lidar_rates.size() < win_size) {
     avg_lidar_rate =
