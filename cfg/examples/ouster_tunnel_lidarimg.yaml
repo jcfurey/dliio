@@ -1,0 +1,33 @@
+# EXAMPLE: Ouster in a tunnel — COIN-LIO LiDAR intensity-image anchor ON.
+#
+# Adds the LiDAR reflectivity-image frame-to-map term on top of the LiDAR tunnel
+# mode. Unlike the narrow sideways camera (ouster_tunnel_visual.yaml), the LiDAR
+# sees the walls 360deg with consistent, range-normalized reflectivity, so it has
+# far more persistent landmarks to anchor the degenerate tunnel axis against.
+# Requires an ORGANIZED scan (Ouster publishes 64xN); the image + spherical model
+# are self-calibrated from the first organized scan.
+#
+# Overlay ON TOP of ouster_tunnel.yaml (reflectivity + plane + gate), then this.
+# No camera needed.
+#
+# Usage:
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
+#     params_file:=.../cfg/params.yaml
+#   #   --ros-args --params-file .../cfg/examples/ouster_tunnel.yaml \
+#   #               --params-file .../cfg/examples/ouster_tunnel_lidarimg.yaml
+#
+# NOTE: lidar_image/weight is an UNTUNED starting point — sweep on the bag.
+# Watch "Lidar Map Points" / "Lidar Map RMS" / "Degenerate Directions" in
+# /diagnostics.
+
+/**:
+  ros__parameters:
+    odom/lidar_image/enabled: true
+    odom/lidar_image/weight: 0.3          # UNTUNED starting point; sweep on the bag
+
+    # The LiDAR anchor reuses the absolute-anchor gate budget (shared with the
+    # camera map term): vision/LiDAR may correct the IMU prior on a degenerate
+    # axis by at most this per scan, bounded so a wrong anchor can't run away.
+    odom/visual/map/gateMaxStepTrans: 1.0
+    odom/visual/map/gateMaxStepRot: 0.1

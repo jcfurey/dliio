@@ -77,6 +77,12 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->visual_map_view_angle_max_ = 0.6f;  // ~34 deg
   this->last_visual_map_rms_ = 0.0f;
   this->last_visual_map_count_ = 0;
+  this->lidar_map_weight_ = 0.0f;
+  this->lidar_az_a_ = 1.0f; this->lidar_az_b_ = 0.0f;
+  this->lidar_el_a_ = 1.0f; this->lidar_el_b_ = 0.0f;
+  this->T_lw_cur_ = Eigen::Isometry3f::Identity();
+  this->last_lidar_map_rms_ = 0.0f;
+  this->last_lidar_map_count_ = 0;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -224,6 +230,37 @@ float NanoGICP<PointSource, PointTarget>::lastVisualMapRms() const {
 template <typename PointSource, typename PointTarget>
 int NanoGICP<PointSource, PointTarget>::lastVisualMapCount() const {
     return this->last_visual_map_count_;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarMapWeight(float weight) {
+    this->lidar_map_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarImage(const cv::Mat& refl_norm) {
+    this->lidar_image_ = refl_norm;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarProjection(float az_a, float az_b, float el_a, float el_b) {
+    this->lidar_az_a_ = az_a; this->lidar_az_b_ = az_b;
+    this->lidar_el_a_ = el_a; this->lidar_el_b_ = el_b;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarFrame(const Eigen::Isometry3f& T_lidar_world) {
+    this->T_lw_cur_ = T_lidar_world;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastLidarMapRms() const {
+    return this->last_lidar_map_rms_;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastLidarMapCount() const {
+    return this->last_lidar_map_count_;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -439,6 +476,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     this->last_visual_rescued_ = 0;
     this->last_visual_map_count_ = 0;
     this->last_visual_map_rms_ = 0.0f;
+    this->last_lidar_map_count_ = 0;
+    this->last_lidar_map_rms_ = 0.0f;
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -504,6 +543,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         if (visual_map_weight_ > 0.f) {
             accumulateVisualMapResidual(trans, &H, &b, nullptr);
         }
+        // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
+        if (lidar_map_weight_ > 0.f) {
+            accumulateLidarMapResidual(trans, &H, &b, nullptr);
+        }
 
         // Add regularization / damping
         H.diagonal().array() += lambda;
@@ -541,9 +584,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             // anchor, so when it is contributing this scan it gets the larger
             // map budget (it can undo a real drag-back); otherwise the tighter
             // frame-to-frame budget applies.
-            const double cap_t = (last_visual_map_count_ > 0)
+            const bool map_active = (last_visual_map_count_ > 0) || (last_lidar_map_count_ > 0);
+            const double cap_t = map_active
                 ? static_cast<double>(visual_map_gate_max_trans_) : static_cast<double>(visual_gate_max_trans_);
-            const double cap_r = (last_visual_map_count_ > 0)
+            const double cap_r = map_active
                 ? static_cast<double>(visual_map_gate_max_rot_) : static_cast<double>(visual_gate_max_rot_);
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_rr(H_geo.template block<3, 3>(0, 0));
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_tt(H_geo.template block<3, 3>(3, 3));
@@ -557,7 +601,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     ++degenerate;
                     const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
                     const double comp = v.dot(dx.head<3>());
-                    if (visual_enabled_ && v.dot(Hrr * v) > rr_thresh) {
+                    if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Hrr * v) > rr_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_r - rescued_r_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
@@ -575,7 +619,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     ++degenerate;
                     const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
                     const double comp = v.dot(dx.tail<3>());
-                    if (visual_enabled_ && v.dot(Htt * v) > tt_thresh) {
+                    if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Htt * v) > tt_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_t - rescued_t_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
@@ -950,6 +994,124 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualMapResidual(
     if (cost != nullptr) { *cost += cost_sum; }
     this->last_visual_map_count_ = static_cast<int>(count);
     this->last_visual_map_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
+    const Eigen::Isometry3f& trans,
+    Eigen::Matrix<double, 6, 6>* H,
+    Eigen::Matrix<double, 6, 1>* b,
+    double* cost) {
+
+    this->last_lidar_map_count_ = 0;
+    this->last_lidar_map_rms_ = 0.0f;
+
+    if (lidar_map_weight_ <= 0.f) { return; }
+    if (lidar_image_.empty() || lidar_image_.type() != CV_32FC1 || !target_) { return; }
+    if (std::abs(lidar_az_a_) < 1e-12f || std::abs(lidar_el_a_) < 1e-12f) { return; }
+
+    const float inv_scale = 1.f / photometric_scale_;
+    // world -> current lidar INCLUDING the correction (same trans-inverse form as
+    // the camera map term, with the lidar frame instead of the camera).
+    const Eigen::Isometry3f T_lw = T_lw_cur_ * trans.inverse();
+    const Eigen::Matrix3f R_lw = T_lw.linear();
+
+    const float bw = 2.f;
+    const float umax = static_cast<float>(lidar_image_.cols) - 1.f - bw;
+    const float vmax = static_cast<float>(lidar_image_.rows) - 1.f - bw;
+    const float inv_az_a = 1.f / lidar_az_a_;
+    const float inv_el_a = 1.f / lidar_el_a_;
+
+    std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
+    double cost_sum = 0.0, sq_sum = 0.0;
+    long count = 0;
+
+    // Cap the iterated map points: the submap can be tens of thousands of points
+    // and this runs every LM iteration; striding bounds the per-scan cost so the
+    // node keeps real time (the term is count-normalized, so a subset is fine).
+    constexpr int kLidarMaxPoints = 4000;
+    const int n_target = static_cast<int>(target_->size());
+    const int stride = std::max(1, n_target / kLidarMaxPoints);
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
+    for (int j = 0; j < n_target; j += stride) {
+        const auto& tp = target_->at(j);
+        const Eigen::Vector3f p_w(tp.x, tp.y, tp.z);            // FIXED map point (world)
+        const float ref = tp.reflectivity * inv_scale;         // its own reference brightness
+        const Eigen::Vector3f Pl = R_lw * p_w + T_lw.translation();
+
+        const float X = Pl.x(), Y = Pl.y(), Z = Pl.z();
+        const float rxy2 = X * X + Y * Y;
+        if (rxy2 < 1e-6f) { continue; }
+        const float rxy = std::sqrt(rxy2);
+        const float rr2 = rxy2 + Z * Z;
+
+        const float az = std::atan2(Y, X);
+        const float el = std::atan2(Z, rxy);
+        const float u = (az - lidar_az_b_) * inv_az_a;   // col
+        const float v = (el - lidar_el_b_) * inv_el_a;   // row
+        if (u < bw || u > umax || v < bw || v > vmax) { continue; }  // (drops the azimuth seam strip)
+
+        const float I_mov = bilinearSample(lidar_image_, u, v);
+        const float gu = 0.5f * (bilinearSample(lidar_image_, u + 1.f, v) - bilinearSample(lidar_image_, u - 1.f, v));
+        const float gv = 0.5f * (bilinearSample(lidar_image_, u, v + 1.f) - bilinearSample(lidar_image_, u, v - 1.f));
+        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { continue; }
+
+        const float r = I_mov - ref;
+
+        // Spherical projection Jacobian dpi_L/dP_l (2x3):
+        //   col: d/dP (az)/az_a,  az=atan2(Y,X) -> daz/dP = (-Y/rxy2, X/rxy2, 0)
+        //   row: d/dP (el)/el_a,  el=atan2(Z,rxy) -> del/dP = (-ZX/(rxy*rr2), -ZY/(rxy*rr2), rxy/rr2)
+        Eigen::Matrix<float, 2, 3> dpi;
+        dpi(0, 0) = inv_az_a * (-Y / rxy2);
+        dpi(0, 1) = inv_az_a * ( X / rxy2);
+        dpi(0, 2) = 0.f;
+        dpi(1, 0) = inv_el_a * (-Z * X / (rxy * rr2));
+        dpi(1, 1) = inv_el_a * (-Z * Y / (rxy * rr2));
+        dpi(1, 2) = inv_el_a * ( rxy / rr2);
+        Eigen::Matrix<float, 1, 2> gI;
+        gI << gu, gv;
+        // Same trans-inverse perturbation as the camera map term:
+        // J = G_L * [skew(p_w) | -I] = [ +G_L*skew(p_w) | -G_L ].
+        const Eigen::Matrix<float, 1, 3> G = gI * dpi * R_lw;
+        Eigen::Matrix<float, 1, 6> J;
+        J.block<1, 3>(0, 0) = G * skew(p_w);
+        J.block<1, 3>(0, 3) = -G;
+
+        float weight = lidar_map_weight_;
+        const float abs_r = std::abs(r);
+        if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
+            weight *= photometric_huber_delta_ / abs_r;
+        }
+
+        const int tn = omp_get_thread_num();
+        H_private[tn] += (weight * J.transpose() * J).cast<double>();
+        b_private[tn] += (weight * J.transpose() * r).cast<double>();
+        cost_sum += weight * r * r;
+        sq_sum += static_cast<double>(r) * r;
+        count += 1;
+    }
+
+    // COUNT-NORMALIZE: the LiDAR image contributes 5k-75k points per scan, so a
+    // raw weight scales the Hessian mass with the (huge, variable) point count
+    // and is impossible to tune (w=0.005 already over-travels). Normalize the
+    // term's total mass to a nominal reference count so `weight` is comparable
+    // to the camera/geometric terms and stable run-to-run regardless of how many
+    // points happen to be visible.
+    Eigen::Matrix<double, 6, 6> H_sum = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 1> b_sum = Eigen::Matrix<double, 6, 1>::Zero();
+    for (int t = 0; t < num_threads_; ++t) {
+        H_sum += H_private[t];
+        b_sum += b_private[t];
+    }
+    constexpr double kLidarRefCount = 1000.0;
+    const double norm = (count > 0) ? (kLidarRefCount / static_cast<double>(count)) : 0.0;
+    (*H) += H_sum * norm;
+    (*b) += b_sum * norm;
+    if (cost != nullptr) { *cost += cost_sum * norm; }
+    this->last_lidar_map_count_ = static_cast<int>(count);
+    this->last_lidar_map_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
 
 template <typename PointSource, typename PointTarget>

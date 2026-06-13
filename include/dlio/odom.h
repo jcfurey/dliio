@@ -447,4 +447,16 @@ private:
   sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
                            const Eigen::Isometry3f& T_cw, const cv::Mat& img);
 
+  // --- COIN-LIO LiDAR intensity-image term ---
+  bool lidar_image_enabled_;
+  double lidar_image_weight_;
+  cv::Mat lidar_refl_img_;             // current scan reflectivity image (/scale), CV_32FC1
+  float lidar_az_a_, lidar_az_b_, lidar_el_a_, lidar_el_b_;  // self-calibrated spherical model
+  bool lidar_proj_ready_;
+  bool lidar_img_ready_;               // a usable image was built for this scan
+  // Build the reflectivity image + spherical projection model from an organized
+  // scan (called in getScanFromROS before NaN removal); no-op if not organized.
+  void buildLidarIntensityImage(const pcl::PointCloud<PointType>::ConstPtr& organized,
+                                int width, int height);
+
 };

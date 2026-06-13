@@ -163,6 +163,12 @@
     odom/visual/map/gateMaxStepRot: 0.1     # [rad] per scan
     odom/visual/map/viewAngleMax: 0.6       # [rad] drop refs whose viewing ray moved more than this
 
+    # COIN-LIO LiDAR intensity-image term: anchors absolute position to wall
+    # texture in the LiDAR reflectivity image (360deg coverage; reuses the
+    # absolute-anchor gate budget above). Needs an organized scan. OFF by default.
+    odom/lidar_image/enabled: false
+    odom/lidar_image/weight: 0.0
+
     # Diagonal covariance stamped on the published nav_msgs/Odometry
     # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
     # Constant and intentionally conservative; tune for your fusion stack

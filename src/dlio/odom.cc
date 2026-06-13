@@ -239,6 +239,10 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->visual_has_prev_ = false;
   this->visual_cur_pending_valid_ = false;
   this->visual_T_cw_prev_ = Eigen::Isometry3f::Identity();
+  this->lidar_proj_ready_ = false;
+  this->lidar_img_ready_ = false;
+  this->lidar_az_a_ = 1.f; this->lidar_az_b_ = 0.f;
+  this->lidar_el_a_ = 1.f; this->lidar_el_b_ = 0.f;
 
   this->num_processed_keyframes = 0;
 
@@ -476,6 +480,15 @@ void dlio::OdomNode::getParams() {
       "Per-scan rescue budget for the absolute map anchor on a degenerate rotation axis [rad]");
   dlio::declare_param(this, "odom/visual/map/viewAngleMax", this->visual_map_view_angle_, 0.6,
       "Max viewing-ray deviation [rad] between a map ref and the current view before it is dropped");
+
+  // COIN-LIO LiDAR intensity-image term: anchors absolute position to wall
+  // texture in the LiDAR reflectivity image (360deg coverage; better suited to
+  // this rig than the narrow camera). Reuses the absolute-anchor gate budget
+  // (odom/visual/map/gateMaxStep*). OFF by default; needs an organized scan.
+  dlio::declare_param(this, "odom/lidar_image/enabled", this->lidar_image_enabled_, false,
+      "Enable the COIN-LIO LiDAR intensity-image frame-to-map term (organized scan + reflectivity)");
+  dlio::declare_param(this, "odom/lidar_image/weight", this->lidar_image_weight_, 0.0,
+      "Weight of the LiDAR intensity-image residual relative to the geometric GICP term");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
@@ -747,7 +760,9 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // copies fields whose datatype matches our struct (reflectivity is a float here,
   // but sensors publish it as uint8/uint16), so copy it explicitly with conversion.
   // Done before NaN removal so indices still line up 1:1 with the message.
-  if (this->use_reflectivity_ && this->photometric_active_) {
+  // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
+  // 3D-spatial reflectivity photometric term).
+  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_) {
     auto rfield = std::find_if(pc->fields.begin(), pc->fields.end(),
         [](const sensor_msgs::msg::PointField& f){ return f.name == "reflectivity"; });
     if (rfield != pc->fields.end()) {
@@ -773,6 +788,14 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
       RCLCPP_WARN_ONCE(this->get_logger(),
           "photometricChannel=reflectivity but the cloud has no 'reflectivity' field.");
     }
+  }
+
+  // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
+  // removal flattens it. No-op if the cloud isn't organized.
+  this->lidar_img_ready_ = false;
+  if (this->lidar_image_enabled_ && pc->height > 1 &&
+      original_scan_->height == pc->height && original_scan_->width == pc->width) {
+    this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
   }
 
   // Remove NaNs
@@ -1499,6 +1522,85 @@ dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::Const
   return refs;
 }
 
+void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::ConstPtr& organized,
+                                              int width, int height) {
+  // Reflectivity image in native (row=ring, col=azimuth) order, normalized to
+  // the same /scale units as the residual reference (point.reflectivity/scale).
+  const float inv_scale = 1.f / 255.0f;
+  cv::Mat img(height, width, CV_32FC1, cv::Scalar(0.f));
+  for (int row = 0; row < height; ++row) {
+    float* dst = img.ptr<float>(row);
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);   // organized access (col, row)
+      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
+        dst[col] = p.reflectivity * inv_scale;
+      }
+    }
+  }
+  this->lidar_refl_img_ = img;
+  this->lidar_img_ready_ = true;
+
+  // Self-calibrate the spherical model once (sensor geometry is fixed):
+  //   el(row) ~ el_a*row + el_b   (least-squares over per-row mean elevation)
+  //   az(col) ~ az_a*col + az_b   (least-squares over one well-populated row, unwrapped)
+  if (this->lidar_proj_ready_) { return; }
+
+  // Elevation vs row.
+  double sr = 0, se = 0, sre = 0, srr = 0; int ne = 0;
+  for (int row = 0; row < height; ++row) {
+    double accum = 0; int cnt = 0;
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);
+      const float rxy = std::sqrt(p.x * p.x + p.y * p.y);
+      if (std::isfinite(p.x) && rxy > 1e-3f) { accum += std::atan2(p.z, rxy); ++cnt; }
+    }
+    if (cnt > 0) {
+      const double el = accum / cnt;
+      sr += row; se += el; sre += row * el; srr += (double)row * row; ++ne;
+    }
+  }
+  // Azimuth vs col on the most-populated row.
+  int best_row = height / 2, best_cnt = -1;
+  for (int row = 0; row < height; ++row) {
+    int cnt = 0;
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);
+      if (std::isfinite(p.x) && (p.x * p.x + p.y * p.y) > 1e-6f) { ++cnt; }
+    }
+    if (cnt > best_cnt) { best_cnt = cnt; best_row = row; }
+  }
+  double sc = 0, sa = 0, sca = 0, scc = 0; int na = 0; double prev_az = 0, unwrap = 0;
+  for (int col = 0; col < width; ++col) {
+    const auto& p = organized->at(col, best_row);
+    if (!std::isfinite(p.x) || (p.x * p.x + p.y * p.y) < 1e-6f) { continue; }
+    double az = std::atan2(p.y, p.x);
+    if (na > 0) {  // unwrap to keep the fit linear across the +/-pi seam
+      while (az - prev_az > M_PI)  az -= 2.0 * M_PI;
+      while (az - prev_az < -M_PI) az += 2.0 * M_PI;
+    }
+    prev_az = az;
+    sc += col; sa += az; sca += col * az; scc += (double)col * col; ++na;
+    (void)unwrap;
+  }
+
+  if (ne >= 2 && na >= 2) {
+    const double el_den = ne * srr - sr * sr;
+    const double az_den = na * scc - sc * sc;
+    if (std::abs(el_den) > 1e-9 && std::abs(az_den) > 1e-9) {
+      this->lidar_el_a_ = static_cast<float>((ne * sre - sr * se) / el_den);
+      this->lidar_el_b_ = static_cast<float>((se - this->lidar_el_a_ * sr) / ne);
+      this->lidar_az_a_ = static_cast<float>((na * sca - sc * sa) / az_den);
+      this->lidar_az_b_ = static_cast<float>((sa - this->lidar_az_a_ * sc) / na);
+      if (std::abs(this->lidar_el_a_) > 1e-9f && std::abs(this->lidar_az_a_) > 1e-9f) {
+        this->lidar_proj_ready_ = true;
+        RCLCPP_INFO(this->get_logger(),
+            "LiDAR intensity image %dx%d; spherical model el=%.5f*row%+.4f, az=%.6f*col%+.4f",
+            width, height, this->lidar_el_a_, this->lidar_el_b_, this->lidar_az_a_, this->lidar_az_b_);
+      }
+    }
+  }
+}
+
 void dlio::OdomNode::getNextPose() {
 
   // Check if the new submap is ready to be used
@@ -1522,6 +1624,22 @@ void dlio::OdomNode::getNextPose() {
   // Configure the optional direct visual term for this scan (picks the camera
   // frame nearest scan_stamp; no-op / LiDAR-only if disabled or no image).
   this->setupVisualForScan();
+
+  // COIN-LIO LiDAR intensity-image term: project map points into this scan's
+  // reflectivity image (world->lidar from the prior pose). No-op unless enabled
+  // and an organized image + spherical model are ready.
+  if (this->lidar_image_enabled_ && this->lidar_image_weight_ > 0.0 &&
+      this->lidar_img_ready_ && this->lidar_proj_ready_) {
+    Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+    Eigen::Isometry3f T_lw;
+    T_lw.matrix() = T_wl.inverse();
+    this->gicp.setLidarImage(this->lidar_refl_img_);
+    this->gicp.setLidarProjection(this->lidar_az_a_, this->lidar_az_b_, this->lidar_el_a_, this->lidar_el_b_);
+    this->gicp.setLidarFrame(T_lw);
+    this->gicp.setLidarMapWeight(static_cast<float>(this->lidar_image_weight_));
+  } else {
+    this->gicp.setLidarMapWeight(0.f);
+  }
 
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
@@ -2544,6 +2662,9 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Visual Map Active", (this->visual_map_enabled_ && this->gicp.lastVisualMapCount() > 0) ? "1" : "0");
   kv("Visual Map Points", std::to_string(this->gicp.lastVisualMapCount()));
   kv("Visual Map RMS", fnum(this->gicp.lastVisualMapRms(), 4));
+  kv("Lidar Map Active", (this->lidar_image_enabled_ && this->gicp.lastLidarMapCount() > 0) ? "1" : "0");
+  kv("Lidar Map Points", std::to_string(this->gicp.lastLidarMapCount()));
+  kv("Lidar Map RMS", fnum(this->gicp.lastLidarMapRms(), 4));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);

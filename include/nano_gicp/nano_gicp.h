@@ -119,6 +119,21 @@ public:
   void setVisualMapViewAngleMax(float radians);   // reject refs whose viewing ray moved more than this
   void setTargetVisualRefs(const std::shared_ptr<const VisualRefList>& refs);
 
+  // --- COIN-LIO-style LiDAR intensity-image term (frame-to-MAP) ---
+  // Anchors absolute position to wall texture seen in the LiDAR reflectivity
+  // image. Like the camera frame-to-map term but the reference brightness is the
+  // map point's own (range-normalized) reflectivity field, and the projection is
+  // the sensor's spherical model (azimuth->col, elevation->row), self-calibrated
+  // from the organized scan. The current scan's reflectivity image + projection
+  // + world->lidar transform are set per scan.
+  void setLidarMapWeight(float weight);
+  void setLidarImage(const cv::Mat& refl_norm);  // CV_32FC1, reflectivity/scale
+  // Linear spherical model: col = (atan2(Y,X) - az_b)/az_a, row = (elev - el_b)/el_a.
+  void setLidarProjection(float az_a, float az_b, float el_a, float el_b);
+  void setLidarFrame(const Eigen::Isometry3f& T_lidar_world);  // world->lidar from the prior pose
+  float lastLidarMapRms() const;
+  int lastLidarMapCount() const;
+
   // RMS of the (normalized) visual residual and number of points used in the
   // last align() (for diagnostics).
   float lastVisualRms() const;
@@ -185,6 +200,15 @@ protected:
                                    Eigen::Matrix<double, 6, 6>* H,
                                    Eigen::Matrix<double, 6, 1>* b,
                                    double* cost = nullptr);
+
+  // COIN-LIO LiDAR-intensity frame-to-map contribution: projects each map point
+  // into the current reflectivity image via the spherical model and compares to
+  // the point's own reflectivity. Same trans-inverse Jacobian shape as the
+  // camera map term, with the spherical dpi_L instead of the pinhole.
+  void accumulateLidarMapResidual(const Eigen::Isometry3f& trans,
+                                  Eigen::Matrix<double, 6, 6>* H,
+                                  Eigen::Matrix<double, 6, 1>* b,
+                                  double* cost = nullptr);
 
 protected:
   using pcl::Registration<PointSource, PointTarget>::reg_name_;
@@ -254,6 +278,15 @@ protected:
   std::shared_ptr<const VisualRefList> target_visual_refs_;
   float last_visual_map_rms_;
   int last_visual_map_count_;
+
+  // --- COIN-LIO LiDAR intensity-image term state ---
+  float lidar_map_weight_;
+  cv::Mat lidar_image_;               // current reflectivity image, CV_32FC1, /scale
+  float lidar_az_a_, lidar_az_b_;     // col = (atan2(Y,X) - az_b) / az_a
+  float lidar_el_a_, lidar_el_b_;     // row = (elev - el_b) / el_a
+  Eigen::Isometry3f T_lw_cur_;        // world -> lidar from the prior pose
+  float last_lidar_map_rms_;
+  int last_lidar_map_count_;
 };
 
 } // namespace nano_gicp

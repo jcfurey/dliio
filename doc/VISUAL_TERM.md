@@ -142,13 +142,42 @@ to map landmarks (wall texture/graffiti):
 Keys (algorithm): `odom/visual/map/{enabled,weight,gateMaxStepTrans,gateMaxStepRot,viewAngleMax}`
 (all default off). Diagnostics: `Visual Map Active/Points/RMS`.
 
+## COIN-LIO LiDAR intensity-image term (frame-to-MAP)
+
+The camera anchor was measurement-starved on this rig (narrow sideways FOV). The
+LiDAR sees the walls 360° with consistent, range-normalized reflectivity, so it
+has far more persistent landmarks. This term is the same frame-to-map idea on the
+LiDAR reflectivity image:
+
+- **Image:** the organized 64×1024 reflectivity image is snapshotted in
+  `getScanFromROS` BEFORE NaN removal (the bag is organized; do **not** organize
+  the registration cloud — GICP needs the NaN-removed/voxelized one). A spherical
+  model `col=(atan2(Y,X)−az_b)/az_a`, `row=(elev−el_b)/el_a` is **self-calibrated**
+  from the scan (least-squares az-per-col and el-per-row), so no external beam LUT.
+- **Reference:** each map point's own `reflectivity` field — no per-point ref
+  threading needed (unlike the camera, which needed `VisualRef`).
+- **Residual/Jacobian:** `accumulateLidarMapResidual` projects the FIXED map point
+  into the current reflectivity image via `π_L`; same trans-inverse Jacobian shape
+  `[+G·skew(p_w)|−G]` with the spherical `dπ_L/dP_l` instead of the pinhole.
+- **Count-normalization (critical):** the submap is tens of thousands of points,
+  so a raw weight scales the Hessian mass with the (huge, variable) point count
+  and is untunable (w=0.005 already over-travels). The term's mass is normalized
+  to a nominal reference count (`kLidarRefCount=1000`) so `weight` is comparable
+  to the camera/geometric terms and stable run-to-run. The iteration is also
+  strided (cap ~4000 points) to bound per-scan cost.
+- Reuses the gate + absolute-anchor budget; can rescue the axis with no camera.
+
+Keys: `odom/lidar_image/{enabled,weight}`; diagnostics `Lidar Map Active/Points/RMS`.
+Overlay: `cfg/examples/ouster_tunnel_lidarimg.yaml`.
+
 ## Tests
 
 `test/test_visual_residual.cpp` (runs in CI, no hardware/extrinsic needed):
 residual→0 at truth; analytic-vs-finite-difference Jacobian; Gauss-Newton
 descent (sign guard); Hessian stiffness on a targeted axis; disabled = no-op —
 for BOTH the frame-to-frame and frame-to-map terms (the f2m tests guard the
-trans-inverse sign flip). Full suite 18/18.
+trans-inverse sign flip), and the COIN-LIO LiDAR term (spherical-projection
+numeric Jacobian). Full suite 21/21.
 
 ## Status / results (06042026 tunnel, n=3, see test-harness notes)
 
@@ -187,3 +216,16 @@ absolute anchor for this rig — 360° FOV, continuous wall coverage, consistent
 range-normalized viewpoint — and reuses this same frame-to-map backbone (swap the
 camera image for the organized 64×1024 reflectivity image). The camera frame-to-map
 work built and validated the machinery and identified the LiDAR as the stronger anchor.
+
+### COIN-LIO LiDAR A/B (2026-06-12)
+
+The LiDAR term solved the starvation — it engages with **7k–75k landmarks per
+scan** (vs the camera's 2–64), and the self-calibrated spherical model is correct
+(±21° elevation, 360° azimuth). But a **raw** weight scales with that huge count
+and is untunable: w0.3 over-travels/diverges, and even w0.005 is 1/3 clean. The
+**count-normalization + iteration stride** (added after) make `weight` stable and
+the term real-time; re-tuning the normalized weight is the open Phase-2 step
+(first cut ~0.05). NOTE: real-time replay on a *loaded/co-scheduled* machine
+starves the node (IMU-drop scan-skips) — the documented dliio hazard; headless on
+free cores is clean (0 warnings, full 21k poses). See
+`results/dliio_lidarimg_ab/NOTES.md`.
