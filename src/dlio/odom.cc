@@ -12,6 +12,7 @@
 
 #include "dlio/odom.h"
 #include "dlio/utils.h"
+#include <set>
 
 #include <queue>
 
@@ -64,7 +65,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // silently fall back to the defaults (which left the photometric term disabled).
   double photometricWeight;
   dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0,
-      "Weight of the photometric GICP residual relative to the geometric term (dimensionless; 0 disables)");
+      "Weight of the photometric GICP residual relative to the geometric term (live-tunable)", 0.0, 10.0);
 
   // Intensity range correction parameters
   dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0,
@@ -110,7 +111,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // pose at full weight. <= 0 disables.
   double photometricHuberDelta;
   dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05,
-      "Huber threshold on the normalized photometric residual (<= 0 disables robustification)");
+      "Huber threshold on the normalized photometric residual (live-tunable; <=0 disables)", 0.0, 1.0);
   this->gicp.setPhotometricHuberDelta(static_cast<float>(photometricHuberDelta));
 
   // GICP covariance regularization:
@@ -140,7 +141,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
   double degeneracyThreshRatio;
   dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005,
-      "Degeneracy gate: block eigen-directions below ratio*lambda_max hold the IMU prior (0 disables)");
+      "Degeneracy gate ratio (live-tunable; 0 disables)", 0.0, 1.0);
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
@@ -191,6 +192,11 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // by the launch file) so the standard diagnostics topic always lands at /diagnostics.
   this->diag_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", rclcpp::QoS(10).best_effort());
+
+  // Live parameter tuning (ros2 param set during a run). Registered after all
+  // params are declared so initialization doesn't trip it.
+  this->on_set_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&dlio::OdomNode::onSetParams, this, std::placeholders::_1));
 
   this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
   this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
@@ -377,8 +383,10 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/computeTimeOffset", this->time_offset_, false);
 
   // Keyframe Threshold
-  dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
-  dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
+  dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1,
+      "Keyframe translation threshold [m] (live-tunable)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0,
+      "Keyframe rotation threshold [deg] (live-tunable)", 0.0, 180.0);
 
   // Bound on the keyframe map (0 = unlimited). When exceeded, the most
   // spatially redundant processed keyframe is removed.
@@ -560,13 +568,13 @@ void dlio::OdomNode::getParams() {
   if (this->twist_cov_.size() != 6) { this->twist_cov_ = cov_default; }
 
   // Geometric Observer
-  dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kv", this->geo_Kv_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kq", this->geo_Kq_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kab", this->geo_Kab_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0);
-  dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0);
-  dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
+  dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0, "Observer position gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kv", this->geo_Kv_, 1.0, "Observer velocity gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kq", this->geo_Kq_, 1.0, "Observer orientation gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kab", this->geo_Kab_, 1.0, "Observer accel-bias gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0, "Observer gyro-bias gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0, "Accel-bias clamp [m/s^2] (live-tunable)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0, "Gyro-bias clamp [rad/s] (live-tunable)", 0.0, 10.0);
 }
 
 void dlio::OdomNode::start() {
@@ -782,6 +790,73 @@ float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_i
   if (!(range > 0.f) || r_ref <= 0.f) { return intensity; }
   const float c = std::max(cos_incidence, cos_min);  // c>0 (cos_min should be >0)
   return std::clamp(intensity * std::pow(range / r_ref, alpha) / c, 0.f, 255.f);
+}
+
+rcl_interfaces::msg::SetParametersResult
+dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
+  // Parameters that may be retuned live (the drift-hunt knobs). Others still
+  // "set" at the ROS level but have no effect until restart.
+  static const std::set<std::string> kLive = {
+    "odom/gicp/photometricWeight", "odom/gicp/photometricHuberDelta",
+    "odom/gicp/photometricScale", "odom/gicp/degeneracyThreshRatio",
+    "odom/gicp/maxCorrespondenceDistance",
+    "odom/keyframe/threshD", "odom/keyframe/threshR",
+    "odom/geo/Kp", "odom/geo/Kv", "odom/geo/Kq", "odom/geo/Kab",
+    "odom/geo/Kgb", "odom/geo/abias_max", "odom/geo/gbias_max"
+  };
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;  // ranges already validated by rclcpp before this
+  std::lock_guard<std::mutex> lock(this->live_mtx_);
+  for (const auto& p : params) {
+    if (kLive.count(p.get_name())) {
+      this->live_pending_[p.get_name()] = p.as_double();
+      this->live_dirty_.store(true);
+    }
+  }
+  return result;
+}
+
+void dlio::OdomNode::applyLiveParams() {
+  if (!this->live_dirty_.load()) { return; }
+  std::map<std::string, double> pending;
+  {
+    std::lock_guard<std::mutex> lock(this->live_mtx_);
+    pending.swap(this->live_pending_);
+    this->live_dirty_.store(false);
+  }
+  for (const auto& kv : pending) {
+    const std::string& name = kv.first;
+    const double v = kv.second;
+    if (name == "odom/gicp/photometricWeight") {
+      this->gicp.setPhotometricWeight(static_cast<float>(v));
+      this->gicp_temp.setPhotometricWeight(static_cast<float>(v));
+      this->photometric_active_ = (v > 0.0);
+    } else if (name == "odom/gicp/photometricHuberDelta") {
+      this->gicp.setPhotometricHuberDelta(static_cast<float>(v));
+      this->gicp_temp.setPhotometricHuberDelta(static_cast<float>(v));
+    } else if (name == "odom/gicp/photometricScale") {
+      this->gicp.setPhotometricScale(static_cast<float>(v));
+      this->gicp_temp.setPhotometricScale(static_cast<float>(v));
+    } else if (name == "odom/gicp/degeneracyThreshRatio") {
+      this->gicp.setDegeneracyThreshRatio(static_cast<float>(v));
+    } else if (name == "odom/gicp/maxCorrespondenceDistance") {
+      this->gicp_max_corr_dist_ = v;
+      if (!this->adaptive_params_) {  // adaptive recomputes this each scan
+        this->gicp.setMaxCorrespondenceDistance(static_cast<float>(v));
+        this->gicp_temp.setMaxCorrespondenceDistance(static_cast<float>(v));
+      }
+    } else if (name == "odom/keyframe/threshD") { this->keyframe_thresh_dist_ = v;
+    } else if (name == "odom/keyframe/threshR") { this->keyframe_thresh_rot_ = v;
+    } else if (name == "odom/geo/Kp")  { this->geo_Kp_ = v;
+    } else if (name == "odom/geo/Kv")  { this->geo_Kv_ = v;
+    } else if (name == "odom/geo/Kq")  { this->geo_Kq_ = v;
+    } else if (name == "odom/geo/Kab") { this->geo_Kab_ = v;
+    } else if (name == "odom/geo/Kgb") { this->geo_Kgb_ = v;
+    } else if (name == "odom/geo/abias_max") { this->geo_abias_max_ = v;
+    } else if (name == "odom/geo/gbias_max") { this->geo_gbias_max_ = v;
+    }
+    RCLCPP_INFO(this->get_logger(), "live param: %s = %.6g", name.c_str(), v);
+  }
 }
 
 void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
@@ -1171,6 +1246,11 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // closes the iterator-invalidation race for the scan-thread-written stats.
   // (imu_rates is written by the IMU thread and is guarded by mtx_imu instead.)
   if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
+  // Commit any parameters retuned via `ros2 param set` since the last scan
+  // (staged by onSetParams on the executor thread; applied here on the scan
+  // thread so gicp/observer state is only ever mutated from one thread).
+  this->applyLiveParams();
 
   double then = this->now().seconds();
 
