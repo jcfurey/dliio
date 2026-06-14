@@ -1495,8 +1495,11 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     this->length_prev_p = this->state.p;
   }
 
-  // Update time stamps
-  this->lidar_rates.push_back( 1. / (this->scan_stamp - this->prev_scan_stamp) );
+  // Update time stamps. Capture the inter-scan period BEFORE overwriting
+  // prev_scan_stamp -- the CPU-starvation block below needs it (computing it
+  // after the overwrite made it always 0, silently killing those diagnostics).
+  const double scan_period = this->scan_stamp - this->prev_scan_stamp;
+  this->lidar_rates.push_back( 1. / scan_period );
   cap_history(this->lidar_rates);
   this->prev_scan_stamp = this->scan_stamp;
   this->elapsed_time = this->scan_stamp - this->first_scan_stamp;
@@ -1521,9 +1524,8 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // period means the node cannot keep real time and WILL fall behind / drop
   // scans under load -- the documented #1 cause of tunnel-run failures (and NOT
   // an algorithm fault). Surface it in /diagnostics so a starved run is
-  // distinguishable from a genuine divergence at a glance.
-  const double scan_period = (this->scan_stamp > this->prev_scan_stamp)
-      ? (this->scan_stamp - this->prev_scan_stamp) : 0.0;
+  // distinguishable from a genuine divergence at a glance. (scan_period was
+  // captured above, before prev_scan_stamp was advanced.)
   this->last_realtime_factor_ = (scan_period > 0.0) ? (comp_time / scan_period) : 0.0;
   if (scan_period > 0.0 && comp_time > scan_period) { ++this->compute_overruns_; }
   // Estimate scans dropped by the transport (best-effort) when the inter-scan
