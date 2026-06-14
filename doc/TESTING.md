@@ -1,6 +1,6 @@
 # Testing & sanitizers
 
-## Unit & integration tests (48, run in CI)
+## Unit & integration tests (49, run in CI)
 
 `colcon test` -> 7 gtest suites:
 - `test_nano_gicp` — GICP alignment, block-wise degeneracy gate, small-cloud
@@ -41,7 +41,7 @@ ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 ```
 `detect_leaks=0` suppresses one-shot leaks in PCL/OpenCV/rclcpp statics; the
 heap-overflow / use-after-free / UB checks are what matter for the hot-path math.
-**Status: clean on all 48 tests** (the hard CI gate).
+**Status: clean on all 49 tests** (the hard CI gate).
 
 ## TSan — clean (via the live-node harness)
 

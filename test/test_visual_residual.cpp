@@ -647,6 +647,85 @@ TEST(LidarMapResidual, ElevationLutMatchesLinearAtTruth) {
   EXPECT_NEAR(cost, 0.0, 1e-9);
 }
 
+// The projection Jacobian's elevation term uses inv_el_eff = 1/slope taken from
+// the per-row elevation LUT (the path for non-uniform OS beams). The other
+// LidarMapResidual tests don't pin this: AnalyticJacobianMatchesFiniteDifference
+// uses the LINEAR elevation model (inv_el_eff = 1/el_a), and
+// ElevationLutMatchesLinearAtTruth only checks the residual under a LINEAR LUT.
+// This finite-differences the full 6-DOF Jacobian with a genuinely NON-UNIFORM
+// LUT active, so a wrong sign/scale of inv_el_eff -- the load-bearing constraint
+// in a degenerate tunnel -- would be caught.
+TEST(LidarMapResidual, AnalyticJacobianMatchesFiniteDifferenceWithNonUniformLut) {
+  TestableGICP gicp;
+  gicp.setLidarMapWeight(1.0f);
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);  // azimuth model + linear fallback
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  gicp.setLidarImage(img);
+
+  // Strictly-increasing but NON-LINEAR per-row elevation LUT (slope varies with
+  // row via a smooth convex warp), spanning ~the linear range so makeLidarTarget
+  // elevations fall well inside its coverage.
+  std::vector<float> lut(kLH);
+  const float span = kLElA * (kLH - 1);
+  for (int row = 0; row < kLH; ++row) {
+    const float t = static_cast<float>(row) / (kLH - 1);
+    const float g = (t + 0.4f * t * t) / 1.4f;   // g(0)=0, g(1)=1, slope rises with row
+    lut[row] = kLElB + span * g;
+  }
+  gicp.setLidarElevationLut(lut);
+
+  // Mirror the code's LUT projection (linear azimuth + LUT-inverse elevation) to
+  // sample the reference at a small shift, so the residual is non-trivial at I.
+  // (The FD-vs-analytic comparison validates inv_el_eff regardless, but a small
+  // residual keeps the first-order/central-difference agreement tight.)
+  auto projectLut = [&](const Eigen::Vector3f& P, float& u, float& v) -> bool {
+    const float rxy = std::sqrt(P.x() * P.x() + P.y() * P.y());
+    u = (std::atan2(P.y(), P.x()) - kLAzB) / kLAzA;
+    const float el = std::atan2(P.z(), rxy);
+    for (int k = 0; k + 1 < kLH; ++k) {                 // LUT increasing
+      const float a = lut[k], bb = lut[k + 1];
+      if (el >= a && el <= bb) {
+        const float denom = bb - a;
+        if (std::abs(denom) < 1e-9f) continue;
+        v = static_cast<float>(k) + (el - a) / denom;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  auto target = makeLidarTarget();
+  Eigen::Isometry3f Tshift = Eigen::Isometry3f::Identity();
+  Tshift.pretranslate(Eigen::Vector3f(0.1f, 0.05f, 0.03f));
+  for (auto& p : target->points) {
+    Eigen::Vector3f Ps = Tshift * Eigen::Vector3f(p.x, p.y, p.z);
+    float u, v;
+    p.reflectivity = projectLut(Ps, u, v) ? bilinearSampleRamp(img, u, v) * 255.f : 0.f;
+  }
+  gicp.setInputTarget(target);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  const int count0 = gicp.lastLidarMapCount();
+  ASSERT_GT(count0, 20) << "non-uniform LUT projection dropped too many points";
+
+  const float eps = 1e-3f;
+  Eigen::Matrix<double, 6, 1> num_grad;
+  Eigen::Matrix<double, 6, 6> Hd; Eigen::Matrix<double, 6, 1> bd;
+  for (int k = 0; k < 6; ++k) {
+    double cp = gicp.lidarMapSystem(perturbLeft(Eigen::Isometry3f::Identity(), k, eps), Hd, bd);
+    ASSERT_EQ(gicp.lastLidarMapCount(), count0) << "point set changed +eps dof " << k;
+    double cm = gicp.lidarMapSystem(perturbLeft(Eigen::Isometry3f::Identity(), k, -eps), Hd, bd);
+    ASSERT_EQ(gicp.lastLidarMapCount(), count0) << "point set changed -eps dof " << k;
+    num_grad(k) = (cp - cm) / (2.0 * eps);
+  }
+  Eigen::Matrix<double, 6, 1> analytic = 2.0 * b;
+  EXPECT_LT((num_grad - analytic).norm(), 0.04 * analytic.norm() + 1e-6)
+      << "non-uniform-LUT Jacobian mismatch\nnum=" << num_grad.transpose()
+      << "\nana=" << analytic.transpose();
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
