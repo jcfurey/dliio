@@ -1,3 +1,36 @@
+/***********************************************************
+ *                                                         *
+ * Copyright (c)                                           *
+ *                                                         *
+ * The Verifiable & Control-Theoretic Robotics (VECTR) Lab *
+ * University of California, Los Angeles                   *
+ *                                                         *
+ * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
+ *                                                         *
+ ***********************************************************/
+
+/*
+ * NanoGICP: a multi-threaded GICP scan-to-map matcher, FORKED FROM fast_gicp and
+ * extended here. Attribution (full citations in doc/REFERENCES.md §1):
+ *
+ *   - fast_gicp — Kenji Koide (koide3), BSD-3-Clause License:
+ *       https://github.com/koide3/fast_gicp
+ *     The GICP covariance/Mahalanobis core and the PCL Registration interface
+ *     descend from this (VGICP: Koide, Yokozuka, Oishi, Banno, ICRA 2021).
+ *     RETAIN fast_gicp's BSD-3-Clause LICENSE when redistributing this file.
+ *   - Generalized-ICP — Segal, Haehnel, Thrun, RSS 2009 (the plane-to-plane
+ *     covariance formulation).
+ *
+ * Extensions added in this fork:
+ *   - block-wise degeneracy gate / solution remapping — Zhang, Kaess, Singh,
+ *     ICRA 2016;
+ *   - COIN-LIO-style LiDAR intensity-image frame-to-map term — Pfreundschuh
+ *     et al., ICRA 2024 — with FAST-LIVO-style occlusion/range rejection —
+ *     Zheng et al., IROS 2022;
+ *   - intensity/reflectivity and direct-camera photometric residuals.
+ */
+
 #pragma once
 
 #include <Eigen/Core>

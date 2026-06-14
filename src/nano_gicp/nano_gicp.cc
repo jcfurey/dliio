@@ -1,3 +1,23 @@
+/***********************************************************
+ *                                                         *
+ * Copyright (c)                                           *
+ *                                                         *
+ * The Verifiable & Control-Theoretic Robotics (VECTR) Lab *
+ * University of California, Los Angeles                   *
+ *                                                         *
+ * Authors: Kenny J. Chen, Ryan Nemiroff, Brett T. Lopez   *
+ * Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu         *
+ *                                                         *
+ ***********************************************************/
+
+/*
+ * NanoGICP — forked from fast_gicp (Kenji Koide, BSD-3-Clause,
+ * https://github.com/koide3/fast_gicp) and extended with a degeneracy gate and
+ * intensity/visual photometric terms. See nano_gicp.h and doc/REFERENCES.md §1
+ * for the full attribution; retain fast_gicp's BSD-3-Clause LICENSE when
+ * redistributing.
+ */
+
 #include "nano_gicp/nano_gicp.h"
 #include "dlio/dlio.h"
 #include <algorithm>
@@ -1122,8 +1142,9 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
         }
         if (u < bw || u > umax || v < bw || v > vmax) { continue; }  // (drops the azimuth seam strip)
 
-        // Occlusion / wrong-surface rejection: the FIXED map point must be the
-        // surface actually visible at this pixel. Without this, the whole-corridor
+        // Occlusion / wrong-surface rejection (FAST-LIVO-style depth-consistency
+        // cull, Zheng et al. IROS 2022): the FIXED map point must be the surface
+        // actually visible at this pixel. Without this, the whole-corridor
         // submap projects far-side / occluded points onto near walls and floods
         // the residual with mismatches (the dominant cause of high frame-to-map RMS).
         if (use_range) {
