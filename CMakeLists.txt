@@ -40,6 +40,10 @@ set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 
 # ROS deps are pulled from package.xml; non-ROS deps found explicitly below.
 find_package(ament_cmake_auto REQUIRED)
+# VTK::jsoncpp (pulled transitively via PCL/pcl_ros) lists JsonCpp::JsonCpp in its
+# link interface but VTK doesn't find_package(jsoncpp) itself — define the imported
+# target first so VTK-targets.cmake resolves it.
+find_package(jsoncpp REQUIRED)
 ament_auto_find_build_dependencies()
 
 find_package(rosidl_default_generators REQUIRED)
@@ -141,7 +145,13 @@ if(livox_ros_driver2_FOUND)
   # PRIVATE: only odom.cc compiles the Livox path; odom.h stays livox-free so the
   # OdomNode layout is identical for every translation unit (no ODR mismatch).
   target_compile_definitions(dlio_components PRIVATE HAVE_LIVOX_ROS_DRIVER2)
-  ament_target_dependencies(dlio_components livox_ros_driver2)
+  # ament_target_dependencies was removed in Rolling/Lyrical. livox_ros_driver2
+  # is a rosidl message package (CustomMsg/CustomPoint), so link its modern
+  # _TARGETS and include the legacy _INCLUDE_DIRS; each is a no-op when undefined,
+  # so this works Humble..Lyrical. Plain signature to match the
+  # target_link_libraries above (CMake forbids mixing keyword/plain styles).
+  target_link_libraries(dlio_components ${livox_ros_driver2_TARGETS})
+  target_include_directories(dlio_components PRIVATE ${livox_ros_driver2_INCLUDE_DIRS})
 endif()
 rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
