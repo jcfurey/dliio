@@ -1588,10 +1588,12 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   // IMU calibration procedure - do for three seconds
   if (!this->imu_calibrated) {
 
-    static int num_samples = 0;
-    static Eigen::Vector3f gyro_avg (0., 0., 0.);
-    static Eigen::Vector3f accel_avg (0., 0., 0.);
-    static bool print = true;
+    // Per-instance accumulators (members; see odom.h). Bound to local names so
+    // the calibration body below is unchanged.
+    int& num_samples = this->calib_num_samples_;
+    Eigen::Vector3f& gyro_avg = this->calib_gyro_avg_;
+    Eigen::Vector3f& accel_avg = this->calib_accel_avg_;
+    bool& print = this->calib_print_;
 
     if ((imu_stamp_secs - this->first_imu_stamp) < this->imu_calib_time_) {
 
@@ -2389,10 +2391,12 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   imu->header = imu_raw->header;
 
   double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
-  static double prev_stamp = imu_stamp_secs;
-  double dt = imu_stamp_secs - prev_stamp;
-  prev_stamp = imu_stamp_secs;
-  
+  // First call: seed prev_stamp to the current stamp so dt -> 0 (per-instance
+  // member, not a function static -- see odom.h / transform_imu_init_).
+  if (!this->transform_imu_init_) { this->transform_prev_stamp_ = imu_stamp_secs; }
+  double dt = imu_stamp_secs - this->transform_prev_stamp_;
+  this->transform_prev_stamp_ = imu_stamp_secs;
+
   if (dt == 0) { dt = 1.0/200.0; }
 
   // Transform angular velocity (will be the same on a rigid body, so just rotate to ROS convention)
@@ -2406,7 +2410,12 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   imu->angular_velocity.y = ang_vel_cg[1];
   imu->angular_velocity.z = ang_vel_cg[2];
 
-  static Eigen::Vector3f ang_vel_cg_prev = ang_vel_cg;
+  // First call: seed prev to current so the angular-acceleration term is 0
+  // (per-instance member). This completes transformImu's one-time init.
+  if (!this->transform_imu_init_) {
+    this->ang_vel_cg_prev_ = ang_vel_cg;
+    this->transform_imu_init_ = true;
+  }
 
   // Transform linear acceleration (need to account for component due to translational difference)
   Eigen::Vector3f lin_accel(imu_raw->linear_acceleration.x,
@@ -2416,10 +2425,10 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   Eigen::Vector3f lin_accel_cg = this->extrinsics.baselink2imu.R * lin_accel;
 
   lin_accel_cg = lin_accel_cg
-                 + ((ang_vel_cg - ang_vel_cg_prev) / dt).cross(-this->extrinsics.baselink2imu.t)
+                 + ((ang_vel_cg - this->ang_vel_cg_prev_) / dt).cross(-this->extrinsics.baselink2imu.t)
                  + ang_vel_cg.cross(ang_vel_cg.cross(-this->extrinsics.baselink2imu.t));
 
-  ang_vel_cg_prev = ang_vel_cg;
+  this->ang_vel_cg_prev_ = ang_vel_cg;
 
   imu->linear_acceleration.x = lin_accel_cg[0];
   imu->linear_acceleration.y = lin_accel_cg[1];
@@ -2449,9 +2458,11 @@ void dlio::OdomNode::computeSpaciousness() {
   // median
   std::nth_element(ds.begin(), ds.begin() + ds.size()/2, ds.end());
   float median_curr = std::sqrt(ds[ds.size()/2]);
-  static float median_prev = median_curr;
-  float median_lpf = 0.95*median_prev + 0.05*median_curr;
-  median_prev = median_lpf;
+  // Per-instance LPF state (member; seeded to the first median to match the old
+  // function-static lazy init).
+  if (!this->spaciousness_init_) { this->spaciousness_prev_ = median_curr; this->spaciousness_init_ = true; }
+  float median_lpf = 0.95f*this->spaciousness_prev_ + 0.05f*median_curr;
+  this->spaciousness_prev_ = median_lpf;
 
   // push
   this->metrics.spaciousness.push_back( median_lpf );
@@ -2469,9 +2480,10 @@ void dlio::OdomNode::computeDensity() {
     density = this->gicp.source_density_;
   }
 
-  static float density_prev = density;
-  float density_lpf = 0.95*density_prev + 0.05*density;
-  density_prev = density_lpf;
+  // Per-instance LPF state (member). The first density is always 0 (first_opt_
+  // done is false on the first scan), matching the old static's first value.
+  float density_lpf = 0.95f*this->density_prev_ + 0.05f*density;
+  this->density_prev_ = density_lpf;
 
   this->metrics.density.push_back( density_lpf );
   cap_history(this->metrics.density);

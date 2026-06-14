@@ -319,6 +319,22 @@ private:
   double first_imu_stamp;
   double prev_imu_stamp;
 
+  // Per-instance running state that used to live in function-local statics --
+  // those alias across OdomNode instances composed into a single process.
+  // transformImu centripetal-correction history:
+  bool transform_imu_init_ = false;
+  double transform_prev_stamp_ = 0.0;
+  Eigen::Vector3f ang_vel_cg_prev_ = Eigen::Vector3f::Zero();
+  // startup IMU-calibration accumulators:
+  int calib_num_samples_ = 0;
+  Eigen::Vector3f calib_gyro_avg_ = Eigen::Vector3f::Zero();
+  Eigen::Vector3f calib_accel_avg_ = Eigen::Vector3f::Zero();
+  bool calib_print_ = true;
+  // spaciousness / density metric low-pass state:
+  bool spaciousness_init_ = false;
+  float spaciousness_prev_ = 0.f;
+  float density_prev_ = 0.f;
+
   ImuMeas imu_meas;
 
   boost::circular_buffer<ImuMeas> imu_buffer;
