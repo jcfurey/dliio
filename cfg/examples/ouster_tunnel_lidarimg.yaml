@@ -26,17 +26,31 @@
 
     # Count-normalized weight (the term's Hessian mass is normalized to a nominal
     # point count, so this is comparable to the geometric term and stable
-    # regardless of how many points are visible). ~0.05 is the first cut after
-    # normalization -- SWEEP 0.02 / 0.05 / 0.1 on the bag (n>=5). The old raw
-    # weight 0.3 over-travelled because it scaled with the 5k-75k point count.
-    odom/lidar_image/weight: 0.05
+    # regardless of how many points are visible). The old raw weight 0.3
+    # over-travelled because it scaled with the 5k-75k point count.
+    #
+    # TUNED 2026-06-16 on the 06042026 conduit (quiet box, n=3, see
+    # results/dliio_tunnel_bench/NOTES.md): 0.05 was TOO WEAK and diverged; 0.2
+    # gave 3/3 bounded (vs LiDAR-only baseline 2/3) with the degenerate axis
+    # re-opening (deg->0) on 2/3 and the backward drag-back halved (-12..-18 m vs
+    # baseline -27..-78 m). NOTE: this makes the term reliably *bounded* and
+    # clearly better than baseline, but does NOT yet track the conduit forward
+    # (still SHORT). Higher weight at this gate is the open lever to chase TRACK.
+    odom/lidar_image/weight: 0.2
 
     # Occlusion / wrong-surface rejection (frame-to-map): a projected map point
     # whose range to the current sensor disagrees with the pixel's range by more
     # than max(rangeAbsTol, rangeRelTol*range) is dropped. Without this the whole
     # corridor map floods near-wall pixels with far-side mismatches (the dominant
-    # cause of high RMS). If "Lidar Map Points" collapses to hundreds, loosen
-    # these; if RMS stays high, tighten.
+    # cause of high RMS).
+    #
+    # 2026-06-16: do NOT loosen these on the 06042026 conduit. Measured the
+    # median engaged graffiti count: 0.5/0.1 -> ~890 pts/scan; loosening to
+    # 1.5/0.2 -> ~920 (no real gain, the visible-wall texture is already
+    # admitted), but it reintroduced divergence (loose configs 2/3 bounded vs
+    # tight 3/3) by admitting borderline through-wall mismatches. Only an extreme
+    # gate-off (1000/100) doubled the count to ~1800 -- and those are exactly the
+    # far-side points that diverge. The tight gate is near-optimal here.
     odom/lidar_image/rangeAbsTol: 0.5     # [m]
     odom/lidar_image/rangeRelTol: 0.1     # fraction of pixel range
 
