@@ -184,6 +184,17 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Degeneracy gate ratio (live-tunable; 0 disables)", 0.0, 1.0);
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 
+  // Per-scan IMU-consistency clamp: bound the TOTAL GICP correction (final pose
+  // vs the IMU-prior initial guess) per scan. Caps map-lock/divergence runaway
+  // along the intermittently un-gated degenerate axis without touching healthy
+  // motion (the prior already contains the motion). 0 disables each cap.
+  double maxCorrTrans, maxCorrRot;
+  dlio::declare_param(this, "odom/gicp/maxCorrTrans", maxCorrTrans, 0.0,
+      "Per-scan total GICP correction translation cap vs IMU prior [m] (0 disables)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/gicp/maxCorrRot", maxCorrRot, 0.0,
+      "Per-scan total GICP correction rotation cap vs IMU prior [rad] (0 disables)", 0.0, 3.1416);
+  this->gicp.setMaxCorrection(static_cast<float>(maxCorrTrans), static_cast<float>(maxCorrRot));
+
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
   // the background thread, so it needs the same photometric configuration.
   this->gicp_temp.setPhotometricWeight(photometricWeight);

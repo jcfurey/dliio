@@ -200,6 +200,13 @@ public:
   void setDegeneracyThreshRatio(float ratio);
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
+  // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
+  // the initial guess / IMU prior) to this translation [m] and rotation [rad]
+  // envelope. Over a ~0.1s scan the IMU prior is high-confidence, so the
+  // correction (not the motion -- the prior already contains the motion) is
+  // tiny; this caps runaway along the intermittently un-gated degenerate axis.
+  // 0 (default) disables each cap independently (no behavior change).
+  void setMaxCorrection(float max_trans, float max_rot);
 
   virtual void setInputSource(const PointCloudSourceConstPtr& cloud) override;
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
@@ -298,7 +305,9 @@ protected:
   float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float degeneracy_thresh_ratio_;
   int last_degenerate_directions_;
-  
+  float max_corr_trans_;               // [m]   per-scan total-correction translation cap; 0 = off
+  float max_corr_rot_;                 // [rad] per-scan total-correction rotation cap;    0 = off
+
   std::shared_ptr<const GradientList> target_intensity_gradients_;
   std::shared_ptr<const std::vector<bool>> gradient_valid_;
 

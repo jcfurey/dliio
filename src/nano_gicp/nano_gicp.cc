@@ -104,6 +104,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_huber_delta_ = 0.05f;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->last_degenerate_directions_ = 0;
+  this->max_corr_trans_ = 0.0f;   // per-scan correction clamp OFF by default
+  this->max_corr_rot_ = 0.0f;
   this->visual_enabled_ = false;
   this->visual_weight_ = 0.0f;
   this->visual_huber_delta_ = 0.05f;
@@ -331,6 +333,12 @@ void NanoGICP<PointSource, PointTarget>::setDegeneracyThreshRatio(float ratio) {
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setMaxCorrection(float max_trans, float max_rot) {
+    this->max_corr_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
+    this->max_corr_rot_   = (max_rot   > 0.f) ? max_rot   : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
 int NanoGICP<PointSource, PointTarget>::lastDegenerateDirections() const {
     return this->last_degenerate_directions_;
 }
@@ -522,6 +530,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
 
     Eigen::Isometry3f trans = Eigen::Isometry3f::Identity();
     trans.matrix() = guess;
+    // IMU-prior initial guess, snapshotted for the per-scan correction clamp below.
+    const Eigen::Isometry3f trans_init = trans;
 
     // Fallback: if the target was registered without precomputed covariances
     // (or with a mismatched set), compute them here.
@@ -727,6 +737,36 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             this->converged_ = true;
             break;
         }
+    }
+
+    // Per-scan IMU-consistency clamp: bound the TOTAL correction (final GICP
+    // pose vs the IMU-prior initial guess) to a configurable envelope. The
+    // degeneracy gate above holds the prior only on the eigen-directions it
+    // flags, on the ~71-80% of scans it fires; on the scans it misses, a
+    // map-lock "jump" otherwise goes through unbounded and seeds a full
+    // (deg=6) collapse. Over a ~0.1s scan the IMU prior is high-confidence, so
+    // the correction -- NOT the motion; the prior already contains the motion --
+    // is physically tiny, and this caps the runaway. Orthogonal to the gate
+    // (gate bounds per-iteration step direction; this bounds final magnitude).
+    // 0 = off (each cap independent), so default behavior is bit-identical.
+    if (this->max_corr_trans_ > 0.f || this->max_corr_rot_ > 0.f) {
+        // World/left-frame correction: trans = corr * trans_init.
+        Eigen::Isometry3f corr = trans * trans_init.inverse();
+        if (this->max_corr_trans_ > 0.f) {
+            const Eigen::Vector3f t = corr.translation();
+            const float n = t.norm();
+            if (n > this->max_corr_trans_) {
+                corr.translation() = t * (this->max_corr_trans_ / n);
+            }
+        }
+        if (this->max_corr_rot_ > 0.f) {
+            Eigen::AngleAxisf aa(corr.rotation());  // .rotation() is orthonormalized
+            if (aa.angle() > this->max_corr_rot_) {
+                aa.angle() = this->max_corr_rot_;
+                corr.linear() = aa.toRotationMatrix();
+            }
+        }
+        trans = corr * trans_init;  // recompose
     }
 
     this->final_transformation_ = trans.matrix();

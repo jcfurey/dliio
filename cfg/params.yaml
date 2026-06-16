@@ -111,6 +111,17 @@
     # Most discriminative with regularizationMethod: plane.
     odom/gicp/degeneracyThreshRatio: 0.005
 
+    # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
+    # the IMU-prior initial guess). Complements the degeneracy gate: the gate
+    # only holds the prior on the eigen-directions it flags (and only on the
+    # scans it fires), so on the scans it misses a map-lock "jump" runs away
+    # unbounded. Over one scan the IMU prior is high-confidence, so the
+    # correction (not the motion -- the prior already contains the motion) is
+    # tiny; these caps bound the runaway. 0.0 disables each (default). See
+    # cfg/examples/ouster_tunnel.yaml for tunnel values.
+    odom/gicp/maxCorrTrans: 0.0          # [m]   per-scan correction cap; 0 = off
+    odom/gicp/maxCorrRot: 0.0            # [rad] per-scan correction cap; 0 = off
+
     # Photometric (intensity-aided) GICP term. Weight of the photometric
     # residual relative to the geometric term; 0.0 disables. The channel is
     # normalized by photometricScale, so the weight is dimensionless. In

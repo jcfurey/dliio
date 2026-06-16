@@ -128,6 +128,91 @@ TEST(NanoGICP, DegeneracyGateCanBeDisabled) {
   EXPECT_EQ(gicp.lastDegenerateDirections(), 0);
 }
 
+// Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs the
+// identity guess) so a large map-lock "jump" cannot run away. Well-conditioned
+// corner geometry + gate OFF, so the solve genuinely wants the full transform;
+// the clamp must cap it.
+TEST(NanoGICP, MaxCorrectionClampBoundsTotalTranslation) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.20f, 0.0f, 0.0f);  // 0.20 m truth
+  auto source = transformCloud(target, T_true.inverse());
+
+  // Unclamped: confirm the registration drives a step larger than the cap.
+  auto g0 = makeGICP();
+  g0.setDegeneracyThreshRatio(0.f);
+  g0.setInputTarget(target);
+  g0.setInputSource(source);
+  Cloud a0; g0.align(a0);
+  const float unclamped = g0.getFinalTransformation().block<3, 1>(0, 3).norm();
+  ASSERT_GT(unclamped, 0.05f);  // setup sanity: the clamp will actually bite
+
+  // Clamped at 5 cm: identity guess, so the correction == final translation.
+  auto g1 = makeGICP();
+  g1.setDegeneracyThreshRatio(0.f);
+  g1.setMaxCorrection(0.05f, 0.f);
+  g1.setInputTarget(target);
+  g1.setInputSource(source);
+  Cloud a1; g1.align(a1);
+  const float clamped = g1.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(clamped, 0.05f + 1e-4f);
+}
+
+TEST(NanoGICP, MaxCorrectionClampBoundsTotalRotation) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 3>(0, 0) =
+      Eigen::AngleAxisf(0.30f, Eigen::Vector3f::UnitZ()).toRotationMatrix();  // 0.30 rad
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g0 = makeGICP();
+  g0.setDegeneracyThreshRatio(0.f);
+  g0.setInputTarget(target);
+  g0.setInputSource(source);
+  Cloud a0; g0.align(a0);
+  Eigen::AngleAxisf aa0(Eigen::Matrix3f(g0.getFinalTransformation().block<3, 3>(0, 0)));
+  ASSERT_GT(aa0.angle(), 0.10f);  // setup sanity
+
+  auto g1 = makeGICP();
+  g1.setDegeneracyThreshRatio(0.f);
+  g1.setMaxCorrection(0.f, 0.10f);  // cap rotation at 0.10 rad
+  g1.setInputTarget(target);
+  g1.setInputSource(source);
+  Cloud a1; g1.align(a1);
+  Eigen::AngleAxisf aa1(Eigen::Matrix3f(g1.getFinalTransformation().block<3, 3>(0, 0)));
+  EXPECT_LT(aa1.angle(), 0.10f + 1e-4f);
+}
+
+// Clamp OFF (the default, 0/0) must be bit-identical: the guard skips the clamp
+// branch entirely, so the result equals the unclamped path exactly. A cap larger
+// than the actual correction is a no-op too (within float recompose epsilon).
+TEST(NanoGICP, MaxCorrectionDisabledIsBitIdentical) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](float ct, float cr) {
+    auto g = makeGICP();
+    g.setMaxCorrection(ct, cr);
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  auto run_default = [&]() {
+    auto g = makeGICP();  // never call setMaxCorrection -> default 0/0
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+
+  const Eigen::Matrix4f base = run_default();
+  EXPECT_TRUE(run(0.f, 0.f).isApprox(base, 0.f));      // explicit off: exact
+  EXPECT_TRUE(run(10.f, 3.0f).isApprox(base, 1e-5f));  // cap >> correction: no-op
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).

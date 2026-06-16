@@ -43,6 +43,18 @@
     odom/gicp/regularizationMethod: plane
     odom/gicp/degeneracyThreshRatio: 0.005
 
+    # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
+    # the IMU-prior initial guess). The degeneracy gate only holds the prior on
+    # the axes it flags, on the ~71-80% of scans it fires; on the scans it
+    # misses, a map-lock "jump" otherwise runs away unbounded and seeds a full
+    # collapse. Over a ~0.1s scan the IMU prior is high-confidence, so the
+    # correction (NOT the motion -- the prior already contains the motion) is
+    # tiny; these caps bound the runaway. Starting values; tune in the bench
+    # harness (results/dliio_tunnel_bench/). 0 disables each. Default off
+    # everywhere else (params.yaml), so non-tunnel runs are unaffected.
+    odom/gicp/maxCorrTrans: 0.30   # [m]   per scan
+    odom/gicp/maxCorrRot: 0.05     # [rad] per scan
+
     # The OS-series integrated IMU offset (from the Ouster datasheet); replace
     # with your unit's calibration if available.
     extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]
