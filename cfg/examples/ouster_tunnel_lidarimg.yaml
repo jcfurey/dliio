@@ -29,14 +29,17 @@
     # regardless of how many points are visible). The old raw weight 0.3
     # over-travelled because it scaled with the 5k-75k point count.
     #
-    # TUNED 2026-06-16 on the 06042026 conduit (quiet box, n=3, see
-    # results/dliio_tunnel_bench/NOTES.md): 0.05 was TOO WEAK and diverged; 0.2
-    # gave 3/3 bounded (vs LiDAR-only baseline 2/3) with the degenerate axis
-    # re-opening (deg->0) on 2/3 and the backward drag-back halved (-12..-18 m vs
-    # baseline -27..-78 m). NOTE: this makes the term reliably *bounded* and
-    # clearly better than baseline, but does NOT yet track the conduit forward
-    # (still SHORT). Higher weight at this gate is the open lever to chase TRACK.
-    odom/lidar_image/weight: 0.2
+    # NOT TUNED — no weight is validated on the 06042026 conduit. 2026-06-16
+    # quiet-box A/B (results/dliio_tunnel_bench/sweep_quiet/NOTES.md): w0.2 looked
+    # great at n=3 (3/3 bounded) but did NOT reproduce at higher n (1/4 in the
+    # follow-up), and pooled clean-load OK-rate is indistinguishable from the
+    # LiDAR-only baseline (~80% each). The divergence is the geometric-degeneracy
+    # /solver basin (along the conduit axis), and a scalar weight does not
+    # reliably move it — n=3-4 cannot even separate configs (same config swung
+    # 3/3 -> 1/4). Left at the conservative 0.05 first cut pending a code-level
+    # fix (early-startup collapse / per-scan along-axis gate budget) + a clean
+    # high-n (>=12) decider. Do NOT trust a single-rep result on this bag.
+    odom/lidar_image/weight: 0.05
 
     # Occlusion / wrong-surface rejection (frame-to-map): a projected map point
     # whose range to the current sensor disagrees with the pixel's range by more
@@ -44,13 +47,15 @@
     # corridor map floods near-wall pixels with far-side mismatches (the dominant
     # cause of high RMS).
     #
-    # 2026-06-16: do NOT loosen these on the 06042026 conduit. Measured the
-    # median engaged graffiti count: 0.5/0.1 -> ~890 pts/scan; loosening to
-    # 1.5/0.2 -> ~920 (no real gain, the visible-wall texture is already
-    # admitted), but it reintroduced divergence (loose configs 2/3 bounded vs
-    # tight 3/3) by admitting borderline through-wall mismatches. Only an extreme
-    # gate-off (1000/100) doubled the count to ~1800 -- and those are exactly the
-    # far-side points that diverge. The tight gate is near-optimal here.
+    # 2026-06-16: no reason to loosen these on the 06042026 conduit. Measured the
+    # median engaged graffiti count (a deterministic, non-chaotic metric):
+    # 0.5/0.1 -> ~890 pts/scan; loosening to 1.5/0.2 -> ~920 (NO real gain --
+    # the visible-wall texture is already admitted at 0.5/0.1). Only an extreme
+    # gate-off (1000/100) roughly doubled it to ~1800, and those extra points are
+    # far-side / through-wall mismatches (the gate-off probe diverged). So
+    # loosening cannot add usable graffiti, only noise. (The earlier "loosening
+    # reintroduces divergence" read was n=3 and is not separable from basin noise
+    # -- but there's no upside to loosening regardless.)
     odom/lidar_image/rangeAbsTol: 0.5     # [m]
     odom/lidar_image/rangeRelTol: 0.1     # fraction of pixel range
 
