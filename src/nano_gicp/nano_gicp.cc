@@ -137,9 +137,12 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_huber_delta_ = 0.05f;
   this->photometric_ref_count_ = 0.0f;   // mass-normalization OFF by default (raw)
   this->last_photometric_count_ = 0;
+  this->last_photometric_rms_ = 0.0f;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->degeneracy_softness_ = 0.0f;   // binary gate by default (bit-identical)
   this->last_degenerate_directions_ = 0;
+  this->last_geo_rot_margin_ = -1.0f;    // telemetry; -1 = gate disabled / not computed
+  this->last_geo_trans_margin_ = -1.0f;
   this->max_corr_trans_ = 0.0f;   // per-scan correction clamp OFF by default
   this->max_corr_rot_ = 0.0f;
   this->visual_enabled_ = false;
@@ -237,6 +240,21 @@ void NanoGICP<PointSource, PointTarget>::setPhotometricRefCount(float ref_count)
 template <typename PointSource, typename PointTarget>
 int NanoGICP<PointSource, PointTarget>::lastPhotometricCount() const {
     return this->last_photometric_count_;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastPhotometricRms() const {
+    return this->last_photometric_rms_;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastGeoRotMargin() const {
+    return this->last_geo_rot_margin_;
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastGeoTransMargin() const {
+    return this->last_geo_trans_margin_;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -613,6 +631,12 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     this->last_visual_map_rms_ = 0.0f;
     this->last_lidar_map_count_ = 0;
     this->last_lidar_map_rms_ = 0.0f;
+    // Read-only observability telemetry: the geometric blocks' trust margin
+    // (weakest-axis eigenvalue / gate threshold). >1 = above the gate (trusted),
+    // <1 = below (held as degenerate), ~1 = marginal (the chatter zone the soft
+    // gate addresses). -1 = not computed (gate disabled). Does NOT affect the solve.
+    this->last_geo_rot_margin_ = -1.0f;
+    this->last_geo_trans_margin_ = -1.0f;
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -750,6 +774,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             // near the threshold are partially held instead of toggled, killing
             // the scan-to-scan chatter that seeds divergence.
             const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
+            // Telemetry only: weakest-axis margin vs the gate threshold.
+            this->last_geo_rot_margin_ = (rr_thresh > 0.0)
+                ? static_cast<float>(eig_rr.eigenvalues()(0) / rr_thresh) : -1.0f;
             for (int k = 0; k < 3; ++k) {
                 const double lam = eig_rr.eigenvalues()(k);
                 const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
@@ -770,6 +797,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
+            // Telemetry only: weakest-axis margin vs the gate threshold.
+            this->last_geo_trans_margin_ = (tt_thresh > 0.0)
+                ? static_cast<float>(eig_tt.eigenvalues()(0) / tt_thresh) : -1.0f;
             for (int k = 0; k < 3; ++k) {
                 const double lam = eig_tt.eigenvalues()(k);
                 const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
@@ -899,6 +929,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
     double cost_sum = 0.0;
     double photo_cost_sum = 0.0;
+    double photo_sq_sum = 0.0;   // telemetry only: sum of UNweighted photometric residual^2
 
     bool use_photometric = (photometric_weight_ > 1e-8)
         && target_intensity_gradients_ && !target_intensity_gradients_->empty();
@@ -917,7 +948,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 1>::Zero());
     std::vector<long> photo_count_private(num_threads_, 0);
 
-    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum)
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum,photo_sq_sum)
     for(int i = 0; i < input_->size(); ++i) {
         int thread_num = omp_get_thread_num();
         int target_index = correspondences_[i];
@@ -972,6 +1003,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                     weight *= photometric_huber_delta_ / abs_r;
                 }
                 ++photo_count_private[thread_num];
+                photo_sq_sum += static_cast<double>(intensity_diff) * intensity_diff;  // telemetry only
                 if (normalize_photo) {
                     // Separate accumulator: scaled to the reference count post-loop.
                     Hp_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
@@ -993,10 +1025,13 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     }
     if (cost != nullptr) { *cost = cost_sum; }
 
-    // Photometric residual count (tallied regardless of normalization).
+    // Photometric residual count + RMS (telemetry, tallied regardless of
+    // normalization; RMS is the UNweighted brightness-constancy fit quality).
     long photo_count = 0;
     for (int i = 0; i < num_threads_; ++i) { photo_count += photo_count_private[i]; }
     this->last_photometric_count_ = static_cast<int>(photo_count);
+    this->last_photometric_rms_ = (photo_count > 0)
+        ? std::sqrt(static_cast<float>(photo_sq_sum / photo_count)) : 0.0f;
 
     // Opt-in mass-normalization: scale the separate photometric accumulator to
     // the nominal reference count and fold it in. (When off, the photometric

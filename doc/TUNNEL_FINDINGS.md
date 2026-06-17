@@ -186,6 +186,24 @@ validated `ouster_tunnel.yaml` is unchanged. This is the **other half of step 1*
 for any cross-term adaptive weighting; this change makes the weights comparable
 but does not yet adapt them at runtime.
 
+## Finding 9 — per-term trust telemetry (read-only; what an adaptive policy keys on)
+
+2026-06-17 surfaces a per-term count+quality pair in `/diagnostics` so the signals
+an adaptive weighting policy would consume can be observed against a real bag
+*before* anything auto-adjusts. Every term now reports both: geometric gets a
+**trust margin** (`Geo Rot/Trans Trust Margin` = the block's weakest-axis
+eigenvalue / the gate threshold; >1 trusted, <1 held, ~1 marginal — the chatter
+zone, -1 when the gate is off); photometric gets `Photometric Points` +
+`Photometric Residual RMS` (the previously-missing pair); the camera and
+LiDAR-image terms already reported count + RMS. All read-only — the margins are
+captured inside the gate's existing eigendecomposition and the RMS from an
+unweighted residual tally, neither touching H/b (the solve is bit-identical,
+covered by the existing alignment + bit-identical tests). This closes the
+observability half of the adaptive-trust groundwork: gate softened (step 2),
+weights commensurable (step 1), and now the trust signals visible. The actual
+runtime adaptation (mapping these signals to per-term/per-axis weights) is the
+next, genuinely-new-behavior step and is not yet done.
+
 ## Sensor-robustness note — intensity<->reflectivity fallback
 
 The tunnel config uses `photometricChannel: reflectivity` (calibrated, range-

@@ -126,6 +126,10 @@ loosen a strongly-degenerate axis: eigenvalue ~0 << thresh still keeps ~0
 | key | healthy | failure signature |
 |---|---|---|
 | `Degenerate Directions (current)` | 1 (the axis) | 6 = full collapse |
+| `Geo Rot Trust Margin` | > 1 (rotation observable) | <= 1 = rotation degenerate; -1 = gate off |
+| `Geo Trans Trust Margin` | > 1 off-axis; ~1/`<1` on the tunnel axis | crossing 1 scan-to-scan = chatter (soft-gate target) |
+| `Photometric Points` | thousands of valid-gradient matches | -> 0 (no texture / channel missing) |
+| `Photometric Residual RMS` | low + stable (good brightness constancy) | high + rising (term mistrustworthy) |
 | `Lidar Map Points` | thousands | -> 0 (term starved / all occluded out) |
 | `Lidar Map RMS` | lower than pre-fix 0.4-0.6 | high + rising |
 | `Visual Rescued Axes` | 1 when deg=1 | 0 while deg>=1 (gate not rescuing) |

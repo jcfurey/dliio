@@ -414,6 +414,54 @@ TEST(NanoGICP, PhotometricNormalizationOnStillConverges) {
   EXPECT_LT(err, 0.03f);
 }
 
+// Read-only telemetry: the photometric residual RMS (fit quality) is reported
+// when the term engages, and 0 when it is off.
+TEST(NanoGICP, PhotometricRmsTracked) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+  // Break brightness constancy so the photometric residual stays non-zero at
+  // geometric convergence (on perfectly consistent data RMS legitimately -> 0).
+  for (auto& p : source->points) { p.intensity += 12.f; p.reflectivity += 12.f; }
+
+  auto g = makeGICP();
+  g.setPhotometricWeight(0.5f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  EXPECT_GT(g.lastPhotometricRms(), 0.0f);
+  EXPECT_TRUE(std::isfinite(g.lastPhotometricRms()));
+
+  auto g0 = makeGICP();                            // photometric off
+  g0.setInputTarget(target);
+  g0.setInputSource(source);
+  Cloud a0; g0.align(a0);
+  EXPECT_EQ(g0.lastPhotometricRms(), 0.0f);
+}
+
+// Read-only telemetry: the geometric trust margin (weakest-axis eigenvalue / gate
+// threshold) is > 1 on well-conditioned corner geometry and < 1 along the
+// degenerate in-plane translation of a single plane.
+TEST(NanoGICP, GeoTrustMarginReflectsConditioning) {
+  auto corner = makeCorner(1.0f, 0.05f);
+  auto gc = makeGICP();
+  gc.setInputTarget(corner);
+  gc.setInputSource(corner);
+  Cloud ac; gc.align(ac);
+  EXPECT_GT(gc.lastGeoRotMargin(), 1.0f);          // fully observable -> above the gate
+  EXPECT_GT(gc.lastGeoTransMargin(), 1.0f);
+
+  auto plane = makePlane(2.0f, 0.05f);
+  auto gp = makeGICP();
+  gp.setInputTarget(plane);
+  gp.setInputSource(plane);
+  Cloud ap; gp.align(ap);
+  EXPECT_GE(gp.lastGeoTransMargin(), 0.0f);         // computed (gate on by default)
+  EXPECT_LT(gp.lastGeoTransMargin(), 1.0f);         // weakest trans axis is degenerate
+  EXPECT_LT(gp.lastGeoTransMargin(), gc.lastGeoTransMargin());
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).

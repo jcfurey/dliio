@@ -3153,9 +3153,15 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Scans Dropped est (cumulative)", std::to_string(this->scans_dropped_est_.load()));
   kv("Degenerate Directions (current)", std::to_string(this->loc_gate_axes_current_));
   kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
+  // Per-term trust telemetry (read-only; what an adaptive weighting policy would
+  // key on). Geometric: weakest-axis margin vs the gate threshold (>1 trusted,
+  // <1 held, ~1 marginal; -1 = gate off). Each term also reports count + RMS.
+  kv("Geo Rot Trust Margin", fnum(this->gicp.lastGeoRotMargin(), 4));
+  kv("Geo Trans Trust Margin", fnum(this->gicp.lastGeoTransMargin(), 4));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");
   kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
+  kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));

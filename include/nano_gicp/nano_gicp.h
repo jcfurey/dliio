@@ -135,6 +135,16 @@ public:
   // Number of photometric residuals accumulated during the last align() (the
   // valid-gradient correspondences). Tracked regardless of normalization.
   int lastPhotometricCount() const;
+  // Unweighted photometric residual RMS from the last align() (brightness-
+  // constancy fit quality; lower is better). 0 if the term did not engage.
+  float lastPhotometricRms() const;
+  // Geometric observability telemetry from the last align(): the rotation /
+  // translation Hessian block's weakest-axis eigenvalue divided by the gate
+  // threshold. >1 = above the gate (trusted), <1 = held as degenerate, ~1 =
+  // marginal (chatter zone). -1 if the gate was disabled. Read-only; the solve
+  // is unaffected.
+  float lastGeoRotMargin() const;
+  float lastGeoTransMargin() const;
 
   // --- Direct visual (camera) photometric term (off by default) ---
   // Frame-to-frame direct image alignment using LiDAR depth. Each current-scan
@@ -346,9 +356,12 @@ protected:
   float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float photometric_ref_count_;        // mass-normalization nominal count; 0 = off (raw)
   int last_photometric_count_;         // valid-gradient residuals in the last align()
+  float last_photometric_rms_;         // telemetry: unweighted photometric residual RMS
   float degeneracy_thresh_ratio_;
   float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
   int last_degenerate_directions_;
+  float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
+  float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a
   float max_corr_trans_;               // [m]   per-scan total-correction translation cap; 0 = off
   float max_corr_rot_;                 // [rad] per-scan total-correction rotation cap;    0 = off
 
