@@ -69,6 +69,22 @@ the scan thread, so it is race-free. Example:
 
 **Composed launch** (`dlio_composed.launch.py`): same arguments (minus `rviz`); runs both nodes as components in one multithreaded container with intra-process communication, so keyframe clouds pass between the odometry and map nodes without serialization. The terminal dashboard is disabled automatically in this mode. Both nodes are also loadable into your own container (`dlio::OdomNode`, `dlio::MapNode`).
 
+**Running from a `ros2 bag`.** DLIO consumes a `sensor_msgs/PointCloud2` topic directly — there is no sensor-packet/driver stage inside the node, so a bag of recorded clouds (e.g. `/ouster/points`) is the native, fully-supported input (this is what the DLIO datasets are). Two things are non-negotiable:
+
+- **Both topics.** DLIO is LiDAR-**inertial** — it needs the cloud *and* an IMU topic. A cloud-only bag never initializes (the node waits for IMU calibration). Map them with `pointcloud_topic:=…` / `imu_topic:=…`.
+- **Sim time.** Launch with `use_sim_time:=true` and play with the clock: `ros2 bag play <bag> --clock`. Otherwise the node clock and message stamps disagree. The cloud subscription is best-effort `SensorDataQoS` with `keep_last(1)`, so it accepts a reliable bag publisher but **drops scans under load** — for a clean offline pass, play headless on free cores (and, if you need every scan, slow the bag: `--rate 0.5`).
+
+What you get from the cloud degrades gracefully by the fields it carries — all detected per-scan, logged at startup, no crashes:
+
+| Field / structure in the `PointCloud2` | Enables | If absent |
+|---|---|---|
+| per-point time (`t` Ouster / `time` Velodyne / `timestamp` Hesai·Livox) | continuous-time **deskew** | sensor → `UNKNOWN`, deskew auto-off (rigid per-scan transform; fine at low speed) |
+| **organized** (`height > 1`) | COIN-LIO LiDAR-image term + incidence-angle correction | those no-op (they need the beam×azimuth grid) |
+| `intensity` / `reflectivity` | photometric term | falls back `reflectivity`↔`intensity`, or disables if neither present |
+| `x,y,z` (always present) | geometric GICP | — |
+
+A *stripped* cloud (xyz-only, unorganized, no time field) reduces DLIO to plain geometric LIO — fine in feature-rich scenes, but it strips exactly the tunnel mitigations (deskew, reflectivity, the organized image), so for degenerate/tunnel work feed the full driver-output cloud.
+
 **Outputs / downstream wiring:**
 
 | Interface | Name | Notes |
