@@ -1470,7 +1470,11 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // thread so gicp/observer state is only ever mutated from one thread).
   this->applyLiveParams();
 
-  double then = this->now().seconds();
+  // Wall-clock start for the computation-time / CPU-starvation diagnostics.
+  // Must be a STEADY clock, not this->now(): under use_sim_time (bag replay)
+  // now() is sim time driven by /clock, so comp_time would be scaled by the
+  // playback rate (and ~0 on a paused bag) instead of measuring real CPU cost.
+  const auto cpu_t0 = std::chrono::steady_clock::now();
 
   if (this->first_scan_stamp == 0.) {
     this->first_scan_stamp = rclcpp::Time(pc->header.stamp).seconds();
@@ -1576,8 +1580,9 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
 
-  // Update some statistics
-  const double comp_time = this->now().seconds() - then;
+  // Update some statistics (wall-clock comp_time; see cpu_t0 above)
+  const double comp_time =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count();
   this->comp_times.push_back(comp_time);
   cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
