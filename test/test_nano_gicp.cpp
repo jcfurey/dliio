@@ -213,6 +213,88 @@ TEST(NanoGICP, MaxCorrectionDisabledIsBitIdentical) {
   EXPECT_TRUE(run(10.f, 3.0f).isApprox(base, 1e-5f));  // cap >> correction: no-op
 }
 
+// --- Soft degeneracy gate keep-fraction (pure helper) ---
+// The free function maps a Hessian eigenvalue to the fraction of the GICP update
+// kept along that direction. softness 0 is the original binary gate; softness>0
+// ramps smoothly across a log-eigenvalue band centred on the threshold.
+
+TEST(SoftGate, BinaryWhenSoftnessZero) {
+  // softness <= 0 reproduces the original binary gate exactly: trust strictly
+  // above the threshold, hold (keep 0) at/below it -- matching `eig <= thresh`.
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(2.0, 1.0, 0.0), 1.0);
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(1.0, 1.0, 0.0), 0.0);   // == thresh -> hold
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(0.5, 1.0, 0.0), 0.0);
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(2.0, 1.0, -1.0), 1.0);  // negative == off
+}
+
+TEST(SoftGate, SmoothstepEdgesAndCentre) {
+  const double thresh = 0.4, s = 0.5;
+  // lower band edge thresh/(1+s): fully held; upper edge thresh*(1+s): fully kept
+  EXPECT_DOUBLE_EQ(nano_gicp::softGateKeepFraction(thresh / (1.0 + s), thresh, s), 0.0);
+  EXPECT_DOUBLE_EQ(nano_gicp::softGateKeepFraction(thresh * (1.0 + s), thresh, s), 1.0);
+  // centre (== thresh) is the smoothstep midpoint, 0.5
+  EXPECT_NEAR(nano_gicp::softGateKeepFraction(thresh, thresh, s), 0.5, 1e-12);
+}
+
+TEST(SoftGate, MonotoneAndClamped) {
+  const double thresh = 1.0, s = 1.0;
+  double prev = -1.0;
+  for (double e = 0.1; e <= 5.0; e += 0.1) {
+    const double k = nano_gicp::softGateKeepFraction(e, thresh, s);
+    EXPECT_GE(k, 0.0);
+    EXPECT_LE(k, 1.0);
+    EXPECT_GE(k, prev - 1e-12);  // non-decreasing in eigenvalue
+    prev = k;
+  }
+  EXPECT_DOUBLE_EQ(nano_gicp::softGateKeepFraction(1e-6, thresh, s), 0.0);  // well below band
+  EXPECT_DOUBLE_EQ(nano_gicp::softGateKeepFraction(1e6, thresh, s), 1.0);   // well above band
+}
+
+TEST(SoftGate, NonPositiveInputsHoldPrior) {
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(-1.0, 1.0, 0.5), 0.0);  // eigval <= 0
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(0.0, 1.0, 0.5), 0.0);
+  EXPECT_EQ(nano_gicp::softGateKeepFraction(1.0, 0.0, 0.5), 0.0);   // thresh <= 0
+}
+
+// Soft gate OFF (default 0) must take the exact binary-gate path: result equals
+// the never-configured default bit-for-bit.
+TEST(NanoGICP, SoftGateDisabledIsBitIdentical) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto run = [&](bool set) {
+    auto g = makeGICP();
+    if (set) { g.setDegeneracySoftness(0.f); }  // explicit off
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);          // never configured -> default 0
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));        // explicit 0: exact
+}
+
+// A wide soft band must NOT leak motion onto a *strongly* unobservable axis: the
+// in-plane directions of a plane have eigenvalue ~0 << thresh, so keep stays ~0
+// and the prior is held -- the soft ramp only affects near-threshold directions.
+TEST(NanoGICP, SoftGateStillHoldsStronglyDegenerateAxis) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto g = makeGICP();
+  g.setDegeneracySoftness(1.0f);  // wide band
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  const float translation_norm = g.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(translation_norm, 0.05f);
+  EXPECT_GE(g.lastDegenerateDirections(), 2);  // still flags the unobservable dofs
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).

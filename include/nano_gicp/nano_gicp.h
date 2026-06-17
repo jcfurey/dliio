@@ -65,6 +65,18 @@ using VisualRefList = std::vector<VisualRef, Eigen::aligned_allocator<VisualRef>
 
 enum class RegularizationMethod { NONE, MIN_EIG, NORMALIZED_MIN_EIG, PLANE, FROBENIUS };
 
+// Soft degeneracy gate keep-fraction: maps a (geometric) Hessian eigenvalue to
+// the fraction of the GICP update that is KEPT along that eigen-direction, in
+// [0,1] (1 = trust the data fully, 0 = hold the IMU prior fully). The original
+// gate is the binary limit: keep 1 above the threshold, 0 at/below it. With
+// softness > 0 the keep-fraction ramps smoothly (smoothstep) across a symmetric
+// band of half-width ln(1+softness) in log-eigenvalue space centred on thresh,
+// so a direction hovering near the threshold no longer flips between full-trust
+// and full-hold scan-to-scan (the chatter that seeds divergence in the chaotic
+// tunnel basin). softness <= 0 reproduces the binary gate bit-for-bit.
+// Free function (type-independent, pure) so it is cheap to unit-test.
+double softGateKeepFraction(double eigval, double thresh, double softness);
+
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
 
@@ -198,6 +210,12 @@ public:
   // a featureless tunnel. 0 disables the gate. Most discriminative with the
   // PLANE regularization method.
   void setDegeneracyThreshRatio(float ratio);
+  // Soft-gate band half-width (multiplicative, dimensionless). 0 (default) keeps
+  // the original binary gate (full trust above the threshold, full prior-hold
+  // at/below it); >0 ramps the keep-fraction smoothly across eigenvalues in
+  // [thresh/(1+softness), thresh*(1+softness)] so near-threshold directions are
+  // not toggled abruptly between trust and hold. See softGateKeepFraction().
+  void setDegeneracySoftness(float softness);
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
   // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
@@ -304,6 +322,7 @@ protected:
   float photometric_scale_;            // channel full-scale; channel is divided by this
   float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float degeneracy_thresh_ratio_;
+  float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
   int last_degenerate_directions_;
   float max_corr_trans_;               // [m]   per-scan total-correction translation cap; 0 = off
   float max_corr_rot_;                 // [rad] per-scan total-correction rotation cap;    0 = off

@@ -185,6 +185,16 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Degeneracy gate ratio (live-tunable; 0 disables)", 0.0, 1.0);
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 
+  // Soft degeneracy gate: ramp the keep-fraction smoothly across a band around
+  // the threshold instead of toggling each eigen-direction between full-trust
+  // and full-hold. Bounds the scan-to-scan chatter when an eigenvalue hovers
+  // near the threshold (a divergence seed in the chaotic tunnel basin).
+  // 0 (default) = original binary gate, bit-identical. Live-tunable.
+  double degeneracySoftness;
+  dlio::declare_param(this, "odom/gicp/degeneracySoftness", degeneracySoftness, 0.0,
+      "Soft-gate band half-width (multiplicative; live-tunable; 0 = binary gate)", 0.0, 10.0);
+  this->gicp.setDegeneracySoftness(static_cast<float>(degeneracySoftness));
+
   // Per-scan IMU-consistency clamp: bound the TOTAL GICP correction (final pose
   // vs the IMU-prior initial guess) per scan. Caps map-lock/divergence runaway
   // along the intermittently un-gated degenerate axis without touching healthy
@@ -1003,6 +1013,7 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   static const std::set<std::string> kLive = {
     "odom/gicp/photometricWeight", "odom/gicp/photometricHuberDelta",
     "odom/gicp/photometricScale", "odom/gicp/degeneracyThreshRatio",
+    "odom/gicp/degeneracySoftness",
     "odom/gicp/maxCorrespondenceDistance",
     "odom/keyframe/threshD", "odom/keyframe/threshR",
     "odom/geo/Kp", "odom/geo/Kv", "odom/geo/Kq", "odom/geo/Kab",
@@ -1043,6 +1054,8 @@ void dlio::OdomNode::applyLiveParams() {
       this->gicp_temp.setPhotometricScale(static_cast<float>(v));
     } else if (name == "odom/gicp/degeneracyThreshRatio") {
       this->gicp.setDegeneracyThreshRatio(static_cast<float>(v));
+    } else if (name == "odom/gicp/degeneracySoftness") {
+      this->gicp.setDegeneracySoftness(static_cast<float>(v));
     } else if (name == "odom/gicp/maxCorrespondenceDistance") {
       this->gicp_max_corr_dist_ = v;
       if (!this->adaptive_params_) {  // adaptive recomputes this each scan

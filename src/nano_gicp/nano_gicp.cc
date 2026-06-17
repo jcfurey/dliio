@@ -84,6 +84,30 @@ Eigen::Matrix<typename Derived::Scalar, 3, 3> skew(const Eigen::MatrixBase<Deriv
     return m;
 }
 
+// Soft degeneracy-gate keep-fraction (see nano_gicp.h). Pure and
+// type-independent so it can be unit-tested without a NanoGICP instance.
+double softGateKeepFraction(double eigval, double thresh, double softness) {
+    if (softness <= 0.0) {
+        // Binary gate: trust strictly above the threshold, hold at/below it.
+        // Matches the original `eigval <= thresh => hold the prior` test exactly,
+        // so the default path is bit-identical.
+        return (eigval > thresh) ? 1.0 : 0.0;
+    }
+    if (!(thresh > 0.0) || !(eigval > 0.0)) {
+        // Non-positive threshold or (near-)singular direction: hold the prior.
+        return 0.0;
+    }
+    // Symmetric band in log-eigenvalue space (scale-free): half-width W, centred
+    // on the threshold. eigval = thresh/(1+softness) -> 0, thresh -> 0.5,
+    // thresh*(1+softness) -> 1.
+    const double W = std::log1p(softness);        // > 0
+    const double r = std::log(eigval / thresh);   // 0 at the threshold
+    const double u = (r + W) / (2.0 * W);         // 0 at lower edge, 1 at upper
+    if (u <= 0.0) { return 0.0; }
+    if (u >= 1.0) { return 1.0; }
+    return u * u * (3.0 - 2.0 * u);               // smoothstep (C1, monotone)
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -103,6 +127,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_scale_ = 255.0f;
   this->photometric_huber_delta_ = 0.05f;
   this->degeneracy_thresh_ratio_ = 0.005f;
+  this->degeneracy_softness_ = 0.0f;   // binary gate by default (bit-identical)
   this->last_degenerate_directions_ = 0;
   this->max_corr_trans_ = 0.0f;   // per-scan correction clamp OFF by default
   this->max_corr_rot_ = 0.0f;
@@ -330,6 +355,11 @@ int NanoGICP<PointSource, PointTarget>::lastLidarMapCount() const {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setDegeneracyThreshRatio(float ratio) {
     this->degeneracy_thresh_ratio_ = ratio;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setDegeneracySoftness(float softness) {
+    this->degeneracy_softness_ = (softness > 0.f) ? softness : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -678,12 +708,21 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             const Eigen::Matrix3d Hrr = H_combined.template block<3, 3>(0, 0);
             const Eigen::Matrix3d Htt = H_combined.template block<3, 3>(3, 3);
 
+            // For each eigen-direction: a hard-degenerate direction (eigenvalue
+            // <= thresh) is counted and, if a visual/map term stiffened it, gets
+            // a bounded visual rescue; otherwise the IMU prior is held. The hold
+            // strength is a SOFT keep-fraction (softGateKeepFraction): with the
+            // default softness 0 it is the binary gate (full hold for degenerate,
+            // no-op for observable), bit-identical; with softness > 0 directions
+            // near the threshold are partially held instead of toggled, killing
+            // the scan-to-scan chatter that seeds divergence.
             const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
-                if (eig_rr.eigenvalues()(k) <= rr_thresh) {
+                const double lam = eig_rr.eigenvalues()(k);
+                const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
+                const double comp = v.dot(dx.head<3>());
+                if (lam <= rr_thresh) {
                     ++degenerate;
-                    const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
-                    const double comp = v.dot(dx.head<3>());
                     if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Hrr * v) > rr_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_r - rescued_r_used);
@@ -691,17 +730,19 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         dx.head<3>() += v * (cl - comp);
                         rescued_r_used += std::abs(cl);
                         ++rescued;
-                    } else {
-                        dx.head<3>() -= v * comp;          // hold the prior
+                        continue;  // rescued: the soft prior-hold below does not apply
                     }
                 }
+                const double keep = softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_);
+                dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
             for (int k = 0; k < 3; ++k) {
-                if (eig_tt.eigenvalues()(k) <= tt_thresh) {
+                const double lam = eig_tt.eigenvalues()(k);
+                const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
+                const double comp = v.dot(dx.tail<3>());
+                if (lam <= tt_thresh) {
                     ++degenerate;
-                    const Eigen::Vector3d v = eig_tt.eigenvectors().col(k);
-                    const double comp = v.dot(dx.tail<3>());
                     if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Htt * v) > tt_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_t - rescued_t_used);
@@ -709,10 +750,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         dx.tail<3>() += v * (cl - comp);
                         rescued_t_used += std::abs(cl);
                         ++rescued;
-                    } else {
-                        dx.tail<3>() -= v * comp;          // hold the prior
+                        continue;  // rescued: the soft prior-hold below does not apply
                     }
                 }
+                const double keep = softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_);
+                dx.tail<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
         }
         this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);

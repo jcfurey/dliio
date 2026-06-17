@@ -96,6 +96,29 @@ prior is genuinely off (real turns, wheel slip, a missed scan) -> watch for
 under-correction / lag and rising geometric RMS, not just divergence. Both
 default 0 (off) in params.yaml, so non-tunnel runs are unaffected.
 
+### Soft degeneracy gate (`degeneracySoftness` — smooths the gate boundary)
+
+`odom/gicp/degeneracySoftness` (added 2026-06-17) replaces the gate's hard
+keep/hold decision with a smoothstep ramp: instead of an eigen-direction
+flipping between full-trust (eigenvalue just above the threshold) and full
+prior-hold (just below) scan-to-scan, the kept fraction ramps smoothly across
+`[thresh/(1+softness), thresh*(1+softness)]`. It targets the **chatter** failure
+path -- a marginally-observable axis (the tunnel axis as weak geometry flickers
+in and out) toggling the gate and seeding the deg=6 collapse -- which the binary
+gate and the clamp do not address (the clamp bounds correction magnitude, the
+gate bounds direction, this bounds the *transition* between them). It does NOT
+loosen a strongly-degenerate axis: eigenvalue ~0 << thresh still keeps ~0
+(unit-tested), so genuinely unobservable dofs stay held.
+
+- Sweep **0.25 / 0.5 / 1.0** on top of B0 (orthogonal to the clamp). 0 = the
+  original binary gate, bit-identical. Wider = gentler boundary but a larger band
+  of partially-trusted directions.
+- This lever pays off only when `Degenerate Directions (current)` is itself
+  oscillating run-to-run; if it already sits stably at 1 (no flicker) expect
+  little effect. The win signature is the same ~100 m tracking with *fewer*
+  scan-to-scan jumps in the degenerate count and lower twist, not a change in the
+  steady-state count. Live-tunable.
+
 ## 3. What to log and read (exact /diagnostics keys)
 
 `ros2 topic echo /diagnostics` (or record it). Per scan, watch:

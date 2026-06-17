@@ -111,6 +111,16 @@
     # Most discriminative with regularizationMethod: plane.
     odom/gicp/degeneracyThreshRatio: 0.005
 
+    # Soft degeneracy gate: instead of toggling each eigen-direction between
+    # full-trust (above the threshold) and full prior-hold (below it), ramp the
+    # kept fraction smoothly with a smoothstep across the band
+    # [thresh/(1+softness), thresh*(1+softness)] in eigenvalue. This removes the
+    # scan-to-scan chatter when an eigenvalue hovers near the threshold (a
+    # documented divergence seed in the chaotic tunnel basin). 0.0 (default) is
+    # the original binary gate, bit-identical; ~0.5-1.0 is a gentle band. The
+    # threshold itself is still degeneracyThreshRatio above. Live-tunable.
+    odom/gicp/degeneracySoftness: 0.0
+
     # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
     # the IMU-prior initial guess). Complements the degeneracy gate: the gate
     # only holds the prior on the eigen-directions it flags (and only on the

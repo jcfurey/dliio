@@ -139,6 +139,29 @@ caps the runaway without touching healthy motion. Mechanism is unit-tested
 0.05 rad) are loose placeholders; the rot cap especially wants tightening
 (milliradian-scale per-scan yaw on a straight corridor).
 
+## Finding 7 — soft degeneracy gate (smooths the gate boundary, efficacy open)
+
+`odom/gicp/degeneracySoftness` (2026-06-17) ramps the gate's keep-fraction with a
+smoothstep across a band `[thresh/(1+s), thresh*(1+s)]` instead of toggling each
+eigen-direction between full-trust and full prior-hold at the threshold. It is a
+third, orthogonal lever on the same failure: the clamp bounds correction
+*magnitude* (Finding 6), the gate bounds correction *direction*, and this bounds
+the *transition* — the scan-to-scan chatter when a marginally-observable axis
+flickers across the threshold and toggles the prior-hold, a documented
+divergence seed. It does not loosen a strongly-degenerate axis (eigenvalue
+~0 << thresh still keeps ~0; unit-tested `SoftGateStillHoldsStronglyDegenerateAxis`),
+and `s = 0` (default) is bit-identical to the original binary gate
+(`SoftGateDisabledIsBitIdentical`). The keep-fraction is a pure free function
+with its own tests (`SoftGate.*`).
+
+**Efficacy not yet benched.** It pays off only when `Degenerate Directions` is
+itself oscillating run-to-run (not when it sits stably at 1); sweep
+**0.25 / 0.5 / 1.0** — see `doc/TUNNEL_SWEEP_RUNBOOK.md §2`. This is the first
+piece of the larger "adaptive trust-weight" direction (replace hand-tuned
+per-term weights with runtime-conditioned ones): the gate is the geometric
+term's trust model, and softening it from binary to continuous is the
+lowest-risk step toward that.
+
 ## Sensor-robustness note — intensity<->reflectivity fallback
 
 The tunnel config uses `photometricChannel: reflectivity` (calibrated, range-
