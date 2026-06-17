@@ -90,6 +90,15 @@ public:
   static SensorType detectSensorType(const std::vector<sensor_msgs::msg::PointField>& fields,
                                      bool has_points, double first_timestamp);
 
+  // Intensity<->reflectivity fallback: resolve the configured photometric channel
+  // against the fields the cloud actually carries. In/out: use_reflectivity and
+  // photometric_active are updated to the effective values -- reflectivity falls
+  // back to intensity (and vice versa) when its field is absent, or the term is
+  // disabled if neither field is present. No-op when the term is off or the
+  // requested channel is available. Static + side-effect-free for unit testing.
+  static void resolvePhotometricChannel(bool has_reflectivity, bool has_intensity,
+                                        bool& use_reflectivity, bool& photometric_active);
+
 private:
 
   struct State;
@@ -483,6 +492,9 @@ private:
   bool use_reflectivity_;
   // photometric term enabled (weight > 0); gates the intensity range correction
   bool photometric_active_;
+  // One-time intensity<->reflectivity fallback resolution against the actual
+  // cloud fields (set on the first scan; see getScanFromROS).
+  bool channel_resolved_ = false;
 
   // --- Direct visual (camera) photometric term (off by default) ---
   // Frame-to-frame direct image alignment that constrains the LiDAR-degenerate

@@ -80,3 +80,41 @@ TEST(SensorDetection, EarlierFieldWins) {
   v.push_back(field("timestamp"));
   EXPECT_EQ(dlio::OdomNode::detectSensorType(v, true, 1.7e18), SensorType::OUSTER);
 }
+
+// --- intensity <-> reflectivity fallback (resolvePhotometricChannel) ----------
+namespace {
+// Returns {use_reflectivity, photometric_active} after resolution.
+std::pair<bool, bool> resolve(bool has_refl, bool has_int, bool want_refl, bool active = true) {
+  bool use_refl = want_refl, act = active;
+  dlio::OdomNode::resolvePhotometricChannel(has_refl, has_int, use_refl, act);
+  return {use_refl, act};
+}
+}  // namespace
+
+TEST(PhotometricChannel, RequestedChannelPresentIsUnchanged) {
+  EXPECT_EQ(resolve(/*refl*/true,  /*int*/true,  /*want_refl*/true ), std::make_pair(true,  true));
+  EXPECT_EQ(resolve(/*refl*/true,  /*int*/true,  /*want_refl*/false), std::make_pair(false, true));
+  EXPECT_EQ(resolve(/*refl*/true,  /*int*/false, /*want_refl*/true ), std::make_pair(true,  true));
+  EXPECT_EQ(resolve(/*refl*/false, /*int*/true,  /*want_refl*/false), std::make_pair(false, true));
+}
+
+TEST(PhotometricChannel, ReflectivityFallsBackToIntensity) {
+  // reflectivity requested, absent, but intensity present -> intensity, still on.
+  EXPECT_EQ(resolve(/*refl*/false, /*int*/true, /*want_refl*/true), std::make_pair(false, true));
+}
+
+TEST(PhotometricChannel, IntensityFallsBackToReflectivity) {
+  // intensity requested, absent, but reflectivity present -> reflectivity, still on.
+  EXPECT_EQ(resolve(/*refl*/true, /*int*/false, /*want_refl*/false), std::make_pair(true, true));
+}
+
+TEST(PhotometricChannel, NeitherFieldDisablesTheTerm) {
+  EXPECT_EQ(resolve(/*refl*/false, /*int*/false, /*want_refl*/true ), std::make_pair(true,  false));
+  EXPECT_EQ(resolve(/*refl*/false, /*int*/false, /*want_refl*/false), std::make_pair(false, false));
+}
+
+TEST(PhotometricChannel, InactiveTermIsLeftUntouched) {
+  // Term off (weight 0): never touched, regardless of fields.
+  EXPECT_EQ(resolve(/*refl*/false, /*int*/false, /*want_refl*/true, /*active*/false),
+            std::make_pair(true, false));
+}
