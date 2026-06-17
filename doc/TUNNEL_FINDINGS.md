@@ -202,7 +202,9 @@ covered by the existing alignment + bit-identical tests). This closes the
 observability half of the adaptive-trust groundwork: gate softened (step 2),
 weights commensurable (step 1), and now the trust signals visible. The actual
 runtime adaptation (mapping these signals to per-term/per-axis weights) is the
-next, genuinely-new-behavior step and is not yet done.
+next, genuinely-new-behavior step and is not yet done — its design is written up
+in **`doc/ADAPTIVE_TRUST.md`** (default-off policy, safety/failure modes, and an
+"observe the telemetry first" pass before any code).
 
 ## Sensor-robustness note — intensity<->reflectivity fallback
 

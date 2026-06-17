@@ -154,6 +154,15 @@ The fix-specific things to confirm engaged:
   (occlusion cull removing far-side points) while `Lidar Map RMS` is **lower**
   (the kept points are real correspondences).
 
+> ADAPTIVE-TRUST "observe first" pass: the per-term trust telemetry
+> (`Geo Rot/Trans Trust Margin`, `Photometric Points`/`Residual RMS`, and the
+> existing visual/LiDAR-image count+RMS) is read-only. **Record `/diagnostics`
+> and plot these against the known map-lock / twist events BEFORE writing any
+> adaptive weighting.** The design (`doc/ADAPTIVE_TRUST.md`) is gated on this:
+> e.g. does `Geo Trans Trust Margin` actually cross ~1 at divergence onset, and
+> does `Photometric Residual RMS` rise before a map-lock or only after? That
+> determines which signal->weight mapping (and time constant) is worth building.
+
 ## 4. Decision tree after the series
 
 - **B1 reliably beats B0 (bounded rate up, twist down, ~100 m):** lock the
