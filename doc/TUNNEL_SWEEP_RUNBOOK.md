@@ -72,6 +72,30 @@ Secondary, only if needed:
 - `degeneracyThreshRatio` (0.005) and `photometricWeight` (0.3) are the B0
   tunnel config; leave fixed unless B1 regresses B0.
 
+### IMU-consistency clamp (newest lever — bounds the runaway directly)
+
+`odom/gicp/maxCorrTrans` / `odom/gicp/maxCorrRot` (added 2026-06-16) cap the
+TOTAL per-scan GICP correction vs the IMU-prior guess. It is **orthogonal to the
+gate**: the gate holds the prior on the eigen-directions it flags, on the
+~71-80% of scans it fires; this clamp bounds the final correction MAGNITUDE on
+*every* scan, including the ~20-30% the gate misses (where a map-lock jump
+otherwise seeds the full deg=6 collapse). It's the most direct bound on the two
+documented failure modes, so sweep it as a PRIMARY lever on top of B0/B1:
+
+- `maxCorrRot` — targets the **twist** mode (cumulative yaw 150-190° over a
+  ~straight corridor with 2-3 deg net heading change). Per-scan yaw correction
+  should be milliradians, so the 0.05 rad placeholder in `ouster_tunnel.yaml` is
+  loose. Sweep **0.01 / 0.02 / 0.05** rad.
+- `maxCorrTrans` — targets the **map-lock drag-back** jump. True inter-scan
+  motion (~0.1-0.2 m at tunnel speed) already lives in the IMU prior, so the
+  residual correction is cm-scale; the 0.30 m placeholder is generous. Sweep
+  **0.10 / 0.20 / 0.30** m.
+
+Failure-direction caution: too tight starves legitimate correction when the IMU
+prior is genuinely off (real turns, wheel slip, a missed scan) -> watch for
+under-correction / lag and rising geometric RMS, not just divergence. Both
+default 0 (off) in params.yaml, so non-tunnel runs are unaffected.
+
 ## 3. What to log and read (exact /diagnostics keys)
 
 `ros2 topic echo /diagnostics` (or record it). Per scan, watch:
@@ -88,6 +112,12 @@ Secondary, only if needed:
 | `CPU Starved` | 0 | 1 = this scan overran the period |
 | `Compute Overruns (cumulative)` | 0 / flat | climbing = CPU-bound run, NOT divergence |
 | `Scans Dropped est (cumulative)` | 0 | > 0 = transport dropped scans (contention) |
+
+> NOTE: the `CPU Starved` / `Realtime Factor` / `Compute Overruns` / `Scans
+> Dropped est` keys are only reliable as of the 2026-06 `scan_period` fix —
+> before it the inter-scan period was computed as 0, so all four read 0
+> regardless of actual load. If you are comparing against older logs, those
+> columns were dead there; trust them now.
 
 The fix-specific things to confirm engaged:
 - Startup log `LiDAR intensity image NxM; spherical model el=...` -> projection

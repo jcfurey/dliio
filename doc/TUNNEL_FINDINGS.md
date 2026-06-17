@@ -122,6 +122,32 @@ walls, range-normalized). Source: `results/dliio_lidarimg_ab/NOTES.md`.
   re-run the A/B **headless on free cores** (every real-time attempt so far was
   starved by co-scheduling, not the algorithm).
 
+## Finding 6 — per-scan IMU-consistency clamp (newest lever, efficacy open)
+
+`odom/gicp/maxCorrTrans` / `maxCorrRot` (2026-06-16) bound the TOTAL per-scan GICP
+correction (final pose vs the IMU-prior guess), orthogonal to the gate: the gate
+holds the prior only on the eigen-directions it flags on the ~71-80% of scans it
+fires, so on the scans it misses a map-lock jump runs away unbounded and seeds the
+deg=6 collapse. Over a ~0.1 s scan the prior is high-confidence, so the *correction*
+(not the motion — the prior contains the motion) is physically tiny; clamping it
+caps the runaway without touching healthy motion. Mechanism is unit-tested
+(MaxCorrectionClampBounds*, DisabledIsBitIdentical) and 0 = off by default.
+
+**Efficacy not yet benched.** This is the most direct bound on both failure modes
+(rot clamp -> twist; trans clamp -> drag-back), so it is now a PRIMARY sweep lever
+— see `doc/TUNNEL_SWEEP_RUNBOOK.md §2`. The `ouster_tunnel.yaml` values (0.30 m /
+0.05 rad) are loose placeholders; the rot cap especially wants tightening
+(milliradian-scale per-scan yaw on a straight corridor).
+
+## Sensor-robustness note — intensity<->reflectivity fallback
+
+The tunnel config uses `photometricChannel: reflectivity` (calibrated, range-
+normalized — the right LiDAR-only signal here). As of 2026-06 the node falls back
+to range-corrected `intensity` automatically if a cloud lacks the `reflectivity`
+field (and the COIN-LIO LiDAR-image term builds from `intensity` instead of an
+all-zero image), so this config no longer silently dies on a non-Ouster sensor or
+an Ouster topic recorded without reflectivity. The fallback is logged once.
+
 ## Recommended configs
 
 | goal | config |
