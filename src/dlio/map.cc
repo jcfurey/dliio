@@ -12,6 +12,7 @@
 
 #include "dlio/map.h"
 #include "dlio/utils.h"
+#include "rclcpp/create_timer.hpp"
 
 #include <filesystem>
 
@@ -43,8 +44,10 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
   this->declare_parameter<double>("map/publishRate", 1.0);
   this->get_parameter("map/publishRate", map_pub_rate);
   if (map_pub_rate > 0.0) {
-    this->map_pub_timer = this->create_wall_timer(
-        std::chrono::duration<double>(1.0 / map_pub_rate),
+    // Node-clock timer (respects use_sim_time): the map republish rate tracks
+    // sim time under bag replay rather than free-running on wall time.
+    this->map_pub_timer = rclcpp::create_timer(this, this->get_clock(),
+        rclcpp::Duration::from_seconds(1.0 / map_pub_rate),
         std::bind(&dlio::MapNode::publishMap, this));
   }
 

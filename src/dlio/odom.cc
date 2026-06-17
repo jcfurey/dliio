@@ -17,6 +17,7 @@
 #include <queue>
 
 #include "rclcpp/qos.hpp"
+#include "rclcpp/create_timer.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <cv_bridge/cv_bridge.hpp>
@@ -216,7 +217,15 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto imu_sub_opt = rclcpp::SubscriptionOptions();
   imu_sub_opt.callback_group = this->imu_cb_group;
-  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::SensorDataQoS(),
+  // SensorDataQoS (best-effort, to match live IMU drivers) but with a DEEP queue:
+  // the default SensorDataQoS depth is 5 (~10-50 ms at IMU rates). If the IMU
+  // callback group is briefly starved (heavy scan on a shared core, or fast bag
+  // replay), a burst beyond the queue is dropped at the middleware -> gaps ->
+  // "IMU does not cover the scan period" -> scan skip. keep_last(100) buffers
+  // ~0.2-1 s without changing reliability, so it stays compatible with
+  // best-effort live publishers.
+  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu",
+      rclcpp::SensorDataQoS().keep_last(100),
       std::bind(&dlio::OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
 
   // Camera image for the optional direct visual term (off by default). Only
@@ -279,8 +288,11 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
     this->extrinsics_ready_.store(false);
     this->tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
     this->tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*this->tf_buffer_);
-    this->extrinsics_timer_ = this->create_wall_timer(
-        std::chrono::duration<double>(0.5),
+    // Node-clock timer (rclcpp::create_timer), not create_wall_timer: it must
+    // respect use_sim_time so under bag replay it ticks on sim time (and pauses
+    // with a paused bag) consistently with the tf2 buffer's sim-time stamps.
+    this->extrinsics_timer_ = rclcpp::create_timer(this, this->get_clock(),
+        rclcpp::Duration::from_seconds(0.5),
         std::bind(&dlio::OdomNode::resolveExtrinsicsFromTf, this));
     RCLCPP_INFO(this->get_logger(),
         "extrinsics/source=tf: waiting for base_link->{imu,lidar} from tf2...");
@@ -301,7 +313,11 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->odom_ros.child_frame_id = this->baselink_frame;
   this->pose_ros.header.frame_id = this->odom_frame;
 
-  this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01), 
+  // Node-clock timer (respects use_sim_time): under bag replay the 100 Hz pose
+  // cadence tracks sim time and pauses with a paused bag, instead of free-running
+  // on wall time. Stamps are the data time regardless (publishPose uses imu_stamp).
+  this->publish_timer = rclcpp::create_timer(this, this->get_clock(),
+      rclcpp::Duration::from_seconds(0.01),
       std::bind(&dlio::OdomNode::publishPose, this));
 
   this->T = Eigen::Matrix4f::Identity();
