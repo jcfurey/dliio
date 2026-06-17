@@ -1,5 +1,15 @@
 # EXAMPLE: Ouster in a tunnel / geometrically self-similar environment.
 #
+# ⚠️ RE-DERIVE: the photometricWeight/gate values below were tuned on the
+# 06042026 bag BEFORE two setup bugs were found (2026-06-17): a 180-deg IMU-yaw
+# extrinsic error (the IMU prior was accel-backward / pitch-inverted; fixed via
+# cfg/examples/ouster_06042026_extrinsics.yaml) and a dead photometric channel
+# (pcl::VoxelGrid zeroed reflectivity/intensity; fixed in code). With the
+# extrinsic corrected, geometry-only already tracks ~200 m on this bag, so the
+# whole "needs a strong photometric weight to pin the axis" rationale below is
+# suspect. Treat 0.3 as a placeholder and re-run the sweep with BOTH fixes in
+# place (and the extrinsics overlay loaded). See doc/FINDINGS_2026-06-17.md.
+#
 # Self-contained "tunnel mode" overlay: the calibrated-reflectivity photometric
 # channel + plane regularization + the degeneracy gate, PLUS a photometric
 # weight strong enough to actually re-constrain the unobservable tunnel axis.

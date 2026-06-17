@@ -7,6 +7,30 @@ on the **06042026** dataset (Ouster OS-64 LIO bag: `/ouster/points` + `/ouster/i
 results*. Raw artifacts live in the (gitignored) `resple_test_ws/results/` dirs
 named below — the tables here are the durable record.
 
+> ⚠️ **CONFOUNDED — read before trusting Findings 1–6.** Two setup bugs were
+> discovered on 2026-06-17 (see `doc/FINDINGS_2026-06-17.md`) that corrupt
+> essentially every empirical result below:
+> 1. **180° IMU-yaw extrinsic error.** `dlio.yaml` shipped an identity
+>    `baselink2imu/R`, but the bag's `os_lidar` and `os_imu` frames are
+>    `Rz(180)` apart, so the IMU prior was fed accel-backward and pitch/roll
+>    inverted. Fixing just this extrinsic (overlay
+>    `cfg/examples/ouster_06042026_extrinsics.yaml`) took tracking from ~24 m to
+>    **~200 m of clean, geometry-only** corridor — i.e. the headline "tunnel is a
+>    chaotic, map-locking, twisting basin" symptom was **largely this config
+>    bug**, not fundamental unobservability.
+> 2. **Dead photometric channel.** `pcl::VoxelGrid` zeroed the
+>    reflectivity/intensity fields, so the photometric and LiDAR-image terms
+>    contributed *nothing* on every voxelized run (fixed in `81acb6e`).
+>
+> Net: the degeneracy-gate sweeps, `photometricWeight`, visual/LiDAR-image, and
+> clamp results below were all measured with a broken IMU prior and/or a dead
+> term. The *mechanisms* are still valid physics (a real tunnel axis is genuinely
+> unobservable), but the numbers, the "least-bad" weights, and the premise that
+> this bag *needs* photometric/visual rescue must be **re-derived** with the
+> extrinsic and voxel fixes in place. The currently-live failure on this bag is
+> the specular water-pool blow-up (`FINDINGS_2026-06-17.md` §3), not the
+> degeneracy these findings chased.
+
 ## The problem
 
 The bag traverses a long, smooth, straight rectangular **tunnel** — a

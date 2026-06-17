@@ -11,15 +11,28 @@
 dliio fuses several residual terms — geometric GICP, a photometric
 (intensity/reflectivity) term, two camera terms (frame-to-frame, frame-to-map),
 and a COIN-LIO LiDAR-intensity-image term. Each carries a hand-tuned scalar
-`weight`, and the tunnel work showed those weights are **environment-specific,
-chaotic-basin-sensitive, and expensive to find** (e.g. photometric `pw0.3` is
-"least-bad, not reliable"; the LiDAR-image weight is still open). The motivating
-question: *can the estimator switch/blend between intensity, reflectivity, VO and
-LiDAR GICP through a runtime trust model, so we stop hand-tuning per environment?*
+`weight`. The original motivating question: *can the estimator switch/blend
+between intensity, reflectivity, VO and LiDAR GICP through a runtime trust model,
+so we stop hand-tuning per environment?*
 
-Yes — but the honest version is **adaptive, observability-aware information
-weighting**, not "use whichever term fits best." This doc specifies that policy
-and the order to build it.
+> **Motivation update (2026-06-17).** This doc was first written when the tunnel
+> looked like a hard, hand-tuning-intensive degeneracy problem. Two setup bugs
+> then surfaced (`doc/FINDINGS_2026-06-17.md`): a 180° IMU-yaw extrinsic error
+> and a `VoxelGrid`-dead photometric channel. With the extrinsic fixed,
+> **geometry-only tracks ~200 m** on that bag — so "hand-tuning the aux-term
+> weights is painful" is a **weaker** motivation than it appeared; the apparent
+> pain was largely a config bug. The case for adaptive trust now rests on
+> **robustness to sensor degradation**, not on tunnel unobservability: the live
+> failure is a specular floor-water pool (`FINDINGS_2026-06-17.md` §3) where the
+> geometric floor constraint *drops out* and the photometric term gets
+> viewpoint-dependent garbage — exactly a "down-weight a term when its
+> observability/quality collapses" problem. Read the policy below through that
+> lens (graceful degradation under dropout/specular/blinding), not "tune the
+> tunnel."
+
+The honest version is **adaptive, observability-aware information weighting**,
+not "use whichever term fits best." This doc specifies that policy and the order
+to build it.
 
 ## The fusion today
 
