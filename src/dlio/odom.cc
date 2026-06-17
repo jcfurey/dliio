@@ -206,12 +206,30 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Per-scan total GICP correction rotation cap vs IMU prior [rad] (0 disables)", 0.0, 3.1416);
   this->gicp.setMaxCorrection(static_cast<float>(maxCorrTrans), static_cast<float>(maxCorrRot));
 
+  // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
+  // nominal residual count so its weight is independent of how many points are
+  // valid that scan (and comparable across terms) -- the same trick the LiDAR-
+  // image term already uses internally. 0 (default) = OFF (raw mass, bit-
+  // identical). NOTE: enabling RE-SCALES the term's effective weight, so a tuned
+  // weight (e.g. photometricWeight) must be re-derived once.
+  double photometricRefCount, visualRefCount, visualMapRefCount;
+  dlio::declare_param(this, "odom/gicp/photometricRefCount", photometricRefCount, 0.0,
+      "Photometric term mass-normalization nominal count (live-tunable; 0 = off/raw)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/gicp/visualRefCount", visualRefCount, 0.0,
+      "Frame-to-frame visual term mass-normalization nominal count (0 = off/raw)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/gicp/visualMapRefCount", visualMapRefCount, 0.0,
+      "Frame-to-map visual term mass-normalization nominal count (0 = off/raw)", 0.0, 1e6);
+  this->gicp.setPhotometricRefCount(static_cast<float>(photometricRefCount));
+  this->gicp.setVisualRefCount(static_cast<float>(visualRefCount));
+  this->gicp.setVisualMapRefCount(static_cast<float>(visualMapRefCount));
+
   // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
   // the background thread, so it needs the same photometric configuration.
   this->gicp_temp.setPhotometricWeight(photometricWeight);
   this->gicp_temp.setGradientKNeighbors(gradientKNeighbors);
   this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
   this->gicp_temp.setPhotometricScale(static_cast<float>(photometricScale));
+  this->gicp_temp.setPhotometricRefCount(static_cast<float>(photometricRefCount));
   this->gicp_temp.setRegularizationMethod(reg_method);
 
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1013,7 +1031,7 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   static const std::set<std::string> kLive = {
     "odom/gicp/photometricWeight", "odom/gicp/photometricHuberDelta",
     "odom/gicp/photometricScale", "odom/gicp/degeneracyThreshRatio",
-    "odom/gicp/degeneracySoftness",
+    "odom/gicp/degeneracySoftness", "odom/gicp/photometricRefCount",
     "odom/gicp/maxCorrespondenceDistance",
     "odom/keyframe/threshD", "odom/keyframe/threshR",
     "odom/geo/Kp", "odom/geo/Kv", "odom/geo/Kq", "odom/geo/Kab",
@@ -1056,6 +1074,9 @@ void dlio::OdomNode::applyLiveParams() {
       this->gicp.setDegeneracyThreshRatio(static_cast<float>(v));
     } else if (name == "odom/gicp/degeneracySoftness") {
       this->gicp.setDegeneracySoftness(static_cast<float>(v));
+    } else if (name == "odom/gicp/photometricRefCount") {
+      this->gicp.setPhotometricRefCount(static_cast<float>(v));
+      this->gicp_temp.setPhotometricRefCount(static_cast<float>(v));
     } else if (name == "odom/gicp/maxCorrespondenceDistance") {
       this->gicp_max_corr_dist_ = v;
       if (!this->adaptive_params_) {  // adaptive recomputes this each scan
@@ -3134,6 +3155,7 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");
   kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
+  kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));

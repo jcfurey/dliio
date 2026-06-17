@@ -132,6 +132,23 @@
     odom/gicp/maxCorrTrans: 0.0          # [m]   per-scan correction cap; 0 = off
     odom/gicp/maxCorrRot: 0.0            # [rad] per-scan correction cap; 0 = off
 
+    # Term mass-normalization (opt-in). Each residual term accumulates into a
+    # shared information-form Hessian (H += weight * J^T J); for the photometric
+    # and camera terms the accumulated "mass" scales with how many points happen
+    # to be valid that scan, so the tuned weight drifts with scan density and is
+    # not comparable across terms. Setting a RefCount > 0 scales that term's
+    # total mass to a nominal reference count (the same trick the LiDAR-image
+    # term uses internally), making the weight count-independent and stable
+    # run-to-run -- the precondition for comparing/auto-balancing the terms.
+    # 0.0 (default) = OFF (raw mass, bit-identical to before).
+    # IMPORTANT: enabling a RefCount RE-SCALES that term's effective weight
+    # (weight * ref/count), so a previously tuned weight must be re-derived once.
+    # A good starting reference is roughly the term's typical valid-point count
+    # (photometric: ~1000-3000 valid-gradient matches; camera terms: far fewer).
+    odom/gicp/photometricRefCount: 0.0   # photometric term; live-tunable; 0 = off
+    odom/gicp/visualRefCount: 0.0        # frame-to-frame camera term;     0 = off
+    odom/gicp/visualMapRefCount: 0.0     # frame-to-map camera term;       0 = off
+
     # Photometric (intensity-aided) GICP term. Weight of the photometric
     # residual relative to the geometric term; 0.0 disables. The channel is
     # normalized by photometricScale, so the weight is dimensionless. In

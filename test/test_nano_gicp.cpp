@@ -46,6 +46,27 @@ Cloud::Ptr makeCorner(float extent, float step) {
   return cloud;
 }
 
+// Corner geometry carrying a smooth spatial intensity/reflectivity ramp, so the
+// photometric term has non-zero target gradients and actually engages.
+Cloud::Ptr makeIntensityCorner(float extent, float step) {
+  auto cloud = std::make_shared<Cloud>();
+  auto add = [&](float x, float y, float z) {
+    dlio::Point p;
+    p.x = x; p.y = y; p.z = z;
+    p.intensity = 100.f + 40.f * x + 25.f * y + 15.f * z;  // smooth ramp -> gradient
+    p.reflectivity = p.intensity;
+    cloud->push_back(p);
+  };
+  for (float a = step; a <= extent; a += step) {
+    for (float b = step; b <= extent; b += step) {
+      add(a, b, 0.f);  // floor
+      add(0.f, a, b);  // wall x=0
+      add(a, 0.f, b);  // wall y=0
+    }
+  }
+  return cloud;
+}
+
 Cloud::Ptr transformCloud(const Cloud::ConstPtr& in, const Eigen::Matrix4f& T) {
   auto out = std::make_shared<Cloud>();
   pcl::transformPointCloud(*in, *out, T);
@@ -293,6 +314,104 @@ TEST(NanoGICP, SoftGateStillHoldsStronglyDegenerateAxis) {
   const float translation_norm = g.getFinalTransformation().block<3, 1>(0, 3).norm();
   EXPECT_LT(translation_norm, 0.05f);
   EXPECT_GE(g.lastDegenerateDirections(), 2);  // still flags the unobservable dofs
+}
+
+// --- Term mass-normalization (refCountScale + the photometric path) ---
+
+TEST(RefCountScale, OffReturnsRawScale) {
+  // refcount <= 0 -> 1.0 (normalization off, raw mass, bit-identical path).
+  EXPECT_EQ(nano_gicp::refCountScale(0.0, 5000), 1.0);
+  EXPECT_EQ(nano_gicp::refCountScale(-3.0, 5000), 1.0);
+}
+
+TEST(RefCountScale, NoResidualsReturnsZero) {
+  // refcount > 0 but no points this scan -> 0 contribution.
+  EXPECT_EQ(nano_gicp::refCountScale(1000.0, 0), 0.0);
+  EXPECT_EQ(nano_gicp::refCountScale(1000.0, -1), 0.0);
+}
+
+TEST(RefCountScale, RatioOtherwiseAndLidarParity) {
+  EXPECT_DOUBLE_EQ(nano_gicp::refCountScale(1000.0, 2000), 0.5);
+  EXPECT_DOUBLE_EQ(nano_gicp::refCountScale(500.0, 100), 5.0);
+  // refcount == count -> 1.0; ref=1000 reproduces the LiDAR-image kLidarRefCount.
+  EXPECT_DOUBLE_EQ(nano_gicp::refCountScale(1000.0, 1000), 1.0);
+}
+
+TEST(RefCountScale, NormalizedMassIsCountIndependent) {
+  // The whole point: a term whose RAW mass scales with the residual count has a
+  // NORMALIZED mass that does not. mass(count) * scale(ref,count) == unit*ref.
+  const double ref = 1000.0, unit_mass = 3.5;
+  double prev = -1.0;
+  for (long count = 10; count <= 100000; count *= 10) {
+    const double raw_mass = unit_mass * static_cast<double>(count);  // mass ~ count
+    const double normalized = raw_mass * nano_gicp::refCountScale(ref, count);
+    EXPECT_NEAR(normalized, unit_mass * ref, 1e-9);   // count-free
+    if (prev >= 0.0) { EXPECT_NEAR(normalized, prev, 1e-9); }
+    prev = normalized;
+  }
+}
+
+// Photometric normalization OFF (default 0) must take the exact raw shared-
+// accumulator path: result equals the never-configured default bit-for-bit.
+TEST(NanoGICP, PhotometricNormalizationDisabledIsBitIdentical) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](bool set_zero) {
+    auto g = makeGICP();
+    g.setPhotometricWeight(0.5f);                 // engage photometric (gradients on setInputTarget)
+    if (set_zero) { g.setPhotometricRefCount(0.f); }
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);        // never configured -> default 0
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));      // explicit 0: exact
+}
+
+// The new per-scan photometric residual count is tracked (diagnostic + future
+// adaptive weighting), and is 0 when the photometric term is off.
+TEST(NanoGICP, PhotometricCountIsTracked) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.02f, -0.01f, 0.03f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g = makeGICP();
+  g.setPhotometricWeight(0.5f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  EXPECT_GT(g.lastPhotometricCount(), 0);          // photometric engaged
+
+  auto g0 = makeGICP();                            // no photometric weight
+  g0.setInputTarget(target);
+  g0.setInputSource(source);
+  Cloud a0; g0.align(a0);
+  EXPECT_EQ(g0.lastPhotometricCount(), 0);
+}
+
+// Normalization ON must keep the solve healthy (the separate-accumulator + scale
+// fold-in path runs, no NaN, still converges on well-conditioned geometry).
+TEST(NanoGICP, PhotometricNormalizationOnStillConverges) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g = makeGICP();
+  g.setPhotometricWeight(0.5f);
+  g.setPhotometricRefCount(1000.f);                // normalization ON
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  ASSERT_TRUE(g.hasConverged());
+  const Eigen::Matrix4f T = g.getFinalTransformation();
+  const float err = (T.block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm();
+  EXPECT_LT(err, 0.03f);
 }
 
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {

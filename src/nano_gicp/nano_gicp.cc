@@ -108,6 +108,15 @@ double softGateKeepFraction(double eigval, double thresh, double softness) {
     return u * u * (3.0 - 2.0 * u);               // smoothstep (C1, monotone)
 }
 
+// Term mass-normalization scale (see nano_gicp.h). Pure and type-independent so
+// it is unit-tested directly. refcount=1000 reproduces the LiDAR-image term's
+// historical kLidarRefCount factor exactly.
+double refCountScale(double refcount, long count) {
+    if (refcount <= 0.0) { return 1.0; }            // normalization off: raw mass
+    if (count <= 0)      { return 0.0; }            // on, but no residuals
+    return refcount / static_cast<double>(count);
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -126,6 +135,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_use_reflectivity_ = false;
   this->photometric_scale_ = 255.0f;
   this->photometric_huber_delta_ = 0.05f;
+  this->photometric_ref_count_ = 0.0f;   // mass-normalization OFF by default (raw)
+  this->last_photometric_count_ = 0;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->degeneracy_softness_ = 0.0f;   // binary gate by default (bit-identical)
   this->last_degenerate_directions_ = 0;
@@ -133,6 +144,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->max_corr_rot_ = 0.0f;
   this->visual_enabled_ = false;
   this->visual_weight_ = 0.0f;
+  this->visual_ref_count_ = 0.0f;        // mass-normalization OFF by default (raw)
   this->visual_huber_delta_ = 0.05f;
   this->visual_fx_ = this->visual_fy_ = this->visual_cx_ = this->visual_cy_ = 0.0f;
   this->T_cw_cur_ = Eigen::Isometry3f::Identity();
@@ -143,6 +155,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->last_visual_count_ = 0;
   this->last_visual_rescued_ = 0;
   this->visual_map_weight_ = 0.0f;
+  this->visual_map_ref_count_ = 0.0f;    // mass-normalization OFF by default (raw)
   this->visual_map_gate_max_trans_ = 1.0f;
   this->visual_map_gate_max_rot_ = 0.1f;
   this->visual_map_view_angle_max_ = 0.6f;  // ~34 deg
@@ -217,6 +230,16 @@ void NanoGICP<PointSource, PointTarget>::setPhotometricHuberDelta(float delta) {
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setPhotometricRefCount(float ref_count) {
+    this->photometric_ref_count_ = (ref_count > 0.f) ? ref_count : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastPhotometricCount() const {
+    return this->last_photometric_count_;
+}
+
+template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setVisualEnabled(bool on) {
     this->visual_enabled_ = on;
 }
@@ -224,6 +247,11 @@ void NanoGICP<PointSource, PointTarget>::setVisualEnabled(bool on) {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setVisualWeight(float weight) {
     this->visual_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualRefCount(float ref_count) {
+    this->visual_ref_count_ = (ref_count > 0.f) ? ref_count : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -277,6 +305,11 @@ int NanoGICP<PointSource, PointTarget>::lastVisualRescuedDirections() const {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setVisualMapWeight(float weight) {
     this->visual_map_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualMapRefCount(float ref_count) {
+    this->visual_map_ref_count_ = (ref_count > 0.f) ? ref_count : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -865,11 +898,26 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
     std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
     double cost_sum = 0.0;
-    
+    double photo_cost_sum = 0.0;
+
     bool use_photometric = (photometric_weight_ > 1e-8)
         && target_intensity_gradients_ && !target_intensity_gradients_->empty();
-    
-    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum)
+
+    // Opt-in photometric mass-normalization: when on, accumulate the photometric
+    // contribution into a SEPARATE accumulator so its total Hessian mass can be
+    // scaled to a nominal reference count (making photometricWeight independent
+    // of the valid-gradient point count, and comparable to the other terms).
+    // When off, the photometric term accumulates into the shared H_private below
+    // exactly as before -> bit-identical. The residual count is tallied either
+    // way (diagnostic + future adaptive weighting).
+    const bool normalize_photo = use_photometric && (this->photometric_ref_count_ > 0.f);
+    std::vector<Eigen::Matrix<double, 6, 6>> Hp_private(
+        normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> bp_private(
+        normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 1>::Zero());
+    std::vector<long> photo_count_private(num_threads_, 0);
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum)
     for(int i = 0; i < input_->size(); ++i) {
         int thread_num = omp_get_thread_num();
         int target_index = correspondences_[i];
@@ -923,9 +971,18 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
                     weight *= photometric_huber_delta_ / abs_r;
                 }
-                H_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
-                b_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
-                cost_sum += weight * intensity_diff * intensity_diff;
+                ++photo_count_private[thread_num];
+                if (normalize_photo) {
+                    // Separate accumulator: scaled to the reference count post-loop.
+                    Hp_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
+                    bp_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
+                    photo_cost_sum += weight * intensity_diff * intensity_diff;
+                } else {
+                    // Raw (default): shared accumulator, bit-identical to before.
+                    H_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
+                    b_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
+                    cost_sum += weight * intensity_diff * intensity_diff;
+                }
             }
         }
     }
@@ -935,6 +992,24 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         (*b) += b_private[i];
     }
     if (cost != nullptr) { *cost = cost_sum; }
+
+    // Photometric residual count (tallied regardless of normalization).
+    long photo_count = 0;
+    for (int i = 0; i < num_threads_; ++i) { photo_count += photo_count_private[i]; }
+    this->last_photometric_count_ = static_cast<int>(photo_count);
+
+    // Opt-in mass-normalization: scale the separate photometric accumulator to
+    // the nominal reference count and fold it in. (When off, the photometric
+    // term was already summed into H_private above -> bit-identical.)
+    if (normalize_photo) {
+        Eigen::Matrix<double, 6, 6> Hp_sum = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> bp_sum = Eigen::Matrix<double, 6, 1>::Zero();
+        for (int i = 0; i < num_threads_; ++i) { Hp_sum += Hp_private[i]; bp_sum += bp_private[i]; }
+        const double norm = refCountScale(static_cast<double>(this->photometric_ref_count_), photo_count);
+        (*H) += Hp_sum * norm;
+        (*b) += bp_sum * norm;
+        if (cost != nullptr) { *cost += photo_cost_sum * norm; }
+    }
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1039,11 +1114,24 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
         count += 1;
     }
 
-    for (int t = 0; t < num_threads_; ++t) {
-        (*H) += H_private[t];
-        (*b) += b_private[t];
+    // Opt-in mass-normalization (see refCountScale): off (default) keeps the
+    // exact per-thread reduction -> bit-identical; on scales the term's total
+    // mass to visual_ref_count_ so visual_weight_ is count-independent.
+    if (this->visual_ref_count_ > 0.f) {
+        Eigen::Matrix<double, 6, 6> H_sum = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> b_sum = Eigen::Matrix<double, 6, 1>::Zero();
+        for (int t = 0; t < num_threads_; ++t) { H_sum += H_private[t]; b_sum += b_private[t]; }
+        const double norm = refCountScale(static_cast<double>(this->visual_ref_count_), count);
+        (*H) += H_sum * norm;
+        (*b) += b_sum * norm;
+        if (cost != nullptr) { *cost += cost_sum * norm; }
+    } else {
+        for (int t = 0; t < num_threads_; ++t) {
+            (*H) += H_private[t];
+            (*b) += b_private[t];
+        }
+        if (cost != nullptr) { *cost += cost_sum; }
     }
-    if (cost != nullptr) { *cost += cost_sum; }
     this->last_visual_count_ = static_cast<int>(count);
     this->last_visual_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
@@ -1142,11 +1230,24 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualMapResidual(
         count += 1;
     }
 
-    for (int t = 0; t < num_threads_; ++t) {
-        (*H) += H_private[t];
-        (*b) += b_private[t];
+    // Opt-in mass-normalization (see refCountScale): off (default) keeps the
+    // exact per-thread reduction -> bit-identical; on scales the term's total
+    // mass to visual_map_ref_count_ so visual_map_weight_ is count-independent.
+    if (this->visual_map_ref_count_ > 0.f) {
+        Eigen::Matrix<double, 6, 6> H_sum = Eigen::Matrix<double, 6, 6>::Zero();
+        Eigen::Matrix<double, 6, 1> b_sum = Eigen::Matrix<double, 6, 1>::Zero();
+        for (int t = 0; t < num_threads_; ++t) { H_sum += H_private[t]; b_sum += b_private[t]; }
+        const double norm = refCountScale(static_cast<double>(this->visual_map_ref_count_), count);
+        (*H) += H_sum * norm;
+        (*b) += b_sum * norm;
+        if (cost != nullptr) { *cost += cost_sum * norm; }
+    } else {
+        for (int t = 0; t < num_threads_; ++t) {
+            (*H) += H_private[t];
+            (*b) += b_private[t];
+        }
+        if (cost != nullptr) { *cost += cost_sum; }
     }
-    if (cost != nullptr) { *cost += cost_sum; }
     this->last_visual_map_count_ = static_cast<int>(count);
     this->last_visual_map_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
@@ -1292,8 +1393,8 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
         H_sum += H_private[t];
         b_sum += b_private[t];
     }
-    constexpr double kLidarRefCount = 1000.0;
-    const double norm = (count > 0) ? (kLidarRefCount / static_cast<double>(count)) : 0.0;
+    constexpr double kLidarRefCount = 1000.0;  // always-on for this term (validated)
+    const double norm = refCountScale(kLidarRefCount, count);
     (*H) += H_sum * norm;
     (*b) += b_sum * norm;
     if (cost != nullptr) { *cost += cost_sum * norm; }

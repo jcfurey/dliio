@@ -162,6 +162,30 @@ per-term weights with runtime-conditioned ones): the gate is the geometric
 term's trust model, and softening it from binary to continuous is the
 lowest-risk step toward that.
 
+## Finding 8 — term mass-normalization (commensurable weights, the other step-1 half)
+
+The photometric and camera terms accumulated into the shared Hessian **raw**, so
+each term's mass scaled with however many points were valid that scan: the tuned
+`weight` drifted with scan density and was not comparable across terms (the same
+problem the LiDAR-image term already fixed internally with `kLidarRefCount`).
+2026-06-17 generalizes that: `odom/gicp/{photometricRefCount, visualRefCount,
+visualMapRefCount}` scale each term's total mass to a nominal reference count via
+the shared `refCountScale(refcount, count)` helper (now also the LiDAR-image
+term's path, bit-identical). All default **0 = OFF (raw, bit-identical** —
+`PhotometricNormalizationDisabledIsBitIdentical`), and the count-independence
+property is unit-tested directly (`RefCountScale.NormalizedMassIsCountIndependent`).
+A new `Photometric Points` diagnostic exposes the per-scan photometric residual
+count (previously untracked).
+
+**Caveat:** enabling a RefCount **re-scales that term's effective weight**
+(`weight·ref/count`), so a tuned weight — notably the tunnel config's
+`photometricWeight: 0.3` — must be re-derived once on the bench (n≥3, chaotic
+basin) before the normalized config is trusted. Left off by default so the
+validated `ouster_tunnel.yaml` is unchanged. This is the **other half of step 1**
+(with the soft gate): commensurable, density-stable weights are the precondition
+for any cross-term adaptive weighting; this change makes the weights comparable
+but does not yet adapt them at runtime.
+
 ## Sensor-robustness note — intensity<->reflectivity fallback
 
 The tunnel config uses `photometricChannel: reflectivity` (calibrated, range-

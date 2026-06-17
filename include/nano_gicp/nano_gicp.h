@@ -77,6 +77,14 @@ enum class RegularizationMethod { NONE, MIN_EIG, NORMALIZED_MIN_EIG, PLANE, FROB
 // Free function (type-independent, pure) so it is cheap to unit-test.
 double softGateKeepFraction(double eigval, double thresh, double softness);
 
+// Mass-normalization scale for a residual term whose Hessian contribution scales
+// with the (variable) number of valid residuals that scan. Multiplying the
+// term's accumulated H/b/cost by this makes the tuned `weight` count-independent
+// and comparable across terms. refcount <= 0 -> 1.0 (normalization OFF: raw,
+// bit-identical); refcount > 0 with count <= 0 -> 0.0 (no points, no
+// contribution); otherwise refcount/count. Pure free function (unit-tested).
+double refCountScale(double refcount, long count);
+
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
 
@@ -118,6 +126,15 @@ public:
   // Huber threshold on the (normalized) photometric residual; residuals
   // beyond it are IRLS-downweighted. <= 0 disables robustification.
   void setPhotometricHuberDelta(float delta);
+  // Mass-normalize the photometric term to this nominal residual count so
+  // photometricWeight is independent of how many valid-gradient matches a scan
+  // has (and comparable to the other terms). 0 (default) = OFF (raw mass,
+  // bit-identical). Enabling RE-SCALES the effective weight (weight*ref/count),
+  // so the tuned photometricWeight must be re-derived once. See refCountScale().
+  void setPhotometricRefCount(float ref_count);
+  // Number of photometric residuals accumulated during the last align() (the
+  // valid-gradient correspondences). Tracked regardless of normalization.
+  int lastPhotometricCount() const;
 
   // --- Direct visual (camera) photometric term (off by default) ---
   // Frame-to-frame direct image alignment using LiDAR depth. Each current-scan
@@ -132,6 +149,9 @@ public:
   // frames are set.
   void setVisualEnabled(bool on);
   void setVisualWeight(float weight);
+  // Mass-normalize the frame-to-frame visual term to this nominal residual
+  // count (see setPhotometricRefCount). 0 (default) = OFF (raw, bit-identical).
+  void setVisualRefCount(float ref_count);
   // Huber threshold on the (normalized) visual residual; <= 0 disables.
   void setVisualHuberDelta(float delta);
   void setVisualIntrinsics(float fx, float fy, float cx, float cy);
@@ -160,6 +180,9 @@ public:
   // from the prior pose. Weight and per-scan gate budget are separate from the
   // frame-to-frame term's.
   void setVisualMapWeight(float weight);
+  // Mass-normalize the frame-to-map visual term to this nominal residual count
+  // (see setPhotometricRefCount). 0 (default) = OFF (raw, bit-identical).
+  void setVisualMapRefCount(float ref_count);
   void setVisualMapGateMaxStep(float max_trans, float max_rot);
   void setVisualMapViewAngleMax(float radians);   // reject refs whose viewing ray moved more than this
   void setTargetVisualRefs(const std::shared_ptr<const VisualRefList>& refs);
@@ -321,6 +344,8 @@ protected:
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
   float photometric_scale_;            // channel full-scale; channel is divided by this
   float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
+  float photometric_ref_count_;        // mass-normalization nominal count; 0 = off (raw)
+  int last_photometric_count_;         // valid-gradient residuals in the last align()
   float degeneracy_thresh_ratio_;
   float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
   int last_degenerate_directions_;
@@ -333,6 +358,7 @@ protected:
   // --- Direct visual (camera) photometric term state ---
   bool visual_enabled_;
   float visual_weight_;
+  float visual_ref_count_;      // mass-normalization nominal count; 0 = off (raw)
   float visual_huber_delta_;
   float visual_fx_, visual_fy_, visual_cx_, visual_cy_;
   cv::Mat visual_cur_;          // current image (fixed reference brightness), CV_32F 1ch
@@ -347,6 +373,7 @@ protected:
 
   // --- Frame-to-MAP camera term state ---
   float visual_map_weight_;
+  float visual_map_ref_count_;  // mass-normalization nominal count; 0 = off (raw)
   float visual_map_gate_max_trans_;
   float visual_map_gate_max_rot_;
   float visual_map_view_angle_max_;   // [rad] max viewing-ray deviation before a ref is rejected
