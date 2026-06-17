@@ -1,0 +1,46 @@
+# EXTRINSICS overlay for the 06042026 Ouster dataset (os_lidar + internal os_imu).
+#
+# WHY THIS EXISTS
+# The cloud arrives in frame os_lidar and the IMU in os_imu. Per the bag's
+# /tf_static, those two frames are 180 deg apart in YAW (the standard Ouster
+# convention): os_sensor->os_lidar = Rz(180), os_sensor->os_imu = identity, so
+# os_lidar->os_imu = Rz(180). dlio.yaml ships extrinsics/source: yaml with an
+# IDENTITY baselink2imu/R, i.e. it fuses the IMU and LiDAR as if aligned. That
+# 180 deg yaw is therefore NOT applied, which (Rz(180) = diag(-1,-1,1)):
+#   - flips accel X/Y  -> the motion prior points BACKWARD
+#   - flips gyro pitch (about Y) and roll (about X) -> pitch/roll priors integrate
+#     the WRONG way; in a pitch-degenerate tunnel the LiDAR can't correct it
+#     -> pitch wobble / the map "fans" about the lateral axis
+#   - leaves yaw (about Z) and gravity-Z intact -> startup gravity-align looks
+#     healthy and nothing errors, which is why the bug was not obvious.
+# (extrinsics/source: tf is NOT a fix here: the bag's os_* frames are not
+#  connected to base_link in the static tree, so tf can't resolve them.)
+#
+# THE FIX
+# Treat base_link as aligned with os_lidar (baselink2lidar/R = identity) and put
+# the real os_lidar->os_imu rotation in baselink2imu/R. Rz(180) is symmetric
+# (its own inverse), so this rotation is correct regardless of the R storage
+# convention; only the small translation is convention-dependent (and minor).
+#
+# USAGE: merge AFTER dlio.yaml so it overrides the identity defaults, e.g. append
+#   --params-file .../cfg/examples/ouster_06042026_extrinsics.yaml
+# alongside ouster_tunnel.yaml.
+
+/**:
+  ros__parameters:
+    extrinsics/source: yaml
+
+    # os_lidar -> os_imu rotation = Rz(180 deg) = diag(-1, -1, 1).
+    extrinsics/baselink2imu/R: [ -1.,  0.,  0.,
+                                  0., -1.,  0.,
+                                  0.,  0.,  1. ]
+    # os_lidar -> os_imu translation [m], composed from /tf_static
+    # (os_sensor->os_lidar t=[0,0,0.038] Rz180; os_sensor->os_imu t=[-0.002,-0.010,0.008]).
+    # Small; the rotation above is the load-bearing correction.
+    extrinsics/baselink2imu/t: [ 0.002, 0.010, -0.030 ]
+
+    # base_link == os_lidar frame.
+    extrinsics/baselink2lidar/R: [ 1., 0., 0.,
+                                   0., 1., 0.,
+                                   0., 0., 1. ]
+    extrinsics/baselink2lidar/t: [ 0., 0., 0. ]
