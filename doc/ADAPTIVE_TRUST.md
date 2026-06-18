@@ -170,6 +170,12 @@ against a signal that turns out to be a lagging indicator.
 
 ## Prior art
 
+> A full survey of the relevant papers and OSS packages — with a dliio-specific
+> "what's portable and how invasive" shortlist — is in
+> `doc/ROBUSTNESS_RESEARCH.md`. The most aligned external method is Super
+> Odometry / SuperLoc's per-direction confidence (γ_trans/γ_rot → prior
+> covariance), which is essentially this doc's Layer-2 routing computed pre-solve.
+
 - Robust M-estimators / IRLS — already in dliio (Huber on the photometric/visual
   residuals).
 - Switchable constraints (Sünderhauf & Protzel) and dynamic covariance scaling
