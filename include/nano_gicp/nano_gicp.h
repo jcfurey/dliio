@@ -95,6 +95,22 @@ double refCountScale(double refcount, long count);
 double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
                             double clamp_floor);
 
+// Probabilistic degeneracy keep-fraction -- a tractable adaptation of Hatleskog &
+// Alexis, "Probabilistic Degeneracy Detection for Point-to-Plane Error
+// Minimization," IEEE RA-L 2024 (arXiv:2410.10784). Returns the per-direction
+// confidence that the geometric signal exceeds the noise floor by a factor
+// `confidence_s`, used to softly attenuate the update along that eigen-direction
+// (their pseudo-inverse scaling lambda+ = p / lambda). p = Phi( ln(eigval /
+// (s*noise_floor)) / spread ), Phi = standard-normal CDF: p=0.5 at eigval =
+// s*noise_floor, ->1 well above, ->0 well below. Unlike a ratio*lambda_max
+// threshold, `noise_floor` is an ABSOLUTE (sensor-noise-derived) quantity, so the
+// observability test transfers across scenes/sensors. NOTE: the paper forward-
+// propagates sensor noise to get a PER-DIRECTION noise variance; here noise_floor
+// is a configured per-block scalar (the deferred faithful extension). spread<=0
+// gives a hard step at s*noise_floor; noise_floor<=0 returns 1 (no model).
+double probGateKeepFraction(double eigval, double noise_floor, double confidence_s,
+                            double spread);
+
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
 
@@ -259,6 +275,13 @@ public:
   // [thresh/(1+softness), thresh*(1+softness)] so near-threshold directions are
   // not toggled abruptly between trust and hold. See softGateKeepFraction().
   void setDegeneracySoftness(float softness);
+  // Probabilistic degeneracy gate (see probGateKeepFraction): when enabled, the
+  // per-direction hold strength is a confidence probability that the eigenvalue
+  // exceeds an absolute (sensor-noise) floor, instead of the ratio/smoothstep
+  // gate. noise_floor_* are per-block (rot rad^2 / trans m^2); 0 falls back to
+  // the ratio threshold. Disabled (default) -> bit-identical to the soft gate.
+  void setProbabilisticGate(bool enabled, float noise_floor_rot, float noise_floor_trans,
+                            float confidence_s, float spread);
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
   // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
@@ -376,6 +399,15 @@ protected:
   float last_photometric_rms_;         // telemetry: unweighted photometric residual RMS
   float degeneracy_thresh_ratio_;
   float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
+  // Probabilistic gate (Hatleskog & Alexis RA-L 2024 adaptation); off -> the
+  // ratio/smoothstep gate above is used (bit-identical). Noise floors are the
+  // absolute per-block (rad^2 / m^2) eigenvalue noise; 0 falls back to the
+  // ratio threshold as the floor (probit shape over the existing gate).
+  bool  prob_gate_enabled_;
+  float prob_noise_floor_rot_;
+  float prob_noise_floor_trans_;
+  float prob_confidence_s_;            // signal must exceed s * noise floor
+  float prob_spread_;                  // probit transition width (log-eigenvalue)
   int last_degenerate_directions_;
   float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a

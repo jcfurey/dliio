@@ -141,6 +141,26 @@
     # threshold itself is still degeneracyThreshRatio above. Live-tunable.
     odom/gicp/degeneracySoftness: 0.0
 
+    # Probabilistic degeneracy gate -- adaptation of Hatleskog & Alexis,
+    # "Probabilistic Degeneracy Detection for Point-to-Plane Error Minimization,"
+    # IEEE RA-L 2024 (arXiv:2410.10784). Instead of holding the prior on
+    # eigen-directions below ratio*lambda_max, the per-direction hold strength
+    # becomes the confidence that the eigenvalue exceeds an ABSOLUTE noise floor
+    # by a factor confidenceS: p = Phi(ln(eigval/(s*floor))/spread). Because the
+    # floor is a sensor-noise quantity (not a ratio of the per-scan max
+    # eigenvalue), the observability test transfers across scenes/sensors -- the
+    # documented weakness of the Zhang single-threshold gate. Set noiseFloorRot
+    # [rad^2] / noiseFloorTrans [m^2] from the sensor's propagated point/normal
+    # noise; 0 falls back to the ratio threshold (a probit-shaped soft gate).
+    # NOTE: the paper auto-propagates noise to a PER-DIRECTION variance; here the
+    # floor is a configured per-block scalar (the faithful extension is deferred).
+    # OFF by default -> the ratio/smoothstep gate above is used, bit-identical.
+    odom/gicp/probGate/enabled: false
+    odom/gicp/probGate/noiseFloorRot: 0.0     # [rad^2] 0 = use ratio threshold
+    odom/gicp/probGate/noiseFloorTrans: 0.0   # [m^2]   0 = use ratio threshold
+    odom/gicp/probGate/confidenceS: 1.0       # signal must exceed s * noise floor
+    odom/gicp/probGate/spread: 1.0            # probit width (log-eigenvalue units)
+
     # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
     # the IMU-prior initial guess). Complements the degeneracy gate: the gate
     # only holds the prior on the eigen-directions it flags (and only on the

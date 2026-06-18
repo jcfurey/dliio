@@ -198,6 +198,28 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Soft-gate band half-width (multiplicative; live-tunable; 0 = binary gate)", 0.0, 10.0);
   this->gicp.setDegeneracySoftness(static_cast<float>(degeneracySoftness));
 
+  // Probabilistic degeneracy gate (Hatleskog & Alexis, IEEE RA-L 2024 adaptation,
+  // arXiv:2410.10784): the per-direction hold strength becomes the confidence
+  // that the eigenvalue clears an ABSOLUTE (sensor-noise) floor, rather than a
+  // ratio*lambda_max threshold -- so the observability test transfers across
+  // scenes/sensors. noiseFloor{Rot,Trans} are the per-block eigenvalue noise
+  // (rad^2 / m^2); 0 falls back to the ratio threshold (probit shape over the
+  // existing gate). OFF by default -> the ratio/smoothstep gate, bit-identical.
+  bool probGateEnabled;
+  double probNoiseFloorRot, probNoiseFloorTrans, probConfidenceS, probSpread;
+  dlio::declare_param(this, "odom/gicp/probGate/enabled", probGateEnabled, false);
+  dlio::declare_param(this, "odom/gicp/probGate/noiseFloorRot", probNoiseFloorRot, 0.0,
+      "Absolute rotation-block eigenvalue noise floor [rad^2] (0 = use ratio thresh)", 0.0, 1e12);
+  dlio::declare_param(this, "odom/gicp/probGate/noiseFloorTrans", probNoiseFloorTrans, 0.0,
+      "Absolute translation-block eigenvalue noise floor [m^2] (0 = use ratio thresh)", 0.0, 1e12);
+  dlio::declare_param(this, "odom/gicp/probGate/confidenceS", probConfidenceS, 1.0,
+      "Signal must exceed s * noise floor (paper's confidence factor)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/probGate/spread", probSpread, 1.0,
+      "Probit transition width in log-eigenvalue units", 0.0, 100.0);
+  this->gicp.setProbabilisticGate(probGateEnabled, static_cast<float>(probNoiseFloorRot),
+      static_cast<float>(probNoiseFloorTrans), static_cast<float>(probConfidenceS),
+      static_cast<float>(probSpread));
+
   // Per-scan IMU-consistency clamp: bound the TOTAL GICP correction (final pose
   // vs the IMU-prior initial guess) per scan. Caps map-lock/divergence runaway
   // along the intermittently un-gated degenerate axis without touching healthy

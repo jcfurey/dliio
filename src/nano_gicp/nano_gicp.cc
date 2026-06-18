@@ -131,6 +131,19 @@ double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
     return floor + (1.0 - floor) * s;               // linear blend
 }
 
+// Probabilistic degeneracy keep-fraction (see nano_gicp.h; Hatleskog & Alexis,
+// RA-L 2024 adaptation). Pure and unit-tested.
+double probGateKeepFraction(double eigval, double noise_floor, double confidence_s,
+                            double spread) {
+    if (noise_floor <= 0.0) { return 1.0; }         // no noise model -> no attenuation
+    if (eigval <= 0.0) { return 0.0; }              // singular direction -> fully held
+    const double s = (confidence_s > 0.0) ? confidence_s : 1.0;
+    const double center = s * noise_floor;          // eigenvalue at which p = 0.5
+    if (spread <= 0.0) { return (eigval > center) ? 1.0 : 0.0; }   // hard step
+    const double z = std::log(eigval / center) / spread;
+    return 0.5 * std::erfc(-z / 1.4142135623730951);   // Phi(z) = 0.5*erfc(-z/sqrt(2))
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -154,6 +167,11 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->last_photometric_rms_ = 0.0f;
   this->degeneracy_thresh_ratio_ = 0.005f;
   this->degeneracy_softness_ = 0.0f;   // binary gate by default (bit-identical)
+  this->prob_gate_enabled_ = false;    // probabilistic gate OFF by default
+  this->prob_noise_floor_rot_ = 0.0f;
+  this->prob_noise_floor_trans_ = 0.0f;
+  this->prob_confidence_s_ = 1.0f;
+  this->prob_spread_ = 1.0f;
   this->last_degenerate_directions_ = 0;
   this->last_geo_rot_margin_ = -1.0f;    // telemetry; -1 = gate disabled / not computed
   this->last_geo_trans_margin_ = -1.0f;
@@ -429,6 +447,17 @@ void NanoGICP<PointSource, PointTarget>::setDegeneracyThreshRatio(float ratio) {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setDegeneracySoftness(float softness) {
     this->degeneracy_softness_ = (softness > 0.f) ? softness : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setProbabilisticGate(bool enabled, float noise_floor_rot,
+                                                             float noise_floor_trans,
+                                                             float confidence_s, float spread) {
+    this->prob_gate_enabled_ = enabled;
+    this->prob_noise_floor_rot_   = (noise_floor_rot   > 0.f) ? noise_floor_rot   : 0.f;
+    this->prob_noise_floor_trans_ = (noise_floor_trans > 0.f) ? noise_floor_trans : 0.f;
+    this->prob_confidence_s_ = (confidence_s > 0.f) ? confidence_s : 1.f;
+    this->prob_spread_ = spread;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -820,7 +849,15 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         continue;  // rescued: the soft prior-hold below does not apply
                     }
                 }
-                const double keep = softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_);
+                // Probabilistic gate (Hatleskog & Alexis): keep-fraction is the
+                // confidence the eigenvalue clears an absolute noise floor; 0
+                // floor -> fall back to the ratio threshold (probit shape). Off
+                // -> the ratio/smoothstep soft gate (bit-identical).
+                const double keep = this->prob_gate_enabled_
+                    ? probGateKeepFraction(lam,
+                        (this->prob_noise_floor_rot_ > 0.f) ? this->prob_noise_floor_rot_ : rr_thresh,
+                        this->prob_confidence_s_, this->prob_spread_)
+                    : softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_);
                 dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
@@ -843,7 +880,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         continue;  // rescued: the soft prior-hold below does not apply
                     }
                 }
-                const double keep = softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_);
+                const double keep = this->prob_gate_enabled_
+                    ? probGateKeepFraction(lam,
+                        (this->prob_noise_floor_trans_ > 0.f) ? this->prob_noise_floor_trans_ : tt_thresh,
+                        this->prob_confidence_s_, this->prob_spread_)
+                    : softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_);
                 dx.tail<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
         }

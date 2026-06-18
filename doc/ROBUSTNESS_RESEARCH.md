@@ -30,7 +30,7 @@ that drag the pose down. The shortlist prioritizes that.
 |---|---|---|---|---|
 | 1 | Ground-plane prior + sub-ground point reject — **IMPLEMENTED (off by default)** as `odom/preprocessing/subFloorReject/*`; per-cell gravity-aligned dense-bin floor, not benched on the pool yet | water-pool mode (b) ghosts | new preprocessing stage (uses the now-trusted IMU gravity) | Low |
 | 2 | Trigger an IMU-prior lean when the floor constraint collapses — **IMPLEMENTED (off by default)** as `odom/gicp/adaptiveClamp/*`; the clamp caps tighten as the `Geo Trust Margin` degrades | water-pool mode (a) dropout | the `Geo Trust Margin` telemetry → the IMU-consistency clamp | Low–med |
-| 3 | Probabilistic soft-attenuation in the gate (per-direction SNR) | degeneracy brittleness | replaces the `degeneracySoftness` smoothstep | Low–med |
+| 3 | Probabilistic soft-attenuation in the gate (per-direction SNR) — **IMPLEMENTED (off by default)** as `odom/gicp/probGate/*` (Hatleskog & Alexis adaptation; absolute noise-floor confidence, full per-direction noise propagation deferred) | degeneracy brittleness | `degeneracySoftness` smoothstep → probit confidence | Low–med |
 | 4 | Per-direction trust from correspondence Jacobians (SuperLoc/X-ICP) | adaptive trust Layer 2 | the per-axis routing in `ADAPTIVE_TRUST.md` | Medium |
 | 5 | Chebrolu adaptive-α robust kernel | outlier-tuning burden | replaces the fixed Huber in the IRLS path | Low |
 | 6 | Dual-return / sub-ground reject *(if Ouster 2nd returns are populated)* | glass/mirror ghosts | preprocessing reject | Low (conditional) |
@@ -87,7 +87,13 @@ threshold weakness. Upgrade path (mostly ETH/Hutter + NTNU lines):
   Hessian, compute per-eigen-direction probability *p* that signal exceeds noise,
   and scale the update's pseudo-inverse by *p*. Reuses the existing block
   eigendecomposition; replaces a hand-shaped keep-fraction with a noise-derived
-  one. **The single most natural next step for the soft gate.**
+  one. **IMPLEMENTED** as `odom/gicp/probGate/*` (off by default): the
+  per-direction hold is a probit confidence `p = Φ(ln(eigval/(s·floor))/spread)`
+  against an *absolute* per-block noise floor (so it transfers across
+  scenes/sensors, unlike `ratio·λmax`). Simplification vs. the paper: the floor
+  is a configured per-block scalar, not auto-propagated to a per-direction
+  variance — that forward propagation (from the GICP per-point covariances) is
+  the deferred faithful extension.
 - **X-ICP / LP-ICP** (Tuna/Nubert/Hutter, T-RO 2024 / arXiv 2025) — per-direction
   localizability from the *correspondence* Jacobians projected onto the
   rotation/translation eigenvectors dliio already computes (`(Jᵢ·vⱼ)²`

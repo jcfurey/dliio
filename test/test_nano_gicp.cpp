@@ -567,6 +567,87 @@ TEST(NanoGICP, AdaptiveClampDegenerateRegimeTightensCap) {
   EXPECT_LT(adapt_norm, 0.05f * 0.25f + 1e-3f);     // ~ base * floor = 0.0125
 }
 
+// --- Probabilistic degeneracy gate (Hatleskog & Alexis RA-L 2024 adaptation) ---
+
+TEST(ProbGate, NoModelOrSingularEdges) {
+  EXPECT_DOUBLE_EQ(nano_gicp::probGateKeepFraction(1.0, 0.0, 1.0, 1.0), 1.0);   // no floor -> no attenuation
+  EXPECT_DOUBLE_EQ(nano_gicp::probGateKeepFraction(-1.0, 1.0, 1.0, 1.0), 0.0);  // singular -> held
+  EXPECT_DOUBLE_EQ(nano_gicp::probGateKeepFraction(0.0, 1.0, 1.0, 1.0), 0.0);
+}
+
+TEST(ProbGate, HalfAtSTimesFloor) {
+  EXPECT_NEAR(nano_gicp::probGateKeepFraction(1.0, 1.0, 1.0, 1.0), 0.5, 1e-9);  // eigval = s*floor
+  EXPECT_NEAR(nano_gicp::probGateKeepFraction(2.0, 1.0, 2.0, 1.0), 0.5, 1e-9);  // s scales the centre
+}
+
+TEST(ProbGate, SaturatesAndMonotone) {
+  EXPECT_GT(nano_gicp::probGateKeepFraction(1e6, 1.0, 1.0, 1.0), 0.999);
+  EXPECT_LT(nano_gicp::probGateKeepFraction(1e-6, 1.0, 1.0, 1.0), 0.001);
+  double prev = -1.0;
+  for (double e = 0.1; e <= 10.0; e += 0.1) {
+    const double p = nano_gicp::probGateKeepFraction(e, 1.0, 1.0, 1.0);
+    EXPECT_GE(p, 0.0); EXPECT_LE(p, 1.0);
+    EXPECT_GE(p, prev - 1e-12);
+    prev = p;
+  }
+}
+
+TEST(ProbGate, SpreadZeroIsHardStep) {
+  EXPECT_DOUBLE_EQ(nano_gicp::probGateKeepFraction(2.0, 1.0, 1.0, 0.0), 1.0);
+  EXPECT_DOUBLE_EQ(nano_gicp::probGateKeepFraction(0.5, 1.0, 1.0, 0.0), 0.0);
+}
+
+// Disabled (default) -> the ratio/smoothstep gate, bit-identical.
+TEST(NanoGICP, ProbGateDisabledIsBitIdentical) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+  auto run = [&](bool set_off) {
+    auto g = makeGICP();
+    if (set_off) { g.setProbabilisticGate(false, 0.f, 0.f, 1.f, 1.f); }
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));
+}
+
+// floors=0 -> ratio threshold is the noise floor; the unobservable in-plane
+// translation (eigenvalue << thresh) gets p~0 and is held, like the soft gate.
+TEST(NanoGICP, ProbGateFallbackHoldsDegenerateAxis) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+  auto g = makeGICP();
+  g.setProbabilisticGate(true, 0.f, 0.f, 1.0f, 0.5f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  const float tnorm = g.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(tnorm, 0.05f);
+  EXPECT_GE(g.lastDegenerateDirections(), 2);
+}
+
+// A sharp probit keeps observable directions ~fully -> a corner still recovers.
+TEST(NanoGICP, ProbGatePreservesWellConditioned) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+  auto g = makeGICP();
+  g.setProbabilisticGate(true, 0.f, 0.f, 1.0f, /*sharp*/0.3f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  ASSERT_TRUE(g.hasConverged());
+  const float terr = (g.getFinalTransformation().block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm();
+  EXPECT_LT(terr, 0.03f);
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).
