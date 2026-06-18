@@ -462,6 +462,111 @@ TEST(NanoGICP, GeoTrustMarginReflectsConditioning) {
   EXPECT_LT(gp.lastGeoTransMargin(), gc.lastGeoTransMargin());
 }
 
+// --- Margin-adaptive clamp (clampScaleFromMargin + the clamp path) ---
+
+TEST(ClampScale, HealthyMarginUsesBaseCap) {
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(5.0, 1.0, 3.0, 0.25), 1.0);   // >= hi
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(3.0, 1.0, 3.0, 0.25), 1.0);   // == hi
+}
+
+TEST(ClampScale, DegenerateMarginTightensToFloor) {
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(1.0, 1.0, 3.0, 0.25), 0.25);  // == lo
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(0.2, 1.0, 3.0, 0.25), 0.25);  // < lo
+}
+
+TEST(ClampScale, BlendsLinearlyBetween) {
+  EXPECT_NEAR(nano_gicp::clampScaleFromMargin(2.0, 1.0, 3.0, 0.25), 0.625, 1e-12);  // s=0.5
+  // monotone non-decreasing in margin
+  double prev = -1.0;
+  for (double m = 0.0; m <= 4.0; m += 0.25) {
+    const double s = nano_gicp::clampScaleFromMargin(m, 1.0, 3.0, 0.25);
+    EXPECT_GE(s, 0.25 - 1e-12);
+    EXPECT_LE(s, 1.0 + 1e-12);
+    EXPECT_GE(s, prev - 1e-12);
+    prev = s;
+  }
+}
+
+TEST(ClampScale, UnknownMarginDoesNotTighten) {
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(-1.0, 1.0, 3.0, 0.25), 1.0);  // gate off
+}
+
+TEST(ClampScale, DegenerateBandAndFloorClamp) {
+  // hi <= lo -> step at margin_lo
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(2.0, 3.0, 3.0, 0.25), 0.25);
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(3.0, 3.0, 3.0, 0.25), 1.0);
+  // floor clamped into [0,1]
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(1.0, 1.0, 3.0, -5.0), 0.0);
+  EXPECT_DOUBLE_EQ(nano_gicp::clampScaleFromMargin(1.0, 1.0, 3.0,  5.0), 1.0);
+}
+
+// Adaptive clamp OFF (default) must be bit-identical to the plain base cap.
+TEST(NanoGICP, AdaptiveClampDisabledIsBitIdentical) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.20f, 0.0f, 0.0f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](bool set_off) {
+    auto g = makeGICP();
+    g.setMaxCorrection(0.05f, 0.f);
+    if (set_off) { g.setAdaptiveClamp(false, 1.f, 3.f, 0.25f); }
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);          // never configured -> default off
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));        // explicit off: exact
+}
+
+// Forcing the HEALTHY regime (margin thresholds well below the corner's high
+// margin) -> scale 1 -> the base cap is used, identical to base-cap-only.
+TEST(NanoGICP, AdaptiveClampHealthyRegimeUsesBaseCap) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.20f, 0.0f, 0.0f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](bool adaptive) {
+    auto g = makeGICP();
+    g.setMaxCorrection(0.05f, 0.f);
+    if (adaptive) { g.setAdaptiveClamp(true, /*lo*/0.1f, /*hi*/0.2f, 0.25f); }  // corner margin >> hi
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation().block<3, 1>(0, 3).norm();
+  };
+  EXPECT_NEAR(run(true), run(false), 1e-5f);   // healthy -> no tightening
+}
+
+// Forcing the DEGENERATE regime (margin thresholds well ABOVE the corner margin)
+// -> scale = floor -> the cap tightens to base*floor end-to-end.
+TEST(NanoGICP, AdaptiveClampDegenerateRegimeTightensCap) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.20f, 0.0f, 0.0f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto base_cap = makeGICP();
+  base_cap.setMaxCorrection(0.05f, 0.f);
+  base_cap.setInputTarget(target);
+  base_cap.setInputSource(source);
+  Cloud a0; base_cap.align(a0);
+  const float base_norm = base_cap.getFinalTransformation().block<3, 1>(0, 3).norm();
+  ASSERT_NEAR(base_norm, 0.05f, 5e-3f);   // base cap bites at 0.05
+
+  auto adapt = makeGICP();
+  adapt.setMaxCorrection(0.05f, 0.f);
+  adapt.setAdaptiveClamp(true, /*lo*/1e6f, /*hi*/2e6f, /*floor*/0.25f);  // corner margin << lo
+  adapt.setInputTarget(target);
+  adapt.setInputSource(source);
+  Cloud a1; adapt.align(a1);
+  const float adapt_norm = adapt.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(adapt_norm, base_norm);                 // tighter than the base cap
+  EXPECT_LT(adapt_norm, 0.05f * 0.25f + 1e-3f);     // ~ base * floor = 0.0125
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).

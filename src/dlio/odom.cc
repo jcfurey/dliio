@@ -209,6 +209,23 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Per-scan total GICP correction rotation cap vs IMU prior [rad] (0 disables)", 0.0, 3.1416);
   this->gicp.setMaxCorrection(static_cast<float>(maxCorrTrans), static_cast<float>(maxCorrRot));
 
+  // Margin-adaptive clamp: tighten the maxCorrection caps as the geometric trust
+  // margin degrades, so the correction is bounded toward the IMU prior under
+  // degeneracy (e.g. a specular floor dropout taking the vertical/pitch
+  // constraint). Off by default -> the base caps above are used unchanged.
+  // Requires a base cap (>0) and the degeneracy gate on (for the margins).
+  bool adaptiveClampEnabled;
+  double clampMarginLo, clampMarginHi, clampFloor;
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/enabled", adaptiveClampEnabled, false);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/marginLo", clampMarginLo, 1.0,
+      "Trust margin at/below which the clamp is fully tightened", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/marginHi", clampMarginHi, 3.0,
+      "Trust margin at/above which the base cap is used (no tightening)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/floor", clampFloor, 0.25,
+      "Tightest cap fraction at full degeneracy (multiplier in (0,1])", 0.0, 1.0);
+  this->gicp.setAdaptiveClamp(adaptiveClampEnabled, static_cast<float>(clampMarginLo),
+      static_cast<float>(clampMarginHi), static_cast<float>(clampFloor));
+
   // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
   // nominal residual count so its weight is independent of how many points are
   // valid that scan (and comparable across terms) -- the same trick the LiDAR-

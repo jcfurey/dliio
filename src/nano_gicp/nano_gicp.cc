@@ -117,6 +117,20 @@ double refCountScale(double refcount, long count) {
     return refcount / static_cast<double>(count);
 }
 
+// Margin-adaptive clamp scale (see nano_gicp.h). Pure and unit-tested.
+double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
+                            double clamp_floor) {
+    if (margin < 0.0) { return 1.0; }               // unknown observability: don't tighten
+    const double floor = (clamp_floor < 0.0) ? 0.0 : (clamp_floor > 1.0 ? 1.0 : clamp_floor);
+    if (!(margin_hi > margin_lo)) {                 // degenerate band: step at margin_lo
+        return (margin >= margin_hi) ? 1.0 : floor;
+    }
+    double s = (margin - margin_lo) / (margin_hi - margin_lo);   // 0 at lo, 1 at hi
+    if (s <= 0.0) { return floor; }
+    if (s >= 1.0) { return 1.0; }
+    return floor + (1.0 - floor) * s;               // linear blend
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -145,6 +159,10 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->last_geo_trans_margin_ = -1.0f;
   this->max_corr_trans_ = 0.0f;   // per-scan correction clamp OFF by default
   this->max_corr_rot_ = 0.0f;
+  this->adaptive_clamp_enabled_ = false;   // margin-adaptive clamp OFF -> base caps
+  this->clamp_margin_lo_ = 1.0f;
+  this->clamp_margin_hi_ = 3.0f;
+  this->clamp_floor_ = 0.25f;
   this->visual_enabled_ = false;
   this->visual_weight_ = 0.0f;
   this->visual_ref_count_ = 0.0f;        // mass-normalization OFF by default (raw)
@@ -417,6 +435,15 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setMaxCorrection(float max_trans, float max_rot) {
     this->max_corr_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
     this->max_corr_rot_   = (max_rot   > 0.f) ? max_rot   : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setAdaptiveClamp(bool enabled, float margin_lo,
+                                                         float margin_hi, float clamp_floor) {
+    this->adaptive_clamp_enabled_ = enabled;
+    this->clamp_margin_lo_ = margin_lo;
+    this->clamp_margin_hi_ = margin_hi;
+    this->clamp_floor_ = (clamp_floor < 0.f) ? 0.f : (clamp_floor > 1.f ? 1.f : clamp_floor);
 }
 
 template <typename PointSource, typename PointTarget>
@@ -855,19 +882,31 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // (gate bounds per-iteration step direction; this bounds final magnitude).
     // 0 = off (each cap independent), so default behavior is bit-identical.
     if (this->max_corr_trans_ > 0.f || this->max_corr_rot_ > 0.f) {
+        // Margin-adaptive: tighten each cap as that block's trust margin degrades
+        // (floor dropout collapses the trans/pitch margin -> tighter cap -> lean on
+        // the IMU prior on exactly the axes that lost observability). Disabled ->
+        // scale 1 -> base caps unchanged (bit-identical).
+        float eff_trans = this->max_corr_trans_;
+        float eff_rot   = this->max_corr_rot_;
+        if (this->adaptive_clamp_enabled_) {
+            eff_trans *= static_cast<float>(clampScaleFromMargin(this->last_geo_trans_margin_,
+                this->clamp_margin_lo_, this->clamp_margin_hi_, this->clamp_floor_));
+            eff_rot   *= static_cast<float>(clampScaleFromMargin(this->last_geo_rot_margin_,
+                this->clamp_margin_lo_, this->clamp_margin_hi_, this->clamp_floor_));
+        }
         // World/left-frame correction: trans = corr * trans_init.
         Eigen::Isometry3f corr = trans * trans_init.inverse();
-        if (this->max_corr_trans_ > 0.f) {
+        if (eff_trans > 0.f) {
             const Eigen::Vector3f t = corr.translation();
             const float n = t.norm();
-            if (n > this->max_corr_trans_) {
-                corr.translation() = t * (this->max_corr_trans_ / n);
+            if (n > eff_trans) {
+                corr.translation() = t * (eff_trans / n);
             }
         }
-        if (this->max_corr_rot_ > 0.f) {
+        if (eff_rot > 0.f) {
             Eigen::AngleAxisf aa(corr.rotation());  // .rotation() is orthonormalized
-            if (aa.angle() > this->max_corr_rot_) {
-                aa.angle() = this->max_corr_rot_;
+            if (aa.angle() > eff_rot) {
+                aa.angle() = eff_rot;
                 corr.linear() = aa.toRotationMatrix();
             }
         }

@@ -152,6 +152,21 @@
     odom/gicp/maxCorrTrans: 0.0          # [m]   per-scan correction cap; 0 = off
     odom/gicp/maxCorrRot: 0.0            # [rad] per-scan correction cap; 0 = off
 
+    # Margin-adaptive clamp: make the caps above TIGHTEN as the geometric trust
+    # margin (Geo Rot/Trans Trust Margin in /diagnostics) degrades, so the
+    # correction is bounded toward the IMU prior exactly where observability
+    # collapses -- e.g. a specular floor dropout removing the vertical/pitch
+    # constraint (the "lean on the IMU when the floor drops" response). The rot
+    # margin scales the rot cap, the trans margin the trans cap. Effective cap =
+    # base * f(margin): f = 1 at margin >= marginHi (healthy), f = floor at
+    # margin <= marginLo (degenerate; margin ~1 is the gate boundary), linear
+    # between. OFF by default -> base caps unchanged (bit-identical). REQUIRES a
+    # base cap (>0 above) and the degeneracy gate on (for the margins).
+    odom/gicp/adaptiveClamp/enabled: false
+    odom/gicp/adaptiveClamp/marginLo: 1.0   # fully tightened at/below this margin
+    odom/gicp/adaptiveClamp/marginHi: 3.0   # base cap at/above this margin
+    odom/gicp/adaptiveClamp/floor: 0.25     # tightest cap fraction at full degeneracy
+
     # Term mass-normalization (opt-in). Each residual term accumulates into a
     # shared information-form Hessian (H += weight * J^T J); for the photometric
     # and camera terms the accumulated "mass" scales with how many points happen

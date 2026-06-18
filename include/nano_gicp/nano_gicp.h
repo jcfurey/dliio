@@ -85,6 +85,16 @@ double softGateKeepFraction(double eigval, double thresh, double softness);
 // contribution); otherwise refcount/count. Pure free function (unit-tested).
 double refCountScale(double refcount, long count);
 
+// Margin-adaptive clamp scale: shrinks the IMU-consistency clamp cap as the
+// geometric trust margin degrades, so the correction is bounded harder toward the
+// IMU prior exactly where observability collapses (e.g. a specular floor dropout
+// taking the vertical/pitch constraint). Returns a multiplier in [clamp_floor, 1]:
+// 1 when margin >= margin_hi (healthy, full base cap), clamp_floor when
+// margin <= margin_lo (degenerate, tightest), linear between. margin < 0 (gate
+// off / not computed) returns 1 (no tightening when observability is unknown).
+double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
+                            double clamp_floor);
+
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
 
@@ -258,6 +268,13 @@ public:
   // tiny; this caps runaway along the intermittently un-gated degenerate axis.
   // 0 (default) disables each cap independently (no behavior change).
   void setMaxCorrection(float max_trans, float max_rot);
+  // Margin-adaptive clamp: when enabled, the maxCorrection caps are scaled down
+  // as the per-axis geometric trust margin degrades (rot margin -> rot cap,
+  // trans margin -> trans cap), leaning on the IMU prior under degeneracy (e.g.
+  // specular floor dropout). Requires a base cap (>0) and the degeneracy gate on
+  // (for the margins). Disabled (default) -> the base caps are used unchanged
+  // (bit-identical). See clampScaleFromMargin().
+  void setAdaptiveClamp(bool enabled, float margin_lo, float margin_hi, float clamp_floor);
 
   virtual void setInputSource(const PointCloudSourceConstPtr& cloud) override;
   virtual void setInputTarget(const PointCloudTargetConstPtr& cloud) override;
@@ -364,6 +381,10 @@ protected:
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a
   float max_corr_trans_;               // [m]   per-scan total-correction translation cap; 0 = off
   float max_corr_rot_;                 // [rad] per-scan total-correction rotation cap;    0 = off
+  bool  adaptive_clamp_enabled_;       // scale the caps by the trust margin; off = base caps
+  float clamp_margin_lo_;              // margin at/below which the cap is fully tightened
+  float clamp_margin_hi_;              // margin at/above which the base cap is used (no tightening)
+  float clamp_floor_;                  // tightest cap fraction (multiplier in (0,1]) at full degeneracy
 
   std::shared_ptr<const GradientList> target_intensity_gradients_;
   std::shared_ptr<const std::vector<bool>> gradient_valid_;
