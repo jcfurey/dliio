@@ -226,12 +226,20 @@
     # (the original motivation: stop tuning photometric robustness per scene).
     # alpha is restricted to (0,2]: 2 = L2 (clean), 1 = pseudo-Huber, ->0 = Cauchy
     # (heavy outliers); the fitted value is published as "Photometric Kernel
-    # Alpha". scale is Barron's c (0 reuses photometricHuberDelta). OFF by default
-    # -> the fixed Huber, bit-identical. (alpha<0 truncated-loss extension deferred.)
+    # Alpha". The Barron weight is FLOORED by the fixed Huber above, so enabling
+    # the kernel can only ADD robustness, never strip it (it falls back to exactly
+    # the Huber at alpha=2). scale is Barron's c: 0 = DATA-DRIVEN (1.4826*MAD of
+    # the residuals each scan, published as "Photometric Kernel Scale"); >0 = a
+    # fixed c. OFF by default -> the fixed Huber, bit-identical. (alpha<0
+    # truncated-loss extension deferred.)
+    # NOTE (2026-06-18 bench): an EARLIER version replaced the Huber and used a
+    # fixed c=photometricHuberDelta > the residual bulk, so alpha pinned at L2 and
+    # stripped protection (-> divergence). The Huber floor + MAD scale above fix
+    # both; still UNBENCHED on the bag after the fix.
     odom/gicp/adaptiveKernel/enabled: false
     odom/gicp/adaptiveKernel/alphaLo: 0.5   # most-robust shape the fit may pick
     odom/gicp/adaptiveKernel/alphaHi: 2.0   # least-robust shape (2 = L2)
-    odom/gicp/adaptiveKernel/scale: 0.0     # Barron c; 0 = reuse photometricHuberDelta
+    odom/gicp/adaptiveKernel/scale: 0.0     # Barron c; 0 = data-driven (1.4826*MAD)
 
     # Photometric channel:
     #   intensity    - raw return strength (range-dependent); uses the range

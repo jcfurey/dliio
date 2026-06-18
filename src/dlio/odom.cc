@@ -3365,6 +3365,7 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
   kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));
+  kv("Photometric Kernel Scale", fnum(this->gicp.lastKernelScale(), 4));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));

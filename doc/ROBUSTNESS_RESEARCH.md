@@ -32,7 +32,7 @@ that drag the pose down. The shortlist prioritizes that.
 | 2 | Trigger an IMU-prior lean when the floor constraint collapses — **IMPLEMENTED (off by default)** as `odom/gicp/adaptiveClamp/*`; the clamp caps tighten as the `Geo Trust Margin` degrades | water-pool mode (a) dropout | the `Geo Trust Margin` telemetry → the IMU-consistency clamp | Low–med |
 | 3 | Probabilistic soft-attenuation in the gate (per-direction SNR) — **IMPLEMENTED (off by default)** as `odom/gicp/probGate/*` (Hatleskog & Alexis adaptation; absolute noise-floor confidence, full per-direction noise propagation deferred) | degeneracy brittleness | `degeneracySoftness` smoothstep → probit confidence | Low–med |
 | 4 | Per-direction trust from correspondence Jacobians (SuperLoc/X-ICP) | adaptive trust Layer 2 | the per-axis routing in `ADAPTIVE_TRUST.md` | Medium |
-| 5 | Chebrolu adaptive-α robust kernel — **IMPLEMENTED (off by default)** as `odom/gicp/adaptiveKernel/*`; Barron loss + per-iteration NLL α-fit on the photometric residual, α∈(0,2] | outlier-tuning burden | replaces the fixed photometric Huber in the IRLS path | Low |
+| 5 | Chebrolu adaptive-α robust kernel — **IMPLEMENTED, off by default** as `odom/gicp/adaptiveKernel/*`; Barron loss + NLL α-fit, **Huber-floored + data-driven MAD scale** after the 2026-06-18 bench (see status note). Unbenched since the fix. | outlier-tuning burden | floors/extends the photometric Huber | Low |
 | 6 | Dual-return / sub-ground reject *(if Ouster 2nd returns are populated)* | glass/mirror ghosts | preprocessing reject | Low (conditional) |
 | 7 | *(optional, heavier)* GenZ-ICP adaptive plane↔point blend | dropout ill-conditioning | the GICP residual/weighting | Medium |
 
@@ -40,6 +40,29 @@ that drag the pose down. The shortlist prioritizes that.
 with the telemetry already added — the `Geo Trans/Rot Trust Margin` collapsing *is*
 the floor-dropout detector, and can trigger leaning on the (post-extrinsic-fix,
 now-trustworthy) IMU on exactly the pitch/Z axes that lost their constraint.
+
+## Validation status (read before trusting any knob)
+
+Everything below is **off by default and unit-tested**, but "implemented" is not
+"validated." The 2026-06-18 clean-harness n=5 sweep (`doc/FINDINGS_2026-06-18.md`)
+is the only bench so far, and its verdict is sobering: **only geometry+gate is
+stable; every auxiliary constraint term destabilizes the tunnel basin or is
+broken.** Per feature:
+
+| feature | bench status (2026-06-18) |
+|---|---|
+| #1 sub-floor reject | **inert on this segment** — 0 points rejected at default params (no water-pool signature here); mechanism verified live, target failure mode not present to test against |
+| #2 margin-adaptive clamp | **bounding, not fixing** — a global magnitude limiter can't add the missing along-axis observation; the gate already fully holds the prior and it still sloshes |
+| #3 probabilistic gate | **unbenched in isolation** |
+| #5 adaptive kernel | **was harmful, now fixed** — bench found it stripped the Huber and pinned α at L2 → divergence; fixed (Huber floor + MAD scale), **unbenched since the fix** |
+| soft gate / mass-norm / telemetry | telemetry confirmed useful (the trust margin localized the real bug); the rest unbenched in isolation |
+
+Bigger conclusion from the bench: the along-axis tunnel degeneracy is **not solved
+by any current term**, and a scalar weight does not reliably move the divergence
+basin. The highest-value lever is a **working camera visual term** (independent
+wall-texture info) — currently `Visual Points = 0`; instrumented in `c3c7df9`
+(read `Visual Match dt` / `Visual Rejects` to localize). See
+`doc/FINDINGS_2026-06-18.md` and `doc/FINDINGS_2026-06-17.md`.
 
 ---
 
@@ -178,7 +201,11 @@ LVI-SAM/learned-covariance per-scan.
   (lagged one iteration), with the partition function cached by numerical
   integration. The fitted α is published as `Photometric Kernel Alpha`.
   Simplification vs. the paper: α restricted to (0,2] (the α<0 truncated-loss
-  extension is deferred).
+  extension is deferred). **2026-06-18 bench caught a defect** (the kernel replaced
+  the Huber and at α=2 stripped all protection; a fixed `c` larger than the
+  residual bulk pinned α at L2). **Fixed**: the Barron weight is now floored by the
+  Huber (`min`, so it can only add robustness), and `scale: 0` means a data-driven
+  `c = 1.4826·MAD` of the residuals (published as `Photometric Kernel Scale`).
 - **GNC** (Yang et al., RA-L 2020): anneal convex→true robust cost; robust to
   ~70–80% outliers (empirical, no global guarantee); wraps the IRLS loop. Only if
   high-outlier regimes appear.

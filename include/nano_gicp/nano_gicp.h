@@ -129,6 +129,9 @@ double barronLogPartition(double alpha);
 // N*logZ(alpha) over a grid in [alpha_lo, alpha_hi] (clamped to (0,2]).
 double fitBarronAlpha(const std::vector<float>& residuals, double c,
                       double alpha_lo, double alpha_hi);
+// Robust scale estimate (1.4826 * median|r|, the MAD sigma) for the Barron c, so
+// the kernel's scale tracks the residual noise instead of a hand-set constant.
+double barronScaleMad(const std::vector<float>& residuals);
 
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
@@ -315,6 +318,8 @@ public:
   void setAdaptiveKernel(bool enabled, float alpha_lo, float alpha_hi, float scale);
   // Alpha fitted in the last align() (2 = L2/clean, lower = more outliers).
   float lastKernelAlpha() const;
+  // Barron scale c in effect in the last align() (data-driven MAD when scale<=0).
+  float lastKernelScale() const;
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
   // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
@@ -449,6 +454,7 @@ protected:
   float kernel_scale_;                 // Barron scale c; 0 -> reuse photometric_huber_delta_
   float current_alpha_;                // alpha in effect this iteration (lagged fit)
   float last_fit_alpha_;               // diagnostic: alpha fitted in the last linearize()
+  float current_kernel_c_;             // Barron scale in effect (data-driven MAD when scale<=0)
   int last_degenerate_directions_;
   float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a

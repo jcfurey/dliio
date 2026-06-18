@@ -213,6 +213,15 @@ double fitBarronAlpha(const std::vector<float>& residuals, double c,
     return best_alpha;
 }
 
+double barronScaleMad(const std::vector<float>& residuals) {
+    if (residuals.empty()) { return 0.05; }   // fallback ~ the default photometric Huber delta
+    std::vector<float> a(residuals.size());
+    for (size_t i = 0; i < residuals.size(); ++i) { a[i] = std::abs(residuals[i]); }
+    std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+    const double med = static_cast<double>(a[a.size() / 2]);  // median|r| ~= MAD (residuals ~0-mean)
+    return std::max(1e-4, 1.4826 * med);                      // robust sigma, floored away from 0
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -247,6 +256,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->kernel_scale_ = 0.0f;               // 0 -> reuse photometric_huber_delta_
   this->current_alpha_ = 2.0f;
   this->last_fit_alpha_ = 2.0f;
+  this->current_kernel_c_ = 0.05f;
   this->last_degenerate_directions_ = 0;
   this->last_geo_rot_margin_ = -1.0f;    // telemetry; -1 = gate disabled / not computed
   this->last_geo_trans_margin_ = -1.0f;
@@ -563,6 +573,11 @@ float NanoGICP<PointSource, PointTarget>::lastKernelAlpha() const {
 }
 
 template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastKernelScale() const {
+    return this->current_kernel_c_;
+}
+
+template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setMaxCorrection(float max_trans, float max_rot) {
     this->max_corr_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
     this->max_corr_rot_   = (max_rot   > 0.f) ? max_rot   : 0.f;
@@ -795,8 +810,13 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // gate addresses). -1 = not computed (gate disabled). Does NOT affect the solve.
     this->last_geo_rot_margin_ = -1.0f;
     this->last_geo_trans_margin_ = -1.0f;
-    // Adaptive kernel: warm-start each scan at the least-robust shape, then adapt.
-    if (this->adaptive_kernel_enabled_) { this->current_alpha_ = this->kernel_alpha_hi_; }
+    // Adaptive kernel: warm-start each scan at the least-robust shape and the
+    // default scale, then adapt both (alpha + data-driven c) over the LM loop.
+    if (this->adaptive_kernel_enabled_) {
+        this->current_alpha_ = this->kernel_alpha_hi_;
+        this->current_kernel_c_ = (this->kernel_scale_ > 0.f) ? this->kernel_scale_
+                                                              : this->photometric_huber_delta_;
+    }
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -1133,7 +1153,9 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     std::vector<long> photo_count_private(num_threads_, 0);
     // Adaptive-kernel residual collection (Chebrolu et al.): fit alpha post-loop.
     const bool adaptive_kernel = use_photometric && this->adaptive_kernel_enabled_;
-    const float kernel_c = (this->kernel_scale_ > 0.f) ? this->kernel_scale_ : photometric_huber_delta_;
+    // Scale c in effect this iteration: explicit kernel_scale_, else the lagged
+    // data-driven MAD estimate (current_kernel_c_), updated post-loop.
+    const float kernel_c = (this->kernel_scale_ > 0.f) ? this->kernel_scale_ : this->current_kernel_c_;
     std::vector<std::vector<float>> photo_resid_private(adaptive_kernel ? num_threads_ : 0);
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum,photo_sq_sum)
@@ -1188,15 +1210,24 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 // alpha fitted to the residual distribution (current_alpha_,
                 // lagged one iteration); residuals are collected for the fit.
                 float weight = photometric_weight_;
+                // Huber multiplier: the default robustifier, and the FLOOR for the
+                // adaptive kernel (so enabling the kernel can only ADD robustness).
+                const float abs_r = std::abs(intensity_diff);
+                float huber_w = 1.f;
+                if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
+                    huber_w = photometric_huber_delta_ / abs_r;
+                }
                 if (adaptive_kernel) {
-                    weight *= static_cast<float>(
+                    // Barron weight floored by the Huber: at alpha=2 (Barron=1.0)
+                    // this falls back to exactly the Huber, never strips it. Fixes
+                    // the 2026-06-18 finding where the kernel replaced the Huber and
+                    // at alpha=2 removed all outlier protection (-> divergence).
+                    const float barron_w = static_cast<float>(
                         barronRelWeight(intensity_diff, this->current_alpha_, kernel_c));
+                    weight *= std::min(barron_w, huber_w);
                     photo_resid_private[thread_num].push_back(intensity_diff);
                 } else {
-                    const float abs_r = std::abs(intensity_diff);
-                    if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
-                        weight *= photometric_huber_delta_ / abs_r;
-                    }
+                    weight *= huber_w;
                 }
                 ++photo_count_private[thread_num];
                 photo_sq_sum += static_cast<double>(intensity_diff) * intensity_diff;  // telemetry only
@@ -1229,14 +1260,19 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     this->last_photometric_rms_ = (photo_count > 0)
         ? std::sqrt(static_cast<float>(photo_sq_sum / photo_count)) : 0.0f;
 
-    // Adaptive kernel: fit Barron's alpha to this iteration's photometric
-    // residuals (NLL minimization), use it next iteration. The weights above used
-    // current_alpha_ (lagged one iteration); it converges over the LM loop.
+    // Adaptive kernel: from this iteration's photometric residuals, update the
+    // scale c (data-driven MAD when kernel_scale_<=0, else the fixed scale) and
+    // fit Barron's alpha (NLL minimization); both are used next iteration (lagged)
+    // and converge over the LM loop. The MAD scale fixes the 2026-06-18 finding
+    // that a fixed c larger than the residual bulk pinned alpha at L2 (no effect).
     if (adaptive_kernel) {
         std::vector<float> resid;
         for (auto& v : photo_resid_private) { resid.insert(resid.end(), v.begin(), v.end()); }
+        const float fit_c = (this->kernel_scale_ > 0.f) ? this->kernel_scale_
+                                                        : static_cast<float>(barronScaleMad(resid));
+        this->current_kernel_c_ = fit_c;
         this->last_fit_alpha_ = static_cast<float>(fitBarronAlpha(
-            resid, kernel_c, this->kernel_alpha_lo_, this->kernel_alpha_hi_));
+            resid, fit_c, this->kernel_alpha_lo_, this->kernel_alpha_hi_));
         this->current_alpha_ = this->last_fit_alpha_;
     }
 

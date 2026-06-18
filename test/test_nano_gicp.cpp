@@ -698,6 +698,16 @@ TEST(BarronKernel, FitAlphaCleanVsOutliers) {
   EXPECT_DOUBLE_EQ(nano_gicp::fitBarronAlpha({}, c, 0.5, 2.0), 2.0);
 }
 
+TEST(BarronKernel, ScaleMadIsRobustSigma) {
+  // 1.4826 * median|r|; robust to a few large outliers.
+  std::vector<float> r(101, 0.02f);          // median|r| = 0.02
+  for (int i = 0; i < 10; ++i) { r.push_back(5.0f); }   // outliers don't move the median
+  EXPECT_NEAR(nano_gicp::barronScaleMad(r), 1.4826 * 0.02, 1e-6);
+  // empty -> fallback; floored away from 0.
+  EXPECT_GT(nano_gicp::barronScaleMad({}), 0.0);
+  EXPECT_GE(nano_gicp::barronScaleMad(std::vector<float>(5, 0.0f)), 1e-4);
+}
+
 // Adaptive kernel OFF (default) -> the fixed Huber path, bit-identical.
 TEST(NanoGICP, AdaptiveKernelDisabledIsBitIdentical) {
   auto target = makeIntensityCorner(1.0f, 0.05f);
