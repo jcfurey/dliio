@@ -192,3 +192,13 @@ runtime adaptation itself — Layers 1 and 2 — is not implemented.** It is the
 step that changes the solve's *decisions* rather than instrumenting them, so it is
 gated on (a) the "observe first" pass above and (b) an explicit go-ahead, and it
 will land behind a default-off master flag with the safety mechanisms above.
+
+> **Bench reality check (2026-06-18).** The first n=5 sweep
+> (`doc/FINDINGS_2026-06-18.md`, summarized in `doc/ROBUSTNESS_RESEARCH.md`
+> "Validation status") found that **a scalar weight does not reliably move the
+> divergence basin** and every auxiliary term either destabilizes or is broken.
+> This sharpens the case for *per-direction* routing (Layer 2) over per-term
+> scalar trust (Layer 1) — but it also means Layer 2 is only as good as the term
+> feeding the degenerate axis, and right now **no term adds clean along-axis
+> information** (the camera term emits 0 points). So Layer 2 is effectively
+> blocked on a working camera/aux term, not on this policy.

@@ -119,6 +119,34 @@ loosen a strongly-degenerate axis: eigenvalue ~0 << thresh still keeps ~0
   scan-to-scan jumps in the degenerate count and lower twist, not a change in the
   steady-state count. Live-tunable.
 
+### Newest levers (2026-06-17/18) — read the bench verdicts first
+
+All off by default. The 2026-06-18 n=5 sweep (`doc/FINDINGS_2026-06-18.md`) already
+weighed in on some; don't re-discover the negatives.
+
+- **`odom/preprocessing/subFloorReject/enabled`** (+ `margin` 0.30, `radius` 8.0)
+  — drops specular sub-floor "ghost" returns (water-pool drag-down). **Bench: 0
+  points rejected on the 06042026 segment** (no water signature there), so it is a
+  verified no-op *here* — only meaningful on a segment that contains the failure.
+  Watch `Sub-floor Points Rejected` (should be ~0 in clean tracking, spike at a
+  pool). Requires `approximateGravity: true`.
+- **`odom/gicp/adaptiveClamp/enabled`** (+ `floor` 0.25) — tightens the
+  `maxCorr*` caps as the trust margin degrades. **Bench: bounding, not fixing** —
+  a global magnitude limiter cannot add the missing along-axis observation; the
+  gate already holds the prior and it still sloshes. Needs a base `maxCorr*` cap
+  > 0 and the gate on. Watch the `Geo *Trust Margin` keys.
+- **`odom/gicp/probGate/enabled`** (+ `noiseFloor{Rot,Trans}`, `confidenceS`,
+  `spread`) — replaces the ratio threshold with a probit confidence against an
+  *absolute* noise floor (Hatleskog & Alexis). **Unbenched.** floors=0 → a
+  probit over the existing ratio gate; set absolute floors for the scene-
+  independent version. Sweep against B0's `degeneracyThreshRatio`/soft gate, not
+  stacked with them blind.
+- **`odom/gicp/adaptiveKernel/enabled`** (+ `alphaLo` 0.5, `alphaHi` 2.0,
+  `scale` 0) — Barron loss with the shape α NLL-fit per scan, Huber-floored, scale
+  0 = data-driven MAD (Chebrolu et al.). **Was harmful, fixed 2026-06-18,
+  unbenched since.** Watch `Photometric Kernel Alpha` (drops below 2 = engaging on
+  outliers) and `Photometric Kernel Scale` (the MAD c).
+
 ## 3. What to log and read (exact /diagnostics keys)
 
 `ros2 topic echo /diagnostics` (or record it). Per scan, watch:
@@ -130,8 +158,14 @@ loosen a strongly-degenerate axis: eigenvalue ~0 << thresh still keeps ~0
 | `Geo Trans Trust Margin` | > 1 off-axis; ~1/`<1` on the tunnel axis | crossing 1 scan-to-scan = chatter (soft-gate target) |
 | `Photometric Points` | thousands of valid-gradient matches | -> 0 (no texture / channel missing) |
 | `Photometric Residual RMS` | low + stable (good brightness constancy) | high + rising (term mistrustworthy) |
+| `Photometric Kernel Alpha` | ~2 clean; <2 = adaptive kernel down-weighting outliers | pinned at 2 with outliers present = not engaging (scale too big) |
+| `Photometric Kernel Scale` | ~ the residual MAD (data-driven c) | — (diagnostic for the kernel scale) |
+| `Sub-floor Points Rejected` | ~0 in clean tracking | spikes at a specular floor pool (the term firing) |
 | `Lidar Map Points` | thousands | -> 0 (term starved / all occluded out) |
 | `Lidar Map RMS` | lower than pre-fix 0.4-0.6 | high + rising |
+| `Visual Active` / `Visual Points` | 1 / thousands when the camera term works | 0 / 0 = term not contributing (debug with the two keys below) |
+| `Visual Match dt (s)` | small (image paired with the scan) | **-1 = NO camera frame matched** (timestamp offset/rate vs maxTimeDiff) |
+| `Visual Rejects (behind/oob/grad)` | mostly geometry-limited (some oob) | high `behind` = wrong cam2lidar; high `oob` = wrong intrinsics/FOV |
 | `Visual Rescued Axes` | 1 when deg=1 | 0 while deg>=1 (gate not rescuing) |
 | `Distance Traveled (m)` | climbs to ~100 | stalls ~17-23 (map-lock) or runs away |
 | `Max Computation Time (ms)` | < scan period | spikes = starvation (see preconditions) |
