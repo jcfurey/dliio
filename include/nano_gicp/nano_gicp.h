@@ -275,6 +275,12 @@ public:
   // last align() (for diagnostics).
   float lastVisualRms() const;
   int lastVisualCount() const;
+  // Frame-to-frame visual reject breakdown from the last align() (diagnostics):
+  // how many source points were dropped behind the camera / out of image bounds
+  // / for ~zero gradient. Pinpoints why "Visual Points" is 0.
+  int lastVisualRejBehind() const;
+  int lastVisualRejOob() const;
+  int lastVisualRejGrad() const;
   float lastVisualMapRms() const;
   int lastVisualMapCount() const;
   // Geometrically-degenerate axes the visual term rescued (allowed bounded
@@ -470,6 +476,9 @@ protected:
   float visual_gate_max_rot_;   // gate rescue BUDGET: max total rotation deviation per scan [rad]
   float last_visual_rms_;
   int last_visual_count_;
+  int last_visual_rej_behind_;   // diagnostics: f2f points rejected behind the camera
+  int last_visual_rej_oob_;      // ... rejected outside the image bounds
+  int last_visual_rej_grad_;     // ... rejected for ~zero image gradient
   int last_visual_rescued_;
 
   // --- Frame-to-MAP camera term state ---

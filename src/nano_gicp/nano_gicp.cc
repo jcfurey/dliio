@@ -267,6 +267,9 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->visual_gate_max_rot_ = 0.1f;
   this->last_visual_rms_ = 0.0f;
   this->last_visual_count_ = 0;
+  this->last_visual_rej_behind_ = 0;
+  this->last_visual_rej_oob_ = 0;
+  this->last_visual_rej_grad_ = 0;
   this->last_visual_rescued_ = 0;
   this->visual_map_weight_ = 0.0f;
   this->visual_map_ref_count_ = 0.0f;    // mass-normalization OFF by default (raw)
@@ -419,6 +422,15 @@ template <typename PointSource, typename PointTarget>
 int NanoGICP<PointSource, PointTarget>::lastVisualCount() const {
     return this->last_visual_count_;
 }
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualRejBehind() const { return this->last_visual_rej_behind_; }
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualRejOob() const { return this->last_visual_rej_oob_; }
+
+template <typename PointSource, typename PointTarget>
+int NanoGICP<PointSource, PointTarget>::lastVisualRejGrad() const { return this->last_visual_rej_grad_; }
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setVisualGateMaxStep(float max_trans, float max_rot) {
@@ -1251,6 +1263,9 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
 
     this->last_visual_count_ = 0;
     this->last_visual_rms_ = 0.0f;
+    this->last_visual_rej_behind_ = 0;   // diagnostics: per-gate reject reasons
+    this->last_visual_rej_oob_ = 0;
+    this->last_visual_rej_grad_ = 0;
 
     if (!visual_enabled_ || visual_weight_ <= 0.f) { return; }
     if (visual_cur_.empty() || visual_prev_.empty() || !input_) { return; }
@@ -1278,8 +1293,10 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
     double cost_sum = 0.0;
     double sq_sum = 0.0;
     long count = 0;
+    long rej_behind = 0, rej_oob = 0, rej_grad = 0;   // diagnostics only
 
-    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) \
+        reduction(+:cost_sum,sq_sum,count,rej_behind,rej_oob,rej_grad)
     for (int i = 0; i < input_->size(); ++i) {
         const auto& sp = input_->at(i);
         const Eigen::Vector3f p_w(sp.x, sp.y, sp.z);     // raw world point (prior pose)
@@ -1289,20 +1306,20 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
         // image. This is pose-independent (the point's position relative to the
         // current camera is fixed by the rigid extrinsic), hence a fixed target.
         const Eigen::Vector3f Pc_ref = R_cur * p_w + t_cur;
-        if (Pc_ref.z() <= zmin) { continue; }
+        if (Pc_ref.z() <= zmin) { ++rej_behind; continue; }
         const float u_ref = fx * Pc_ref.x() / Pc_ref.z() + cx;
         const float v_ref = fy * Pc_ref.y() / Pc_ref.z() + cy;
-        if (u_ref < bw || u_ref > cur_umax || v_ref < bw || v_ref > cur_vmax) { continue; }
+        if (u_ref < bw || u_ref > cur_umax || v_ref < bw || v_ref > cur_vmax) { ++rej_oob; continue; }
         const float I_ref = bilinearSample(visual_cur_, u_ref, v_ref);
 
         // Moving brightness: project the CORRECTED world point into the PREVIOUS
         // image. This depends on `trans` -- the source of pose observability.
         const Eigen::Vector3f Pc = R_prev * x + t_prev;
-        if (Pc.z() <= zmin) { continue; }
+        if (Pc.z() <= zmin) { ++rej_behind; continue; }
         const float invz = 1.f / Pc.z();
         const float u = fx * Pc.x() * invz + cx;
         const float v = fy * Pc.y() * invz + cy;
-        if (u < bw || u > prev_umax || v < bw || v > prev_vmax) { continue; }
+        if (u < bw || u > prev_umax || v < bw || v > prev_vmax) { ++rej_oob; continue; }
         const float I_mov = bilinearSample(visual_prev_, u, v);
 
         // Image gradient (central difference) on the previous image, normalized.
@@ -1310,7 +1327,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
                                - bilinearSample(visual_prev_, u - 1.f, v));
         const float gv = 0.5f * (bilinearSample(visual_prev_, u, v + 1.f)
                                - bilinearSample(visual_prev_, u, v - 1.f));
-        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { continue; }
+        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { ++rej_grad; continue; }
 
         const float r = I_mov - I_ref;
 
@@ -1364,6 +1381,9 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
     }
     this->last_visual_count_ = static_cast<int>(count);
     this->last_visual_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
+    this->last_visual_rej_behind_ = static_cast<int>(rej_behind);
+    this->last_visual_rej_oob_ = static_cast<int>(rej_oob);
+    this->last_visual_rej_grad_ = static_cast<int>(rej_grad);
 }
 
 template <typename PointSource, typename PointTarget>

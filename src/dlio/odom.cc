@@ -2082,6 +2082,7 @@ bool dlio::OdomNode::setupVisualForScan() {
 
   // Default everything off for this scan; (re)enable below per term.
   this->visual_cur_pending_valid_ = false;
+  this->last_visual_match_dt_ = -1.0;   // diagnostics: reset, set below if matched
   this->gicp.setVisualEnabled(false);
   this->gicp.setVisualMapWeight(0.f);
 
@@ -2099,6 +2100,7 @@ bool dlio::OdomNode::setupVisualForScan() {
       if (dt <= best_dt) { best_dt = dt; cur_mono = kv.second; }
     }
   }
+  this->last_visual_match_dt_ = cur_mono.empty() ? -1.0 : best_dt;   // diagnostics
   if (cur_mono.empty()) { return false; }  // graceful LiDAR-only this scan
   // Convert the single matched frame to normalized float (the residual unit).
   cv::Mat cur_img;
@@ -3366,6 +3368,14 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));
+  // Why "Visual Points" might be 0: image match dt (-1 = no camera frame paired),
+  // and the per-gate reject breakdown when a frame did pair (behind camera / out
+  // of image bounds / ~zero gradient) -> pinpoints match vs projection failure.
+  kv("Visual Match dt (s)", fnum(this->last_visual_match_dt_, 4));
+  kv("Visual Rejects (behind/oob/grad)",
+     std::to_string(this->gicp.lastVisualRejBehind()) + "/" +
+     std::to_string(this->gicp.lastVisualRejOob()) + "/" +
+     std::to_string(this->gicp.lastVisualRejGrad()));
   kv("Visual Rescued Axes", std::to_string(this->gicp.lastVisualRescuedDirections()));
   kv("Visual Map Active", (this->visual_map_enabled_ && this->gicp.lastVisualMapCount() > 0) ? "1" : "0");
   kv("Visual Map Points", std::to_string(this->gicp.lastVisualMapCount()));
