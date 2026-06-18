@@ -32,7 +32,7 @@ that drag the pose down. The shortlist prioritizes that.
 | 2 | Trigger an IMU-prior lean when the floor constraint collapses — **IMPLEMENTED (off by default)** as `odom/gicp/adaptiveClamp/*`; the clamp caps tighten as the `Geo Trust Margin` degrades | water-pool mode (a) dropout | the `Geo Trust Margin` telemetry → the IMU-consistency clamp | Low–med |
 | 3 | Probabilistic soft-attenuation in the gate (per-direction SNR) — **IMPLEMENTED (off by default)** as `odom/gicp/probGate/*` (Hatleskog & Alexis adaptation; absolute noise-floor confidence, full per-direction noise propagation deferred) | degeneracy brittleness | `degeneracySoftness` smoothstep → probit confidence | Low–med |
 | 4 | Per-direction trust from correspondence Jacobians (SuperLoc/X-ICP) | adaptive trust Layer 2 | the per-axis routing in `ADAPTIVE_TRUST.md` | Medium |
-| 5 | Chebrolu adaptive-α robust kernel | outlier-tuning burden | replaces the fixed Huber in the IRLS path | Low |
+| 5 | Chebrolu adaptive-α robust kernel — **IMPLEMENTED (off by default)** as `odom/gicp/adaptiveKernel/*`; Barron loss + per-iteration NLL α-fit on the photometric residual, α∈(0,2] | outlier-tuning burden | replaces the fixed photometric Huber in the IRLS path | Low |
 | 6 | Dual-return / sub-ground reject *(if Ouster 2nd returns are populated)* | glass/mirror ghosts | preprocessing reject | Low (conditional) |
 | 7 | *(optional, heavier)* GenZ-ICP adaptive plane↔point blend | dropout ill-conditioning | the GICP residual/weighting | Medium |
 
@@ -172,8 +172,13 @@ LVI-SAM/learned-covariance per-scan.
 
 - **Chebrolu et al., "Adaptive Robust Kernels"** (RA-L 2021, on **Barron** CVPR
   2019): per-iteration auto-tuning of the loss shape `α` via a 1-D NLL search — a
-  **no-tuning replacement for the fixed Huber** in the IRLS path. Highest-value
-  kernel upgrade.
+  **no-tuning replacement for the fixed Huber** in the IRLS path. **IMPLEMENTED**
+  on the photometric term as `odom/gicp/adaptiveKernel/*` (off by default): Barron
+  loss + a per-iteration grid NLL fit of α∈(0,2] to the photometric residuals
+  (lagged one iteration), with the partition function cached by numerical
+  integration. The fitted α is published as `Photometric Kernel Alpha`.
+  Simplification vs. the paper: α restricted to (0,2] (the α<0 truncated-loss
+  extension is deferred).
 - **GNC** (Yang et al., RA-L 2020): anneal convex→true robust cost; robust to
   ~70–80% outliers (empirical, no global guarantee); wraps the IRLS loop. Only if
   high-outlier regimes appear.

@@ -144,6 +144,75 @@ double probGateKeepFraction(double eigval, double noise_floor, double confidence
     return 0.5 * std::erfc(-z / 1.4142135623730951);   // Phi(z) = 0.5*erfc(-z/sqrt(2))
 }
 
+// --- Barron adaptive robust kernel (CVPR 2019) + Chebrolu et al. alpha fit
+// (RA-L 2021). See nano_gicp.h. Restricted to alpha in (0,2]; pure + unit-tested.
+namespace {
+constexpr double kTwoPi = 6.283185307179586;
+}
+
+double barronRho(double r, double alpha, double c) {
+    if (c <= 0.0) { return 0.0; }
+    const double x2 = (r / c) * (r / c);
+    if (alpha >= 2.0) { return 0.5 * x2; }                  // L2
+    if (alpha <= 0.0) { return std::log(0.5 * x2 + 1.0); }  // Cauchy/Lorentzian (alpha->0)
+    const double a2 = std::abs(alpha - 2.0);
+    return (a2 / alpha) * (std::pow(x2 / a2 + 1.0, 0.5 * alpha) - 1.0);
+}
+
+double barronRelWeight(double r, double alpha, double c) {
+    if (c <= 0.0) { return 1.0; }
+    if (alpha >= 2.0) { return 1.0; }                       // L2: no down-weighting
+    const double x2 = (r / c) * (r / c);
+    const double a2 = std::abs(alpha - 2.0);
+    return std::pow(x2 / a2 + 1.0, 0.5 * alpha - 1.0);      // (0,1], redescending
+}
+
+double barronLogPartition(double alpha) {
+    if (alpha >= 2.0) { return 0.5 * std::log(kTwoPi); }    // Z = sqrt(2 pi)
+    // Cache logZ on a fixed alpha grid (0.05 spacing), numerically integrated
+    // once (thread-safe function-local static init). Z(alpha) = int exp(-rho).
+    static const std::vector<double> table = [] {
+        std::vector<double> t(41);
+        const double L = 50.0; const int N = 5000; const double h = 2.0 * L / N;
+        for (int k = 0; k <= 40; ++k) {
+            const double a = 0.05 * k;
+            if (a <= 0.0) { t[k] = std::log(std::sqrt(2.0) * 3.14159265358979324); continue; } // Z(0)=pi*sqrt2
+            if (a >= 2.0) { t[k] = 0.5 * std::log(kTwoPi); continue; }
+            double sum = 0.0;
+            for (int i = 0; i <= N; ++i) {
+                const double x = -L + i * h;
+                const double w = (i == 0 || i == N) ? 1.0 : ((i % 2) ? 4.0 : 2.0);
+                sum += w * std::exp(-barronRho(x, a, 1.0));
+            }
+            t[k] = std::log(sum * h / 3.0);                 // Simpson
+        }
+        return t;
+    }();
+    const double a = (alpha < 0.0) ? 0.0 : alpha;
+    const double fk = a / 0.05;
+    const int k = std::min(39, static_cast<int>(std::floor(fk)));
+    const double frac = fk - k;
+    return table[k] + frac * (table[k + 1] - table[k]);     // linear interp
+}
+
+double fitBarronAlpha(const std::vector<float>& residuals, double c,
+                      double alpha_lo, double alpha_hi) {
+    if (residuals.empty() || c <= 0.0) { return alpha_hi; }
+    const double lo = std::max(0.05, std::min(static_cast<double>(alpha_lo), 2.0));
+    const double hi = std::max(lo, std::min(static_cast<double>(alpha_hi), 2.0));
+    const int G = 16;
+    const double N = static_cast<double>(residuals.size());
+    double best_alpha = hi, best_nll = std::numeric_limits<double>::max();
+    for (int g = 0; g <= G; ++g) {
+        const double alpha = lo + (hi - lo) * (static_cast<double>(g) / G);
+        double s = 0.0;
+        for (const float r : residuals) { s += barronRho(r, alpha, c); }
+        const double nll = s + N * barronLogPartition(alpha);
+        if (nll < best_nll) { best_nll = nll; best_alpha = alpha; }
+    }
+    return best_alpha;
+}
+
 template <typename PointSource, typename PointTarget>
 NanoGICP<PointSource, PointTarget>::NanoGICP() {
   reg_name_ = "NanoGICP";
@@ -172,6 +241,12 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->prob_noise_floor_trans_ = 0.0f;
   this->prob_confidence_s_ = 1.0f;
   this->prob_spread_ = 1.0f;
+  this->adaptive_kernel_enabled_ = false;   // fixed Huber by default (bit-identical)
+  this->kernel_alpha_lo_ = 0.5f;
+  this->kernel_alpha_hi_ = 2.0f;
+  this->kernel_scale_ = 0.0f;               // 0 -> reuse photometric_huber_delta_
+  this->current_alpha_ = 2.0f;
+  this->last_fit_alpha_ = 2.0f;
   this->last_degenerate_directions_ = 0;
   this->last_geo_rot_margin_ = -1.0f;    // telemetry; -1 = gate disabled / not computed
   this->last_geo_trans_margin_ = -1.0f;
@@ -461,6 +536,21 @@ void NanoGICP<PointSource, PointTarget>::setProbabilisticGate(bool enabled, floa
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setAdaptiveKernel(bool enabled, float alpha_lo,
+                                                          float alpha_hi, float scale) {
+    this->adaptive_kernel_enabled_ = enabled;
+    this->kernel_alpha_lo_ = alpha_lo;
+    this->kernel_alpha_hi_ = alpha_hi;
+    this->kernel_scale_ = (scale > 0.f) ? scale : 0.f;
+    this->current_alpha_ = alpha_hi;        // start at L2 / least-robust, then adapt
+}
+
+template <typename PointSource, typename PointTarget>
+float NanoGICP<PointSource, PointTarget>::lastKernelAlpha() const {
+    return this->last_fit_alpha_;
+}
+
+template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setMaxCorrection(float max_trans, float max_rot) {
     this->max_corr_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
     this->max_corr_rot_   = (max_rot   > 0.f) ? max_rot   : 0.f;
@@ -693,6 +783,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // gate addresses). -1 = not computed (gate disabled). Does NOT affect the solve.
     this->last_geo_rot_margin_ = -1.0f;
     this->last_geo_trans_margin_ = -1.0f;
+    // Adaptive kernel: warm-start each scan at the least-robust shape, then adapt.
+    if (this->adaptive_kernel_enabled_) { this->current_alpha_ = this->kernel_alpha_hi_; }
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -1027,6 +1119,10 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     std::vector<Eigen::Matrix<double, 6, 1>> bp_private(
         normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 1>::Zero());
     std::vector<long> photo_count_private(num_threads_, 0);
+    // Adaptive-kernel residual collection (Chebrolu et al.): fit alpha post-loop.
+    const bool adaptive_kernel = use_photometric && this->adaptive_kernel_enabled_;
+    const float kernel_c = (this->kernel_scale_ > 0.f) ? this->kernel_scale_ : photometric_huber_delta_;
+    std::vector<std::vector<float>> photo_resid_private(adaptive_kernel ? num_threads_ : 0);
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum,photo_sq_sum)
     for(int i = 0; i < input_->size(); ++i) {
@@ -1073,14 +1169,22 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 J_photometric.block<1, 3>(0, 0) = gradient.transpose() * skew(transformed_source);
                 J_photometric.block<1, 3>(0, 3) = -gradient.transpose();
 
-                // Huber robustification: photometric outliers (specular
-                // returns, wet patches, exposure-like artifacts) otherwise
-                // shove the pose at full weight -- IRLS down-weighting
-                // beyond photometric_huber_delta_ (normalized units).
+                // Robustification of the photometric outliers (specular returns,
+                // wet patches, exposure-like artifacts). Default: IRLS Huber
+                // down-weighting beyond photometric_huber_delta_. Adaptive kernel
+                // (Barron/Chebrolu): redescending Barron weight with the shape
+                // alpha fitted to the residual distribution (current_alpha_,
+                // lagged one iteration); residuals are collected for the fit.
                 float weight = photometric_weight_;
-                const float abs_r = std::abs(intensity_diff);
-                if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
-                    weight *= photometric_huber_delta_ / abs_r;
+                if (adaptive_kernel) {
+                    weight *= static_cast<float>(
+                        barronRelWeight(intensity_diff, this->current_alpha_, kernel_c));
+                    photo_resid_private[thread_num].push_back(intensity_diff);
+                } else {
+                    const float abs_r = std::abs(intensity_diff);
+                    if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
+                        weight *= photometric_huber_delta_ / abs_r;
+                    }
                 }
                 ++photo_count_private[thread_num];
                 photo_sq_sum += static_cast<double>(intensity_diff) * intensity_diff;  // telemetry only
@@ -1112,6 +1216,17 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     this->last_photometric_count_ = static_cast<int>(photo_count);
     this->last_photometric_rms_ = (photo_count > 0)
         ? std::sqrt(static_cast<float>(photo_sq_sum / photo_count)) : 0.0f;
+
+    // Adaptive kernel: fit Barron's alpha to this iteration's photometric
+    // residuals (NLL minimization), use it next iteration. The weights above used
+    // current_alpha_ (lagged one iteration); it converges over the LM loop.
+    if (adaptive_kernel) {
+        std::vector<float> resid;
+        for (auto& v : photo_resid_private) { resid.insert(resid.end(), v.begin(), v.end()); }
+        this->last_fit_alpha_ = static_cast<float>(fitBarronAlpha(
+            resid, kernel_c, this->kernel_alpha_lo_, this->kernel_alpha_hi_));
+        this->current_alpha_ = this->last_fit_alpha_;
+    }
 
     // Opt-in mass-normalization: scale the separate photometric accumulator to
     // the nominal reference count and fold it in. (When off, the photometric

@@ -220,6 +220,24 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       static_cast<float>(probNoiseFloorTrans), static_cast<float>(probConfidenceS),
       static_cast<float>(probSpread));
 
+  // Adaptive robust kernel on the photometric term (Barron, CVPR 2019 +
+  // Chebrolu et al., IEEE RA-L 2021, arXiv:2004.14938): replace the fixed
+  // photometric Huber with Barron's loss whose shape alpha is re-fit to the
+  // residual distribution each iteration (no hand-tuned kernel). scale = Barron c
+  // (0 -> reuse photometricHuberDelta). OFF by default -> the fixed Huber,
+  // bit-identical. The fitted alpha is published as "Photometric Kernel Alpha".
+  bool adaptiveKernelEnabled;
+  double kernelAlphaLo, kernelAlphaHi, kernelScale;
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/enabled", adaptiveKernelEnabled, false);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/alphaLo", kernelAlphaLo, 0.5,
+      "Min Barron shape alpha (more robust); clamped to (0,2]", 0.0, 2.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/alphaHi", kernelAlphaHi, 2.0,
+      "Max Barron shape alpha (2 = L2); clamped to (0,2]", 0.0, 2.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/scale", kernelScale, 0.0,
+      "Barron scale c (normalized units; 0 = reuse photometricHuberDelta)", 0.0, 100.0);
+  this->gicp.setAdaptiveKernel(adaptiveKernelEnabled, static_cast<float>(kernelAlphaLo),
+      static_cast<float>(kernelAlphaHi), static_cast<float>(kernelScale));
+
   // Per-scan IMU-consistency clamp: bound the TOTAL GICP correction (final pose
   // vs the IMU-prior initial guess) per scan. Caps map-lock/divergence runaway
   // along the intermittently un-gated degenerate axis without touching healthy
@@ -3344,6 +3362,7 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
+  kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
   kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
   kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));

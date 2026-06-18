@@ -111,6 +111,25 @@ double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
 double probGateKeepFraction(double eigval, double noise_floor, double confidence_s,
                             double spread);
 
+// --- Barron adaptive robust kernel (J. T. Barron, "A General and Adaptive Robust
+// Loss Function," CVPR 2019, arXiv:1701.03077) with per-iteration shape fitting
+// (Chebrolu, Laebe, Vysotska, Behley, Stachniss, "Adaptive Robust Kernels for
+// Non-Linear Least Squares Problems," IEEE RA-L 2021, arXiv:2004.14938). Restricted
+// to alpha in (0,2] (L2 at 2 -> pseudo-Huber at 1 -> Cauchy as alpha->0); the
+// alpha<0 truncated-loss extension is deferred. c is the kernel scale. ---
+// Loss of residual r (Barron's f); used in the negative-log-likelihood alpha fit.
+double barronRho(double r, double alpha, double c);
+// IRLS weight MULTIPLIER in (0,1]: 1 at r=0, redescending for |r|>0 when alpha<2.
+// Drop-in replacement for the Huber multiplier on a robustified residual.
+double barronRelWeight(double r, double alpha, double c);
+// log of the partition Z(alpha) = integral exp(-rho(x,alpha,1)) dx (the NLL's
+// normalizer; precomputed/cached). Prevents the fit collapsing to "all outliers".
+double barronLogPartition(double alpha);
+// Fit alpha to a residual set by minimizing the NLL sum_i rho(r_i,alpha,c) +
+// N*logZ(alpha) over a grid in [alpha_lo, alpha_hi] (clamped to (0,2]).
+double fitBarronAlpha(const std::vector<float>& residuals, double c,
+                      double alpha_lo, double alpha_hi);
+
 template<typename PointSource, typename PointTarget>
 class NanoGICP : public pcl::Registration<PointSource, PointTarget> {
 
@@ -282,6 +301,14 @@ public:
   // the ratio threshold. Disabled (default) -> bit-identical to the soft gate.
   void setProbabilisticGate(bool enabled, float noise_floor_rot, float noise_floor_trans,
                             float confidence_s, float spread);
+  // Barron adaptive robust kernel on the photometric residual (see barron* above):
+  // replaces the fixed photometric Huber with Barron's loss whose shape alpha is
+  // re-fit to the residual distribution each iteration (no hand-tuned kernel).
+  // scale = Barron c (0 -> reuse the photometric Huber delta). Disabled (default)
+  // -> the fixed Huber, bit-identical.
+  void setAdaptiveKernel(bool enabled, float alpha_lo, float alpha_hi, float scale);
+  // Alpha fitted in the last align() (2 = L2/clean, lower = more outliers).
+  float lastKernelAlpha() const;
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
   // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
@@ -408,6 +435,14 @@ protected:
   float prob_noise_floor_trans_;
   float prob_confidence_s_;            // signal must exceed s * noise floor
   float prob_spread_;                  // probit transition width (log-eigenvalue)
+  // Barron adaptive robust kernel on the photometric term (Chebrolu et al.); off
+  // -> the fixed Huber, bit-identical. current_alpha_ is re-fit each linearize().
+  bool  adaptive_kernel_enabled_;
+  float kernel_alpha_lo_;
+  float kernel_alpha_hi_;
+  float kernel_scale_;                 // Barron scale c; 0 -> reuse photometric_huber_delta_
+  float current_alpha_;                // alpha in effect this iteration (lagged fit)
+  float last_fit_alpha_;               // diagnostic: alpha fitted in the last linearize()
   int last_degenerate_directions_;
   float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a

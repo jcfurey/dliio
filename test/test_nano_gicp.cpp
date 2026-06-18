@@ -648,6 +648,96 @@ TEST(NanoGICP, ProbGatePreservesWellConditioned) {
   EXPECT_LT(terr, 0.03f);
 }
 
+// --- Barron adaptive robust kernel (CVPR 2019 + Chebrolu et al. RA-L 2021) ---
+
+TEST(BarronKernel, RelWeightEdges) {
+  // alpha = 2 -> L2, no down-weighting, for any r.
+  EXPECT_DOUBLE_EQ(nano_gicp::barronRelWeight(0.5, 2.0, 0.05), 1.0);
+  EXPECT_DOUBLE_EQ(nano_gicp::barronRelWeight(0.0, 2.0, 0.05), 1.0);
+  // r = 0 -> weight 1 for any alpha.
+  EXPECT_DOUBLE_EQ(nano_gicp::barronRelWeight(0.0, 0.5, 0.05), 1.0);
+  // alpha = 0 at r = c: ((1)/2 + 1)^(-1) = 1/1.5.
+  EXPECT_NEAR(nano_gicp::barronRelWeight(0.05, 0.0, 0.05), 1.0 / 1.5, 1e-9);
+}
+
+TEST(BarronKernel, RelWeightRedescends) {
+  // For alpha < 2 the weight strictly decreases with |r| (and stays in (0,1]).
+  const double w0 = nano_gicp::barronRelWeight(0.0, 1.0, 0.05);
+  const double w1 = nano_gicp::barronRelWeight(0.05, 1.0, 0.05);
+  const double w2 = nano_gicp::barronRelWeight(0.20, 1.0, 0.05);
+  EXPECT_DOUBLE_EQ(w0, 1.0);
+  EXPECT_LT(w1, w0);
+  EXPECT_LT(w2, w1);
+  EXPECT_GT(w2, 0.0);
+}
+
+TEST(BarronKernel, RhoSpecialForms) {
+  EXPECT_NEAR(nano_gicp::barronRho(0.05, 2.0, 0.05), 0.5, 1e-9);              // L2: 0.5*(r/c)^2
+  EXPECT_NEAR(nano_gicp::barronRho(0.05, 0.0, 0.05), std::log(1.5), 1e-9);   // log(0.5*(r/c)^2+1)
+  EXPECT_NEAR(nano_gicp::barronRho(0.0, 1.0, 0.05), 0.0, 1e-12);             // r=0 -> 0
+}
+
+TEST(BarronKernel, LogPartitionEndpointsAndMonotone) {
+  EXPECT_NEAR(nano_gicp::barronLogPartition(2.0), 0.5 * std::log(6.283185307179586), 1e-9);
+  EXPECT_NEAR(nano_gicp::barronLogPartition(0.0), std::log(std::sqrt(2.0) * 3.14159265358979324), 1e-3);
+  // Z shrinks as alpha grows -> logZ decreasing in alpha.
+  EXPECT_GT(nano_gicp::barronLogPartition(0.5), nano_gicp::barronLogPartition(1.0));
+  EXPECT_GT(nano_gicp::barronLogPartition(1.0), nano_gicp::barronLogPartition(2.0));
+}
+
+TEST(BarronKernel, FitAlphaCleanVsOutliers) {
+  const double c = 0.05;
+  std::vector<float> clean(200, 0.002f);                    // tiny residuals -> L2
+  std::vector<float> outliers(200, 0.002f);
+  for (int i = 0; i < 30; ++i) { outliers.push_back(0.4f); } // heavy outliers -> robust
+  const double a_clean = nano_gicp::fitBarronAlpha(clean, c, 0.5, 2.0);
+  const double a_out   = nano_gicp::fitBarronAlpha(outliers, c, 0.5, 2.0);
+  EXPECT_GT(a_clean, 1.8);          // clean data -> near L2
+  EXPECT_LT(a_out, a_clean);        // outliers pull the shape toward robust
+  // empty -> alpha_hi
+  EXPECT_DOUBLE_EQ(nano_gicp::fitBarronAlpha({}, c, 0.5, 2.0), 2.0);
+}
+
+// Adaptive kernel OFF (default) -> the fixed Huber path, bit-identical.
+TEST(NanoGICP, AdaptiveKernelDisabledIsBitIdentical) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](bool set_off) {
+    auto g = makeGICP();
+    g.setPhotometricWeight(0.5f);
+    if (set_off) { g.setAdaptiveKernel(false, 0.5f, 2.0f, 0.f); }
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));
+}
+
+// Adaptive kernel ON: the solve stays healthy and a sane alpha is reported.
+TEST(NanoGICP, AdaptiveKernelConvergesAndReportsAlpha) {
+  auto target = makeIntensityCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g = makeGICP();
+  g.setPhotometricWeight(0.5f);
+  g.setAdaptiveKernel(true, 0.5f, 2.0f, 0.f);  // scale 0 -> reuse Huber delta
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  ASSERT_TRUE(g.hasConverged());
+  const float terr = (g.getFinalTransformation().block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm();
+  EXPECT_LT(terr, 0.03f);
+  EXPECT_GT(g.lastKernelAlpha(), 0.0f);
+  EXPECT_LE(g.lastKernelAlpha(), 2.0f);
+}
+
 TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
   // Fewer points than kCorrespondences: previously read uninitialized
   // kd-tree result slots (out-of-bounds indices).
