@@ -28,7 +28,7 @@ that drag the pose down. The shortlist prioritizes that.
 
 | # | Change | Targets | dliio component it upgrades | Invasiveness |
 |---|---|---|---|---|
-| 1 | Ground-plane prior + sub-ground point reject | water-pool mode (b) ghosts | new preprocessing stage (uses the now-trusted IMU gravity) | Low |
+| 1 | Ground-plane prior + sub-ground point reject — **IMPLEMENTED (off by default)** as `odom/preprocessing/subFloorReject/*`; per-cell gravity-aligned dense-bin floor, not benched on the pool yet | water-pool mode (b) ghosts | new preprocessing stage (uses the now-trusted IMU gravity) | Low |
 | 2 | Trigger an IMU-prior lean when the floor constraint collapses | water-pool mode (a) dropout | the `Geo Trust Margin` telemetry → the clamp / a prior | Low–med |
 | 3 | Probabilistic soft-attenuation in the gate (per-direction SNR) | degeneracy brittleness | replaces the `degeneracySoftness` smoothstep | Low–med |
 | 4 | Per-direction trust from correspondence Jacobians (SuperLoc/X-ICP) | adaptive trust Layer 2 | the per-axis routing in `ADAPTIVE_TRUST.md` | Medium |

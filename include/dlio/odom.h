@@ -99,6 +99,21 @@ public:
   static void resolvePhotometricChannel(bool has_reflectivity, bool has_intensity,
                                         bool& use_reflectivity, bool& photometric_active);
 
+  // Sub-floor reject keep-mask (specular water/mirror "ghost" removal). Points
+  // are flat x/y/z arrays in a GRAVITY-ALIGNED frame (z = up). The floor is
+  // estimated PER 2D CELL as the lowest z-bin holding >= min_bin_count points
+  // (robust to the sparse sub-floor ghosts themselves, and to slope/curvature);
+  // a point is dropped (mask 0) only if it lies within `radius` of (cx,cy) AND
+  // more than `margin` below its cell's floor. Cells with no dense floor bin and
+  // points outside the radius are kept. If the drop fraction would exceed
+  // max_reject_frac, NOTHING is dropped (returns all-1) -- a safety no-op.
+  // Static + side-effect-free for unit testing.
+  static std::vector<uint8_t> subFloorKeepMask(
+      const std::vector<float>& xs, const std::vector<float>& ys,
+      const std::vector<float>& zs, float cx, float cy,
+      float radius, float cell, float z_bin, int min_bin_count,
+      float margin, float max_reject_frac);
+
 private:
 
   struct State;
@@ -129,6 +144,9 @@ private:
 
   void getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
   void preprocessPoints();
+  // Apply subFloorKeepMask to this->current_scan in place (no-op unless enabled
+  // and the world frame is gravity-aligned). Updates last_subfloor_rejected_.
+  void rejectSubFloor();
   void deskewPointcloud();
   void initializeInputTarget();
   void setInputSource();
@@ -446,6 +464,16 @@ private:
 
   bool densemap_filtered_;
   bool wait_until_move_;
+
+  // Sub-floor reject (specular ghost removal); off by default -> bit-identical.
+  bool subfloor_reject_enabled_ = false;
+  double subfloor_margin_ = 0.30;       // [m] reject this far below the cell floor
+  double subfloor_radius_ = 8.0;        // [m] horizontal window analyzed
+  double subfloor_cell_ = 1.0;          // [m] 2D cell size for per-cell floor
+  double subfloor_zbin_ = 0.10;         // [m] vertical bin for the floor histogram
+  int    subfloor_min_bin_ = 8;         // min points in a z-bin to count as floor
+  double subfloor_max_frac_ = 0.15;     // safety: skip if >this fraction would drop
+  int    last_subfloor_rejected_ = 0;   // diagnostic: points dropped last scan
 
   double crop_size_;
 

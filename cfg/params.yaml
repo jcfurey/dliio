@@ -66,6 +66,26 @@
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 0.25
 
+    # Sub-floor reject (specular ghost removal). Drops "ghost" returns that a
+    # mirror-like surface (a floor water pool / wet patch) plants BELOW the real
+    # floor, which otherwise drag the pose/map down. Per 2D cell it estimates the
+    # floor as the lowest dense z-bin (robust to the sparse ghosts and to
+    # slope/curvature) and rejects points more than `margin` below it; if the
+    # reject would exceed `maxRejectFrac` it is skipped (the floor estimate, not
+    # the scan, is suspect). OFF by default -> bit-identical. Requires a
+    # gravity-aligned odom frame (odom/imu/approximateGravity: true, the default),
+    # since it keys on world +Z = up. Watch the `Sub-floor Points Rejected`
+    # /diagnostics key: it should be ~0 in clean tracking and spike only at the
+    # reflective surface. Caveat: a genuine deep negative obstacle below the floor
+    # would also be rejected, so keep this off outside specular environments.
+    odom/preprocessing/subFloorReject/enabled: false
+    odom/preprocessing/subFloorReject/margin: 0.30        # [m] reject below cell floor
+    odom/preprocessing/subFloorReject/radius: 8.0         # [m] horizontal window analyzed
+    odom/preprocessing/subFloorReject/cell: 1.0           # [m] per-cell floor grid
+    odom/preprocessing/subFloorReject/zBin: 0.10          # [m] floor histogram bin
+    odom/preprocessing/subFloorReject/minBinCount: 8      # min points to count as floor
+    odom/preprocessing/subFloorReject/maxRejectFrac: 0.15 # safety: skip above this fraction
+
     # Keyframe creation thresholds: distance [m] and rotation [deg].
     # With adaptive: true (dlio.yaml) threshD is scaled by spaciousness.
     odom/keyframe/threshD: 1.0

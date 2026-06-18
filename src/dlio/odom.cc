@@ -13,6 +13,9 @@
 #include "dlio/odom.h"
 #include "dlio/utils.h"
 #include <set>
+#include <unordered_map>
+#include <limits>
+#include <cstdint>
 
 #include <queue>
 
@@ -561,6 +564,16 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "pointcloud/voxelize", this->vf_use_, true);
   dlio::declare_param(this, "odom/preprocessing/voxelFilter/res", this->vf_res_, 0.05);
 
+  // Sub-floor reject (specular ghost removal); OFF by default -> bit-identical.
+  // Requires a gravity-aligned odom frame (odom/imu/approximateGravity:true).
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/enabled", this->subfloor_reject_enabled_, false);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/margin", this->subfloor_margin_, 0.30);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/radius", this->subfloor_radius_, 8.0);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/cell", this->subfloor_cell_, 1.0);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/zBin", this->subfloor_zbin_, 0.10);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/minBinCount", this->subfloor_min_bin_, 8);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/maxRejectFrac", this->subfloor_max_frac_, 0.15);
+
   // Adaptive Parameters
   dlio::declare_param(this, "adaptive", this->adaptive_params_, true);
 
@@ -1029,6 +1042,95 @@ void dlio::OdomNode::resolvePhotometricChannel(bool has_reflectivity, bool has_i
   }
 }
 
+std::vector<uint8_t> dlio::OdomNode::subFloorKeepMask(
+    const std::vector<float>& xs, const std::vector<float>& ys,
+    const std::vector<float>& zs, float cx, float cy,
+    float radius, float cell, float z_bin, int min_bin_count,
+    float margin, float max_reject_frac) {
+
+  const size_t n = zs.size();
+  std::vector<uint8_t> keep(n, 1);
+  if (n == 0 || cell <= 0.f || z_bin <= 0.f || radius <= 0.f) { return keep; }
+
+  // Pass 1: per 2D cell, histogram z of the points inside the radius window.
+  // cell key packs (ix,iy) into one int64; z key is the floor-divided z-bin.
+  const float r2 = radius * radius;
+  std::unordered_map<int64_t, std::unordered_map<int, int>> hist;
+  for (size_t i = 0; i < n; ++i) {
+    const float dx = xs[i] - cx, dy = ys[i] - cy;
+    if (dx * dx + dy * dy > r2) { continue; }                 // only the near-range window
+    const int ix = static_cast<int>(std::floor(dx / cell));
+    const int iy = static_cast<int>(std::floor(dy / cell));
+    const int64_t ckey = (static_cast<int64_t>(ix) << 32) ^ (static_cast<uint32_t>(iy));
+    const int zb = static_cast<int>(std::floor(zs[i] / z_bin));
+    ++hist[ckey][zb];
+  }
+
+  // Pass 2: per cell, the floor is the LOWEST z-bin with >= min_bin_count points
+  // (dense surface). Sparse sub-floor ghosts don't form such a bin, so they
+  // can't pull the floor down. floor_z = lower edge of that bin.
+  std::unordered_map<int64_t, float> floor_z;
+  floor_z.reserve(hist.size());
+  for (const auto& cellkv : hist) {
+    int lowest = std::numeric_limits<int>::max();
+    for (const auto& zkv : cellkv.second) {
+      if (zkv.second >= min_bin_count && zkv.first < lowest) { lowest = zkv.first; }
+    }
+    if (lowest != std::numeric_limits<int>::max()) {
+      floor_z[cellkv.first] = static_cast<float>(lowest) * z_bin;
+    }
+  }
+
+  // Pass 3: drop in-window points more than `margin` below their cell's floor.
+  size_t dropped = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const float dx = xs[i] - cx, dy = ys[i] - cy;
+    if (dx * dx + dy * dy > r2) { continue; }
+    const int ix = static_cast<int>(std::floor(dx / cell));
+    const int iy = static_cast<int>(std::floor(dy / cell));
+    const int64_t ckey = (static_cast<int64_t>(ix) << 32) ^ (static_cast<uint32_t>(iy));
+    const auto it = floor_z.find(ckey);
+    if (it == floor_z.end()) { continue; }                    // no dense floor -> keep
+    if (zs[i] < it->second - margin) { keep[i] = 0; ++dropped; }
+  }
+
+  // Safety: a reject this large means the floor estimate is wrong, not that the
+  // scan is mostly ghosts -- don't gut the scan; no-op instead.
+  if (max_reject_frac > 0.f && dropped > static_cast<size_t>(max_reject_frac * n)) {
+    std::fill(keep.begin(), keep.end(), 1);
+  }
+  return keep;
+}
+
+void dlio::OdomNode::rejectSubFloor() {
+  this->last_subfloor_rejected_ = 0;
+  // Off by default; requires a gravity-aligned world frame (z = up), which the
+  // prior transform gives only when gravity_align_ is on.
+  if (!this->subfloor_reject_enabled_ || !this->gravity_align_) { return; }
+  if (!this->current_scan || this->current_scan->empty()) { return; }
+
+  const auto& in = *this->current_scan;
+  const size_t m = in.size();
+  std::vector<float> xs(m), ys(m), zs(m);
+  for (size_t i = 0; i < m; ++i) { xs[i] = in[i].x; ys[i] = in[i].y; zs[i] = in[i].z; }
+
+  const auto keep = OdomNode::subFloorKeepMask(
+      xs, ys, zs, this->T_prior(0, 3), this->T_prior(1, 3),
+      static_cast<float>(this->subfloor_radius_), static_cast<float>(this->subfloor_cell_),
+      static_cast<float>(this->subfloor_zbin_), this->subfloor_min_bin_,
+      static_cast<float>(this->subfloor_margin_), static_cast<float>(this->subfloor_max_frac_));
+
+  auto kept = std::make_shared<pcl::PointCloud<PointType>>();
+  kept->reserve(m);
+  for (size_t i = 0; i < m; ++i) {
+    if (keep[i]) { kept->push_back(in[i]); }
+    else { ++this->last_subfloor_rejected_; }
+  }
+  if (this->last_subfloor_rejected_ == 0) { return; }          // nothing dropped: leave as-is
+  kept->header = in.header;
+  this->current_scan = kept;
+}
+
 rcl_interfaces::msg::SetParametersResult
 dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   // Parameters that may be retuned live (the drift-hunt knobs). Others still
@@ -1347,6 +1449,11 @@ void dlio::OdomNode::preprocessPoints() {
   } else {
     this->current_scan = this->deskewed_scan;
   }
+
+  // Drop specular sub-floor "ghost" returns before registration/mapping. No-op
+  // unless enabled (off by default -> bit-identical), so it filters whichever
+  // cloud became current_scan and keeps ghosts out of the keyframe/submap too.
+  this->rejectSubFloor();
 
 }
 
@@ -3179,6 +3286,7 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Distance Traveled (m)", fnum(this->length_traversed, 3));
   kv("Keyframes", std::to_string(this->keyframes.size()));
   kv("Deskewed Points", std::to_string(this->deskew_size.load()));
+  kv("Sub-floor Points Rejected", std::to_string(this->last_subfloor_rejected_));
   kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
   // CPU starvation: realtime factor (>1 = slower than real time), cumulative
   // compute overruns, and an estimate of transport-dropped scans.
