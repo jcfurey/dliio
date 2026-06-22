@@ -297,6 +297,11 @@ public:
   // Empty image = no occlusion check (original behavior).
   void setLidarRangeImage(const cv::Mat& range_img);
   void setLidarRangeConsistency(float abs_tol, float rel_tol);
+  // Full-scale normalization for the COIN-LIO image term (default 255). The image
+  // pixel values and each map point's reference brightness are divided by this so
+  // the residual is dimensionless; set per CHANNEL (reflectivity ~255, near-IR/
+  // ambient ~thousands). Kept separate from the 3D photometric scale.
+  void setLidarImageScale(float scale);
   // Condition-scaled directional weighting of the LiDAR-map term (see
   // conditionScaleTerm): boost the term along geometrically-weak axes so it can
   // clear the degeneracy-gate rescue bar without inflating strong axes. power =
@@ -463,6 +468,7 @@ protected:
   int gradient_k_neighbors_;
   bool photometric_use_reflectivity_;  // false = intensity, true = reflectivity
   float photometric_scale_;            // channel full-scale; channel is divided by this
+  float lidar_image_scale_;            // COIN-LIO image full-scale (per-channel); separate from photometric_scale_
   float photometric_huber_delta_;      // Huber threshold (normalized units); <=0 disables
   float photometric_ref_count_;        // mass-normalization nominal count; 0 = off (raw)
   int last_photometric_count_;         // valid-gradient residuals in the last align()

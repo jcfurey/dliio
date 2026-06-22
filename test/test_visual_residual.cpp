@@ -508,6 +508,41 @@ TEST(LidarMapResidual, ResidualIsZeroAtTruth) {
   EXPECT_LT(b.norm(), 2e-3);
 }
 
+// setLidarImageScale retargets the per-channel full-scale normalization (the
+// residual is I_image - reflectivity/scale). Default 255 is exercised by
+// ResidualIsZeroAtTruth above (bit-identical); this checks a near-IR-like scale.
+TEST(LidarMapResidual, ImageScaleRetargetsReference) {
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto setup = [&](TestableGICP& g, float refl_scale) {
+    g.setLidarMapWeight(1.0f);
+    g.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+    g.setLidarFrame(Eigen::Isometry3f::Identity());          // world == lidar
+    g.setLidarImage(img);
+    auto target = makeLidarTarget();
+    // reference = image value at the point's own projection, scaled by refl_scale,
+    // so the residual is 0 iff the term normalizes by the same refl_scale.
+    for (auto& p : target->points) {
+      float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+      p.reflectivity = bilinearSampleRamp(img, u, v) * refl_scale;
+    }
+    g.setInputTarget(target);
+  };
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+
+  // A near-IR-like reference (sample * 2000) is zero ONLY when scale = 2000.
+  TestableGICP big; setup(big, 2000.f); big.setLidarImageScale(2000.f);
+  double cost_big = big.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(big.lastLidarMapCount(), 20);
+  EXPECT_NEAR(cost_big, 0.0, 1e-9);
+
+  // The same sample*2000 reference at the DEFAULT 255 scale is far from zero,
+  // proving the scale is actually applied (not ignored).
+  TestableGICP mis; setup(mis, 2000.f);                      // default scale 255
+  double cost_mis = mis.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(mis.lastLidarMapCount(), 20);
+  EXPECT_GT(cost_mis, 0.1);
+}
+
 TEST(LidarMapResidual, AnalyticJacobianMatchesFiniteDifference) {
   TestableGICP gicp;
   gicp.setLidarMapWeight(1.0f);

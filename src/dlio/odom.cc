@@ -736,6 +736,25 @@ void dlio::OdomNode::getParams() {
       "Cond-scale exponent on (lambda_max/lambda_k) per geometric eigen-direction");
   dlio::declare_param(this, "odom/lidar_image/condScale/cap", this->lidar_cs_cap_, 50.0,
       "Cond-scale max per-direction boost (alpha) applied to the LiDAR-map term");
+  // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
+  // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
+  // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is
+  // shot-noise-dominated per pixel, so it pairs with denoiseKernel. Default
+  // 'reflectivity' + scale 255 + no denoise is bit-identical to the prior behavior.
+  dlio::declare_param(this, "odom/lidar_image/channel", this->lidar_image_channel_, std::string("reflectivity"),
+      "Cloud field feeding the LiDAR-image slot: 'reflectivity' | 'intensity' | 'ambient' (near-IR)");
+  if (this->lidar_image_channel_ != "reflectivity" && this->lidar_image_channel_ != "intensity"
+      && this->lidar_image_channel_ != "ambient") {
+    RCLCPP_WARN(this->get_logger(),
+        "Unknown odom/lidar_image/channel '%s'; defaulting to 'reflectivity'.",
+        this->lidar_image_channel_.c_str());
+    this->lidar_image_channel_ = "reflectivity";
+  }
+  dlio::declare_param(this, "odom/lidar_image/scale", this->lidar_image_scale_, 255.0,
+      "Full-scale normalization of the LiDAR-image channel (reflectivity ~255, near-IR ~thousands)");
+  this->gicp.setLidarImageScale(static_cast<float>(this->lidar_image_scale_));
+  dlio::declare_param(this, "odom/lidar_image/denoiseKernel", this->lidar_image_denoise_kernel_, 0,
+      "K x K spatial box-blur of the organized image channel before residuals (<=1 = off; tames near-IR shot noise)");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
@@ -1321,9 +1340,18 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
   // 3D-spatial reflectivity photometric term).
   if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_) {
-    auto rfield = std::find_if(pc->fields.begin(), pc->fields.end(),
-        [](const sensor_msgs::msg::PointField& f){ return f.name == "reflectivity"; });
-    if (rfield != pc->fields.end()) {
+    // Which cloud field feeds the per-point image slot (point.reflectivity).
+    // Default 'reflectivity' -> bit-identical. The COIN-LIO image term may select
+    // a higher-texture channel (odom/lidar_image/channel = intensity|ambient);
+    // honoured only when the 3D reflectivity photometric term isn't also using
+    // the slot (they share it), so the default photometric path is unchanged.
+    std::string img_field = "reflectivity";
+    if (this->lidar_image_enabled_ && !(this->use_reflectivity_ && this->photometric_active_)) {
+      img_field = this->lidar_image_channel_;   // reflectivity | intensity | ambient
+    }
+    auto field_it = std::find_if(pc->fields.begin(), pc->fields.end(),
+        [&img_field](const sensor_msgs::msg::PointField& f){ return f.name == img_field; });
+    if (field_it != pc->fields.end()) {
       const size_t n = original_scan_->points.size();
       auto fill = [&](auto it) {
         for (size_t i = 0; i < n; ++i, ++it) {
@@ -1331,28 +1359,42 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
         }
       };
       using PF = sensor_msgs::msg::PointField;
-      switch (rfield->datatype) {
-        case PF::UINT8:   fill(sensor_msgs::PointCloud2ConstIterator<uint8_t >(*pc, "reflectivity")); break;
-        case PF::UINT16:  fill(sensor_msgs::PointCloud2ConstIterator<uint16_t>(*pc, "reflectivity")); break;
-        case PF::UINT32:  fill(sensor_msgs::PointCloud2ConstIterator<uint32_t>(*pc, "reflectivity")); break;
-        case PF::FLOAT32: fill(sensor_msgs::PointCloud2ConstIterator<float   >(*pc, "reflectivity")); break;
+      switch (field_it->datatype) {
+        case PF::UINT8:   fill(sensor_msgs::PointCloud2ConstIterator<uint8_t >(*pc, img_field)); break;
+        case PF::UINT16:  fill(sensor_msgs::PointCloud2ConstIterator<uint16_t>(*pc, img_field)); break;
+        case PF::UINT32:  fill(sensor_msgs::PointCloud2ConstIterator<uint32_t>(*pc, img_field)); break;
+        case PF::FLOAT32: fill(sensor_msgs::PointCloud2ConstIterator<float   >(*pc, img_field)); break;
         default:
           RCLCPP_WARN_ONCE(this->get_logger(),
-              "reflectivity field has unsupported datatype %u; channel will be zero.",
-              rfield->datatype);
+              "LiDAR-image channel '%s' has unsupported datatype %u; channel will be zero.",
+              img_field.c_str(), field_it->datatype);
           break;
       }
     } else {
-      // No 'reflectivity' field. The photometric term already fell back to
+      // Selected field absent. The 3D photometric term already fell back to
       // intensity above; the COIN-LIO LiDAR-image term still needs a per-point
       // channel, so build it from 'intensity' (already populated by fromROSMsg).
-      // The image is then a raw-intensity image (range-dependent, not calibrated
-      // reflectivity), but functional.
+      // The image is then a raw-intensity image (range-dependent, not calibrated),
+      // but functional.
       for (auto& p : original_scan_->points) { p.reflectivity = p.intensity; }
       RCLCPP_WARN_ONCE(this->get_logger(),
-          "LiDAR-image term: cloud has no 'reflectivity' field; using 'intensity' "
-          "for the LiDAR image (range-dependent, not calibrated reflectivity).");
+          "LiDAR-image term: cloud has no '%s' field; using 'intensity' for the "
+          "LiDAR image (range-dependent, not calibrated).", img_field.c_str());
     }
+  }
+
+  // Spatial denoise of the image channel: near-IR/ambient is shot-noise-dominated
+  // per pixel (temporal noise ~1.5x the Poisson floor), so a K x K box blur over
+  // the organized grid averages the independent shot noise down ~sqrt(valid
+  // neighbours) while preserving structured wall texture (lag-1 autocorr ~0.9).
+  // In-place on the .reflectivity slot before the image is built, so the current
+  // image and the keyframe references denoise consistently. No-op for K <= 1 or a
+  // non-organized cloud, and (default 0) bit-identical for reflectivity.
+  if (this->lidar_image_enabled_ && this->lidar_image_denoise_kernel_ > 1 &&
+      pc->height > 1 && original_scan_->height == pc->height &&
+      original_scan_->width == pc->width) {
+    this->denoiseOrganizedChannel(original_scan_, pc->width, pc->height,
+                                  this->lidar_image_denoise_kernel_);
   }
 
   // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
@@ -2203,11 +2245,55 @@ dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::Const
   return refs;
 }
 
+void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::Ptr& organized,
+                                             int width, int height, int kernel) {
+  if (kernel <= 1) { return; }
+  const int half = kernel / 2;
+  const size_t n = static_cast<size_t>(width) * static_cast<size_t>(height);
+  // Snapshot the slot + validity so the blur reads pre-denoise values (a valid
+  // pixel is a real return with finite x, matching buildLidarIntensityImage).
+  std::vector<float> in(n, 0.f);
+  std::vector<uint8_t> valid(n, 0);
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);   // organized access (col, row)
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
+        in[idx] = p.reflectivity;
+        valid[idx] = 1;
+      }
+    }
+  }
+  // Box-blur over the K x K neighbourhood, valid pixels only (no-return pixels
+  // are excluded and left untouched). No azimuth wrap at the col seam: at K~5 the
+  // seam columns simply lose a couple of neighbours, which is negligible.
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      if (!valid[idx]) { continue; }
+      float sum = 0.f; int cnt = 0;
+      for (int dr = -half; dr <= half; ++dr) {
+        const int r = row + dr;
+        if (r < 0 || r >= height) { continue; }
+        for (int dc = -half; dc <= half; ++dc) {
+          const int c = col + dc;
+          if (c < 0 || c >= width) { continue; }
+          const size_t nidx = static_cast<size_t>(r) * width + c;
+          if (valid[nidx]) { sum += in[nidx]; ++cnt; }
+        }
+      }
+      if (cnt > 0) { organized->at(col, row).reflectivity = sum / static_cast<float>(cnt); }
+    }
+  }
+}
+
 void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::ConstPtr& organized,
                                               int width, int height) {
   // Reflectivity image in native (row=ring, col=azimuth) order, normalized to
   // the same /scale units as the residual reference (point.reflectivity/scale).
-  const float inv_scale = 1.f / 255.0f;
+  // Per-channel scale (odom/lidar_image/scale; default 255, bit-identical) keeps
+  // the image and the gicp map-term reference normalized identically.
+  const float inv_scale = 1.f / static_cast<float>(this->lidar_image_scale_);
   cv::Mat img(height, width, CV_32FC1, cv::Scalar(0.f));
   cv::Mat rng(height, width, CV_32FC1, cv::Scalar(0.f));  // range [m]; 0 = no return
   for (int row = 0; row < height; ++row) {

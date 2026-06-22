@@ -1,0 +1,46 @@
+# EXAMPLE: Ouster tunnel — COIN-LIO LiDAR-image anchor on the NEAR-IR (ambient)
+# channel, spatially denoised. (2026-06-22, doc/FINDINGS_2026-06-22.md Part 5.)
+#
+# Why near-IR: the reflectivity channel this term used is the COARSEST the sensor
+# emits (only ~61 quantization levels, mean ~19) and is along-axis aliased on the
+# uniform tunnel wall, so the LiDAR-image term is a no-op for the degeneracy at any
+# weight (Parts 2-3). The /ouster/points cloud also carries an unused 'ambient'
+# (near-IR) field with ~100x the dynamic range (mean ~645, ~6000 distinct levels)
+# and real spatial texture (lag-1 autocorr ~0.9) — passive light, so it can pick up
+# wall markings/fixtures/staining that active reflectivity washes out.
+#
+# Why denoise: near-IR is also SHOT-NOISE-DOMINATED per pixel (a static patch
+# jitters ~15% of its mean, ~1.5x the Poisson floor). A raw per-pixel residual would
+# mostly fight noise. denoiseKernel applies a K x K spatial box-blur over the
+# organized scan (valid returns only), averaging the independent shot noise down
+# ~sqrt(valid neighbours) while preserving the structured texture.
+#
+# ISOLATION: this turns the 3D reflectivity photometric term OFF (photometricWeight
+# 0). That term shares the per-point image slot, and the code keeps the slot on
+# 'reflectivity' whenever the 3D reflectivity term is active — so the term MUST be
+# off for channel=ambient to take effect, and turning it off isolates the
+# LiDAR-image term under test for a clean A/B vs the reflectivity baseline.
+#
+# Overlay ON TOP of ouster_tunnel.yaml + ouster_tunnel_lidarimg.yaml, then this
+# (inherits weight 0.05, the occlusion gate, and the gate budget). No camera needed.
+#
+# A/B baseline = the same stack WITHOUT this file but WITH photometricWeight:=0.0
+# (reflectivity LiDAR-image term, 3D photometric off) — see the session note.
+
+/**:
+  ros__parameters:
+    # Isolate the LiDAR-image term: turn off the 3D reflectivity photometric term
+    # (also a prerequisite for channel=ambient to be honoured; they share the slot).
+    odom/gicp/photometricWeight: 0.0
+
+    # Feed the LiDAR-image slot from near-IR instead of reflectivity.
+    odom/lidar_image/channel: ambient
+
+    # Near-IR full-scale: mean ~645, so /2000 lands the bulk near ~0.3 normalized
+    # and meaningful texture diffs near the 0.05 huber knee. FIRST CUT — tune so the
+    # bulk residual sits near/below huberDelta (watch "Lidar Map RMS").
+    odom/lidar_image/scale: 2000.0
+
+    # K x K spatial box-blur of the near-IR channel before residuals (shot-noise
+    # suppression). 5x5 averages ~25 valid neighbours -> ~5x noise reduction.
+    odom/lidar_image/denoiseKernel: 5

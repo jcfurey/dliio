@@ -265,6 +265,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->gradient_k_neighbors_ = 10;
   this->photometric_use_reflectivity_ = false;
   this->photometric_scale_ = 255.0f;
+  this->lidar_image_scale_ = 255.0f;   // COIN-LIO image normalization (per-channel)
   this->photometric_huber_delta_ = 0.05f;
   this->photometric_ref_count_ = 0.0f;   // mass-normalization OFF by default (raw)
   this->last_photometric_count_ = 0;
@@ -380,6 +381,11 @@ void NanoGICP<PointSource, PointTarget>::setPhotometricChannel(bool use_reflecti
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricScale(float scale) {
     this->photometric_scale_ = (scale > 0.f) ? scale : 1.0f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarImageScale(float scale) {
+    this->lidar_image_scale_ = (scale > 0.f) ? scale : 1.0f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1622,7 +1628,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
     if (lidar_image_.empty() || lidar_image_.type() != CV_32FC1 || !target_) { return; }
     if (std::abs(lidar_az_a_) < 1e-12f || std::abs(lidar_el_a_) < 1e-12f) { return; }
 
-    const float inv_scale = 1.f / photometric_scale_;
+    const float inv_scale = 1.f / lidar_image_scale_;  // COIN-LIO image scale (per-channel)
     // world -> current lidar INCLUDING the correction (same trans-inverse form as
     // the camera map term, with the lidar frame instead of the camera).
     const Eigen::Isometry3f T_lw = T_lw_cur_ * trans.inverse();

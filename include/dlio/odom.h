@@ -99,6 +99,15 @@ public:
   static void resolvePhotometricChannel(bool has_reflectivity, bool has_intensity,
                                         bool& use_reflectivity, bool& photometric_active);
 
+  // Spatial box-blur the per-point image channel (the .reflectivity slot) over
+  // the organized K x K neighbourhood, averaging per-pixel shot noise down
+  // ~sqrt(valid neighbours) while preserving structured wall texture (near-IR is
+  // shot-noise-dominated). Restricted to valid-return pixels (finite x), in-place,
+  // and applied before the image is built so the current image and the keyframe
+  // references denoise consistently. No-op for K <= 1. Static for unit testing.
+  static void denoiseOrganizedChannel(const pcl::PointCloud<PointType>::Ptr& organized,
+                                      int width, int height, int kernel);
+
   // Sub-floor reject keep-mask (specular water/mirror "ghost" removal). Points
   // are flat x/y/z arrays in a GRAVITY-ALIGNED frame (z = up). The floor is
   // estimated PER 2D CELL as the lowest z-bin holding >= min_bin_count points
@@ -581,6 +590,9 @@ private:
   double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
   bool lidar_cond_scale_enabled_;      // direction-scale the lidar-map term along weak geom axes
   double lidar_cs_power_, lidar_cs_cap_;  // cond-scale exponent + per-direction boost cap
+  std::string lidar_image_channel_;    // cloud field feeding the image slot: reflectivity|intensity|ambient
+  double lidar_image_scale_;           // image full-scale normalization (per-channel; default 255)
+  int lidar_image_denoise_kernel_;     // K x K spatial box-blur of the organized channel (<=1 = off; tames near-IR shot noise)
   bool lidar_proj_ready_;
   bool lidar_img_ready_;               // a usable image was built for this scan
   // Build the reflectivity image + spherical projection model from an organized
