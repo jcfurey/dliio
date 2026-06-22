@@ -6,6 +6,8 @@
 
 #include <cmath>
 
+#include <Eigen/Dense>
+
 #include "dlio/dlio.h"
 #include "nano_gicp/nano_gicp.h"
 
@@ -807,6 +809,133 @@ TEST(NanoGICP, MinEigRegularizationKeepsInPlaneVariance) {
   }
   // unlike PLANE, the in-plane eigenvalues are the data variance, not 1.0
   EXPECT_TRUE(any_non_unit_inplane);
+}
+
+// --- Condition-scaled directional weighting (conditionScaleTerm) ---
+//
+// Reweights a map term toward geometrically-weak axes (judged from H_geo) so it
+// can clear the degeneracy-gate rescue bar there. alpha_k =
+// clamp((lambda_max/lambda_k)^power, 1, cap), S = V·diag(alpha)·Vᵀ per 3x3 block,
+// *H = S·H·S, *b = S·b. Pure function -> tested directly.
+
+namespace {
+Eigen::Matrix<double, 6, 6> diagGeo(double a, double b, double c,
+                                    double d, double e, double f) {
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Zero();
+  H(0, 0) = a; H(1, 1) = b; H(2, 2) = c;
+  H(3, 3) = d; H(4, 4) = e; H(5, 5) = f;
+  return H;
+}
+double alphaOf(double lam, double lmax, double power, double cap) {
+  double a = std::pow(lmax / lam, power);
+  return std::min(std::max(a, 1.0), cap);
+}
+}  // namespace
+
+// power = 0 -> every alpha = (lmax/lam)^0 = 1 -> S = I -> exact no-op.
+TEST(CondScale, PowerZeroIsIdentity) {
+  const auto Hgeo = diagGeo(100, 50, 1, 80, 2, 40);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity() * 3.0;
+  Eigen::Matrix<double, 6, 1> b; b << 1, 2, 3, 4, 5, 6;
+  const auto H0 = H; const auto b0 = b;
+  nano_gicp::conditionScaleTerm(Hgeo, 0.0, 50.0, &H, &b);
+  EXPECT_TRUE(H.isApprox(H0, 0.0));
+  EXPECT_TRUE(b.isApprox(b0, 0.0));
+}
+
+// cap = 1 -> alpha clamped to [1,1] = 1 -> exact no-op (regardless of power).
+TEST(CondScale, CapOneIsIdentity) {
+  const auto Hgeo = diagGeo(100, 50, 1, 80, 2, 40);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity() * 3.0;
+  Eigen::Matrix<double, 6, 1> b; b << 1, 2, 3, 4, 5, 6;
+  const auto H0 = H; const auto b0 = b;
+  nano_gicp::conditionScaleTerm(Hgeo, 2.0, 1.0, &H, &b);
+  EXPECT_TRUE(H.isApprox(H0, 0.0));
+  EXPECT_TRUE(b.isApprox(b0, 0.0));
+}
+
+// A block whose geometric Hessian is empty (lambda_max <= 0) is left untouched.
+TEST(CondScale, EmptyGeoBlockIsIdentity) {
+  // rotation block all-zero (no geometric rotation info), translation strong.
+  const auto Hgeo = diagGeo(0, 0, 0, 100, 100, 100);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::conditionScaleTerm(Hgeo, 1.0, 50.0, &H, &b);
+  // rotation block unchanged (identity), translation strong -> alpha=1 -> unchanged.
+  EXPECT_NEAR(H(0, 0), 1.0, 1e-12);
+  EXPECT_NEAR(H(1, 1), 1.0, 1e-12);
+  EXPECT_NEAR(H(2, 2), 1.0, 1e-12);
+  EXPECT_TRUE(b.isApprox(Eigen::Matrix<double, 6, 1>::Ones(), 1e-12));
+}
+
+// Diagonal H_geo -> eigenvectors are the axes -> S is diagonal diag(alpha) with
+// each axis scaled by alpha of ITS OWN eigenvalue. H term = I -> H' = diag(alpha²),
+// b ones -> b' = alpha. Exact, deterministic.
+TEST(CondScale, DiagonalExactBoostAndStrongUnchanged) {
+  const double p = 0.5, cap = 100.0;
+  // rot eigenvalues {100,100,1} (weak axis 2); trans {1,50,50} (weak axis 0).
+  const auto Hgeo = diagGeo(100, 100, 1, 1, 50, 50);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::conditionScaleTerm(Hgeo, p, cap, &H, &b);
+
+  const double a_rot_weak = alphaOf(1, 100, p, cap);   // sqrt(100) = 10
+  const double a_tr_weak  = alphaOf(1, 50, p, cap);    // sqrt(50)  ~ 7.071
+  EXPECT_NEAR(H(2, 2), a_rot_weak * a_rot_weak, 1e-9);  // weak rot stiffness x alpha²
+  EXPECT_NEAR(b(2), a_rot_weak, 1e-9);                  // weak rot drive     x alpha
+  EXPECT_NEAR(H(3, 3), a_tr_weak * a_tr_weak, 1e-9);    // weak trans
+  EXPECT_NEAR(b(3), a_tr_weak, 1e-9);
+  // strong axes (eigenvalue == lambda_max) -> alpha = 1 -> unchanged.
+  EXPECT_NEAR(H(0, 0), 1.0, 1e-9);
+  EXPECT_NEAR(b(0), 1.0, 1e-9);
+  EXPECT_NEAR(H(4, 4), 1.0, 1e-9);
+  EXPECT_NEAR(b(4), 1.0, 1e-9);
+}
+
+// The mechanism: a tiny isotropic-diluted term (like the measured ~2-16) clears
+// the rescue bar on the weak rotation axis only after condition-scaling.
+TEST(CondScale, WeakAxisClearsRescueBar) {
+  // rot eigenvalues {1e6,1e6,1e3} -> lambda_max=1e6, thresh = 0.005*1e6 = 5000;
+  // weak axis 2 has lambda=1e3 < thresh (degenerate). trans all strong.
+  const auto Hgeo = diagGeo(1e6, 1e6, 1e3, 1e6, 1e6, 1e6);
+  const double thresh = 0.005 * 1e6;
+  const Eigen::Vector3d vweak(0, 0, 1);
+  const double lam_geo_weak = 1e3;
+
+  Eigen::Matrix<double, 6, 6> Hterm = Eigen::Matrix<double, 6, 6>::Zero();
+  Hterm(2, 2) = 5.0;  // term supplies only ~5 on the weak axis (measured 2-16)
+  Eigen::Matrix<double, 6, 1> bterm = Eigen::Matrix<double, 6, 1>::Zero();
+
+  // Without cond-scale the gate's Rayleigh (lambda_geo + term) is below the bar.
+  EXPECT_LT(lam_geo_weak + 5.0, thresh);
+
+  nano_gicp::conditionScaleTerm(Hgeo, 0.5, 1000.0, &Hterm, &bterm);
+  const double comb = lam_geo_weak +
+                      vweak.dot(Hterm.block<3, 3>(0, 0) * vweak);
+  EXPECT_GT(comb, thresh);  // cond-scale lifts it past the rescue bar
+}
+
+// Symmetry + PSD preserved for a coupled PSD term.
+TEST(CondScale, PreservesSymmetryAndPSD) {
+  const auto Hgeo = diagGeo(100, 10, 1, 80, 5, 1);
+  Eigen::Matrix<double, 6, 6> M = Eigen::Matrix<double, 6, 6>::Random();
+  Eigen::Matrix<double, 6, 6> H = M * M.transpose();  // symmetric PSD, with coupling
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Random();
+  nano_gicp::conditionScaleTerm(Hgeo, 1.0, 50.0, &H, &b);
+  EXPECT_LT((H - H.transpose()).norm(), 1e-9);  // symmetric
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(H);
+  EXPECT_GT(es.eigenvalues()(0), -1e-9);        // PSD
+}
+
+// cap bounds the per-direction boost even for an extreme weakness/power.
+TEST(CondScale, CapBoundsBoost) {
+  const double cap = 8.0;
+  const auto Hgeo = diagGeo(1e8, 1e8, 1.0, 1e8, 1e8, 1e8);  // huge ratio on rot axis 2
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::conditionScaleTerm(Hgeo, 4.0, cap, &H, &b);
+  EXPECT_NEAR(H(2, 2), cap * cap, 1e-6);  // alpha clamped to cap -> stiffness cap²
+  EXPECT_NEAR(b(2), cap, 1e-9);
 }
 
 int main(int argc, char** argv) {

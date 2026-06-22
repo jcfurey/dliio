@@ -85,6 +85,23 @@ double softGateKeepFraction(double eigval, double thresh, double softness);
 // contribution); otherwise refcount/count. Pure free function (unit-tested).
 double refCountScale(double refcount, long count);
 
+// Condition-scaled (directional) reweighting of a map term's Hessian/gradient
+// contribution, judged from the GEOMETRIC Hessian's eigenbasis (so "weak" is a
+// geometry property, never the term's own). For each 3x3 block of `H_geo` (rot =
+// 0..2, trans = 3..5): eigendecompose, form S_block = V·diag(alpha_k)·Vᵀ with
+// alpha_k = clamp((lambda_max/lambda_k)^power, 1, cap), then with
+// S = blockdiag(S_rr, S_tt) apply *H_term = S·(*H_term)·S, *b_term = S·(*b_term)
+// (equivalent to J -> J·S: raises the term's stiffness AND drive along weak
+// directions by alpha²/alpha; strong directions alpha≈1 stay ~unchanged). Keeps
+// H_term symmetric PSD. A block with lambda_max <= 0 is left untouched (identity).
+// Lets a map term clear the degeneracy-gate rescue bar on a geometrically-weak
+// axis without inflating the strong axes (doc/REVIEW.md #8). Pure free function
+// (unit-tested); defined in nano_gicp.cc next to refCountScale.
+void conditionScaleTerm(const Eigen::Matrix<double, 6, 6>& H_geo,
+                        double power, double cap,
+                        Eigen::Matrix<double, 6, 6>* H_term,
+                        Eigen::Matrix<double, 6, 1>* b_term);
+
 // Margin-adaptive clamp scale: shrinks the IMU-consistency clamp cap as the
 // geometric trust margin degrades, so the correction is bounded harder toward the
 // IMU prior exactly where observability collapses (e.g. a specular floor dropout
@@ -271,6 +288,12 @@ public:
   // Empty image = no occlusion check (original behavior).
   void setLidarRangeImage(const cv::Mat& range_img);
   void setLidarRangeConsistency(float abs_tol, float rel_tol);
+  // Condition-scaled directional weighting of the LiDAR-map term (see
+  // conditionScaleTerm): boost the term along geometrically-weak axes so it can
+  // clear the degeneracy-gate rescue bar without inflating strong axes. power =
+  // exponent on (lambda_max/lambda_k), cap = max per-direction boost. enabled =
+  // false (default) -> the term accumulates directly, bit-identical.
+  void setLidarCondScale(bool enabled, float power, float cap);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
 
@@ -507,6 +530,9 @@ protected:
   cv::Mat lidar_range_img_;           // current range image [m], CV_32FC1, <=0 invalid (optional)
   float lidar_range_abs_tol_;         // occlusion tolerance: absolute [m]
   float lidar_range_rel_tol_;         // occlusion tolerance: relative (fraction of range)
+  bool  lidar_cond_scale_enabled_;    // direction-scale the term along weak geom axes; off = bit-identical
+  float lidar_cs_power_;              // exponent on (lambda_max/lambda_k) per direction
+  float lidar_cs_cap_;               // max per-direction boost (alpha)
   float last_lidar_map_rms_;
   int last_lidar_map_count_;
 };

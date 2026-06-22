@@ -117,6 +117,32 @@ double refCountScale(double refcount, long count) {
     return refcount / static_cast<double>(count);
 }
 
+// Condition-scaled directional reweighting of a map term (see nano_gicp.h).
+void conditionScaleTerm(const Eigen::Matrix<double, 6, 6>& H_geo,
+                        double power, double cap,
+                        Eigen::Matrix<double, 6, 6>* H_term,
+                        Eigen::Matrix<double, 6, 1>* b_term) {
+    if (cap < 1.0) { cap = 1.0; }
+    Eigen::Matrix<double, 6, 6> S = Eigen::Matrix<double, 6, 6>::Identity();
+    for (int blk = 0; blk < 2; ++blk) {
+        const int o = 3 * blk;                      // 0 = rotation, 3 = translation
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(H_geo.block<3, 3>(o, o));
+        const double lmax = es.eigenvalues()(2);    // ascending order: (2) is largest
+        if (!(lmax > 0.0)) { continue; }            // empty/degenerate block: identity
+        Eigen::Vector3d alpha;
+        for (int k = 0; k < 3; ++k) {
+            const double lam = es.eigenvalues()(k);
+            double a = (lam > 0.0) ? std::pow(lmax / lam, power) : cap;
+            a = std::min(std::max(a, 1.0), cap);    // boost weak (>=1), cap, never shrink
+            alpha(k) = a;
+        }
+        S.block<3, 3>(o, o) =
+            es.eigenvectors() * alpha.asDiagonal() * es.eigenvectors().transpose();
+    }
+    *H_term = S * (*H_term) * S;                     // J -> J·S : stiffness x alpha²
+    *b_term = S * (*b_term);                         //            drive     x alpha
+}
+
 // Margin-adaptive clamp scale (see nano_gicp.h). Pure and unit-tested.
 double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
                             double clamp_floor) {
@@ -294,6 +320,9 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->T_lw_cur_ = Eigen::Isometry3f::Identity();
   this->lidar_range_abs_tol_ = 0.5f;
   this->lidar_range_rel_tol_ = 0.1f;
+  this->lidar_cond_scale_enabled_ = false;  // direction-scaling OFF -> bit-identical
+  this->lidar_cs_power_ = 1.0f;
+  this->lidar_cs_cap_ = 50.0f;
   this->last_lidar_map_rms_ = 0.0f;
   this->last_lidar_map_count_ = 0;
 }
@@ -524,6 +553,13 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setLidarRangeConsistency(float abs_tol, float rel_tol) {
     this->lidar_range_abs_tol_ = (abs_tol > 0.f) ? abs_tol : 0.f;
     this->lidar_range_rel_tol_ = (rel_tol > 0.f) ? rel_tol : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarCondScale(bool enabled, float power, float cap) {
+    this->lidar_cond_scale_enabled_ = enabled;
+    this->lidar_cs_power_ = (power > 0.f) ? power : 0.f;
+    this->lidar_cs_cap_   = (cap   > 1.f) ? cap   : 1.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -884,7 +920,23 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         }
         // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
         if (lidar_map_weight_ > 0.f) {
-            accumulateLidarMapResidual(trans, &H, &b, nullptr);
+            if (lidar_cond_scale_enabled_) {
+                // Direction-scale the term toward the geometrically-weak axes so
+                // it can clear the gate's rescue bar there (its isotropic mass is
+                // otherwise ~250-10000x short on the degenerate axis). Accumulate
+                // into a separate H_lid/b_lid, reweight via the GEOMETRIC eigenbasis
+                // (H_geo, judged before any term), then add. The per-scan rescue
+                // budget below still bounds the resulting motion. See REVIEW.md #8.
+                Eigen::Matrix<double, 6, 6> H_lid = Eigen::Matrix<double, 6, 6>::Zero();
+                Eigen::Matrix<double, 6, 1> b_lid = Eigen::Matrix<double, 6, 1>::Zero();
+                accumulateLidarMapResidual(trans, &H_lid, &b_lid, nullptr);
+                conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
+                                   static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
+                H += H_lid;
+                b += b_lid;
+            } else {
+                accumulateLidarMapResidual(trans, &H, &b, nullptr);  // bit-identical
+            }
         }
 
         // Snapshot the combined (geometric + photometric) Hessian BEFORE

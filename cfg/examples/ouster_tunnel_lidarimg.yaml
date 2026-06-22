@@ -75,3 +75,16 @@
     # anchor can't run away.
     odom/visual/map/gateMaxStepTrans: 1.0
     odom/visual/map/gateMaxStepRot: 0.1
+
+    # Condition-scaled directional weighting (2026-06-22, doc/FINDINGS_2026-06-22.md
+    # Part 2). The reason the weight above is a no-op for the degeneracy: the term's
+    # isotropic mass lands on the strong (wall) axes and is ~250-10000x short of the
+    # rescue bar on the weak (rotation) axis, so the gate erases its along-axis
+    # contribution. condScale boosts the term along the geometrically-weak axes
+    # (judged from the geometric Hessian) so it can clear the rescue bar there
+    # without inflating the strong axes; the per-scan gate budget above still bounds
+    # the motion. OFF here by default (bit-identical) -- enable + sweep power/cap to
+    # test (watch for over-travel on uniform/aliased stretches).
+    # odom/lidar_image/condScale/enabled: true
+    # odom/lidar_image/condScale/power: 1.0    # exponent on (lambda_max/lambda_k)
+    # odom/lidar_image/condScale/cap: 50.0     # max per-direction boost

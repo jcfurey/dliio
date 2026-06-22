@@ -720,6 +720,15 @@ void dlio::OdomNode::getParams() {
       "Occlusion check: absolute range tolerance [m] for accepting a projected map point");
   dlio::declare_param(this, "odom/lidar_image/rangeRelTol", this->lidar_range_rel_tol_, 0.1,
       "Occlusion check: relative range tolerance (fraction of pixel range)");
+  // Condition-scaled directional weighting: boost the LiDAR-map term along the
+  // geometrically-weak (degenerate) axes so it can clear the gate's rescue bar
+  // there. OFF by default -> the term accumulates directly (bit-identical).
+  dlio::declare_param(this, "odom/lidar_image/condScale/enabled", this->lidar_cond_scale_enabled_, false,
+      "Direction-scale the LiDAR-map term toward geometrically-weak axes (clears the rescue bar there)");
+  dlio::declare_param(this, "odom/lidar_image/condScale/power", this->lidar_cs_power_, 1.0,
+      "Cond-scale exponent on (lambda_max/lambda_k) per geometric eigen-direction");
+  dlio::declare_param(this, "odom/lidar_image/condScale/cap", this->lidar_cs_cap_, 50.0,
+      "Cond-scale max per-direction boost (alpha) applied to the LiDAR-map term");
   // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
   // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
   std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
@@ -2313,6 +2322,9 @@ void dlio::OdomNode::getNextPose() {
     this->gicp.setLidarRangeConsistency(static_cast<float>(this->lidar_range_abs_tol_),
                                         static_cast<float>(this->lidar_range_rel_tol_));
     this->gicp.setLidarFrame(T_lw);
+    this->gicp.setLidarCondScale(this->lidar_cond_scale_enabled_,
+                                 static_cast<float>(this->lidar_cs_power_),
+                                 static_cast<float>(this->lidar_cs_cap_));
     this->gicp.setLidarMapWeight(static_cast<float>(this->lidar_image_weight_));
   } else {
     this->gicp.setLidarMapWeight(0.f);
