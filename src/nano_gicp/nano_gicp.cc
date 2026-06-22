@@ -296,6 +296,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->visual_weight_ = 0.0f;
   this->visual_ref_count_ = 0.0f;        // mass-normalization OFF by default (raw)
   this->visual_huber_delta_ = 0.05f;
+  this->visual_src_ = nullptr;           // dense f2f source OFF -> iterate input_
+  this->visual_src_max_ = 0;
   this->visual_fx_ = this->visual_fy_ = this->visual_cx_ = this->visual_cy_ = 0.0f;
   this->T_cw_cur_ = Eigen::Isometry3f::Identity();
   this->T_cw_prev_ = Eigen::Isometry3f::Identity();
@@ -450,6 +452,13 @@ void NanoGICP<PointSource, PointTarget>::setVisualPreviousFrame(
     const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world) {
     this->visual_prev_ = image_norm;
     this->T_cw_prev_ = T_cam_world;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setVisualSource(
+    const PointCloudSourceConstPtr& cloud, int max_points) {
+    this->visual_src_ = cloud;
+    this->visual_src_max_ = (max_points > 0) ? max_points : 0;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1383,10 +1392,19 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
     long count = 0;
     long rej_behind = 0, rej_oob = 0, rej_grad = 0;   // diagnostics only
 
+    // Source cloud: the dense deskewed scan if provided (strided to bound cost),
+    // else the voxelised registration cloud (input_) at stride 1 (bit-identical).
+    // Both are the same deskewed WORLD frame, so the projection math is identical.
+    const bool use_dense = (this->visual_src_ && !this->visual_src_->empty());
+    const auto& src = use_dense ? *this->visual_src_ : *input_;
+    const int n_src = static_cast<int>(src.size());
+    const int stride = (use_dense && this->visual_src_max_ > 0 && n_src > this->visual_src_max_)
+                           ? (n_src / this->visual_src_max_) : 1;
+
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) \
         reduction(+:cost_sum,sq_sum,count,rej_behind,rej_oob,rej_grad)
-    for (int i = 0; i < input_->size(); ++i) {
-        const auto& sp = input_->at(i);
+    for (int i = 0; i < n_src; i += stride) {
+        const auto& sp = src.at(i);
         const Eigen::Vector3f p_w(sp.x, sp.y, sp.z);     // raw world point (prior pose)
         const Eigen::Vector3f x = trans * p_w;           // pose-corrected world point
 

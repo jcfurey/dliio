@@ -726,6 +726,91 @@ TEST(LidarMapResidual, AnalyticJacobianMatchesFiniteDifferenceWithNonUniformLut)
       << "\nana=" << analytic.transpose();
 }
 
+// --- Dense source cloud for the frame-to-frame term (setVisualSource) ---
+//
+// The f2f term iterates the source cloud only to PROJECT points for brightness.
+// A dense source (the full deskewed scan) keeps the narrow camera FOV populated
+// where the voxelised input_ collapses to ~0. Null source -> iterate input_
+// (bit-identical). See doc/FINDINGS_2026-06-22.md Part 1/4.
+
+namespace {
+// Build a small f2f scene; returns the configured gicp ready for visualSystem.
+void setupF2F(TestableGICP& g) {
+  g.setVisualEnabled(true);
+  g.setVisualWeight(1.0f);
+  g.setVisualHuberDelta(0.f);
+  g.setVisualIntrinsics(kFx, kFy, kCx, kCy);
+  cv::Mat cur = makeRampImage(kW, kH, 0.01f, 0.007f, 0.2f);
+  cv::Mat prev = makeRampImage(kW, kH, 0.01f, 0.007f, 0.25f);  // != cur -> nonzero r
+  g.setVisualCurrentFrame(cur, lookingDownCamera(5.f));
+  g.setVisualPreviousFrame(prev, lookingDownCamera(5.f));
+}
+// A dense in-FOV cloud (looking-down camera at height 5): n x n grid on z=0.
+Cloud::Ptr makeDenseGrid(int n) {
+  auto c = std::make_shared<Cloud>();
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j)
+      c->push_back(makePoint(-1.f + 2.f * i / (n - 1), -1.f + 2.f * j / (n - 1), 0.f));
+  return c;
+}
+}  // namespace
+
+// Null dense source -> the term iterates input_, bit-identical.
+TEST(VisualDenseSource, NullSourceIsBitIdentical) {
+  auto input = makeWorldPoints();
+  TestableGICP a; setupF2F(a); a.setInputSource(input);
+  Eigen::Matrix<double, 6, 6> Ha; Eigen::Matrix<double, 6, 1> ba;
+  double ca = a.visualSystem(Eigen::Isometry3f::Identity(), Ha, ba);
+
+  TestableGICP b; setupF2F(b); b.setInputSource(input);
+  b.setVisualSource(nullptr, 4000);                  // explicitly off
+  Eigen::Matrix<double, 6, 6> Hb; Eigen::Matrix<double, 6, 1> bb;
+  double cb = b.visualSystem(Eigen::Isometry3f::Identity(), Hb, bb);
+
+  EXPECT_EQ(a.lastVisualCount(), b.lastVisualCount());
+  EXPECT_DOUBLE_EQ(ca, cb);
+  EXPECT_TRUE(Ha.isApprox(Hb, 0.0));
+  EXPECT_TRUE(ba.isApprox(bb, 0.0));
+}
+
+// A dense source overrides a sparse input_: the iterated/kept count reflects the
+// dense cloud, not the tiny registration cloud (the de-starvation mechanism).
+TEST(VisualDenseSource, DenseOverridesSparseInput) {
+  auto sparse = std::make_shared<Cloud>();          // 4 in-FOV points
+  sparse->push_back(makePoint(0.f, 0.f, 0.f));
+  sparse->push_back(makePoint(0.2f, 0.f, 0.f));
+  sparse->push_back(makePoint(0.f, 0.2f, 0.f));
+  sparse->push_back(makePoint(-0.2f, -0.2f, 0.f));
+
+  TestableGICP base; setupF2F(base); base.setInputSource(sparse);
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> bvec;
+  base.visualSystem(Eigen::Isometry3f::Identity(), H, bvec);
+  const int sparse_count = base.lastVisualCount();
+  EXPECT_LE(sparse_count, 4);
+
+  TestableGICP dense; setupF2F(dense); dense.setInputSource(sparse);
+  dense.setVisualSource(makeDenseGrid(9), 4000);     // 81 in-FOV points, no stride
+  dense.visualSystem(Eigen::Isometry3f::Identity(), H, bvec);
+  EXPECT_GT(dense.lastVisualCount(), sparse_count);  // de-starved
+  EXPECT_GE(dense.lastVisualCount(), 60);            // ~81 in-FOV
+}
+
+// maxPoints strides the dense source down, bounding per-iteration cost.
+TEST(VisualDenseSource, StrideCapsIteration) {
+  auto grid = makeDenseGrid(11);                     // 121 in-FOV points
+  TestableGICP full; setupF2F(full); full.setInputSource(makeWorldPoints());
+  full.setVisualSource(grid, 4000);                  // no stride
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> bvec;
+  full.visualSystem(Eigen::Isometry3f::Identity(), H, bvec);
+  EXPECT_GE(full.lastVisualCount(), 110);            // ~121 kept
+
+  TestableGICP capped; setupF2F(capped); capped.setInputSource(makeWorldPoints());
+  capped.setVisualSource(grid, 30);                  // stride = 121/30 = 4 -> ~31 kept
+  capped.visualSystem(Eigen::Isometry3f::Identity(), H, bvec);
+  EXPECT_LT(capped.lastVisualCount(), full.lastVisualCount());
+  EXPECT_LE(capped.lastVisualCount(), 40);           // <= ~maxPoints
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

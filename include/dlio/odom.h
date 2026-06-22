@@ -532,6 +532,8 @@ private:
   double visual_weight_;
   double visual_huber_delta_;
   double visual_max_dt_;                 // max |image_stamp - scan_stamp| [s]
+  bool visual_dense_source_;             // feed the f2f term the dense deskewed cloud (not voxelised input_)
+  int visual_dense_max_;                 // stride the dense f2f source down to <= this many points
   double last_visual_match_dt_ = -1.0;   // diagnostics: |dt| of the matched frame, -1 = none
   double visual_gate_max_trans_;         // gate safety floor: max step [m]
   double visual_gate_max_rot_;           // gate safety floor: max step [rad]

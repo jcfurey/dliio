@@ -39,6 +39,16 @@
     odom/visual/gateMaxStepTrans: 0.2   # [m] per scan
     odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
 
+    # Dense source for the frame-to-frame term (2026-06-22, FINDINGS Part 1/4).
+    # The f2f term iterates the source cloud only to PROJECT points for brightness;
+    # the voxelised registration cloud (~1-3k pts) is too sparse to populate the
+    # narrow side-camera FOV (the in-FOV count collapses to ~0 as it shrinks).
+    # Enabling this projects the full deskewed scan (~43k pts, same world frame),
+    # strided to maxPoints, so the FOV stays populated. OFF here by default
+    # (bit-identical -> iterates input_); enable to test.
+    # odom/visual/denseSource/enabled: true
+    # odom/visual/denseSource/maxPoints: 4000
+
     # Frame-to-MAP camera term: the absolute anchor that breaks the tunnel
     # drag-back (registers the current image to per-keyframe wall-texture refs).
     odom/visual/map/enabled: true

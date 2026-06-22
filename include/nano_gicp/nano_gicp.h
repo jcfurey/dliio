@@ -236,6 +236,15 @@ public:
   // Previous frame: warp-target image + world->camera transform (previous
   // optimized pose). Pose-corrected world points project here.
   void setVisualPreviousFrame(const cv::Mat& image_norm, const Eigen::Isometry3f& T_cam_world);
+  // Optional DENSE source cloud for the frame-to-frame term: the f2f residual
+  // only needs world-frame points to project for brightness, not the voxelised
+  // registration cloud (input_). input_ is too sparse to populate the narrow
+  // camera FOV (the in-FOV count collapses to ~0 as it shrinks); the full
+  // deskewed scan is the same deskewed world frame but ~30x denser. When set
+  // (non-null, non-empty), accumulateVisualResidual iterates this cloud strided
+  // to <= max_points instead of input_. Null cloud (default) -> iterate input_
+  // at stride 1, bit-identical. See doc/FINDINGS_2026-06-22.md Part 1/4.
+  void setVisualSource(const PointCloudSourceConstPtr& cloud, int max_points);
   // Safety floor for the degeneracy gate when the visual term is on. The gate
   // judges observability from LiDAR geometry alone; on a geometrically
   // degenerate axis the visual term is allowed to drive motion ONLY if it
@@ -499,6 +508,8 @@ protected:
   float visual_fx_, visual_fy_, visual_cx_, visual_cy_;
   cv::Mat visual_cur_;          // current image (fixed reference brightness), CV_32F 1ch
   cv::Mat visual_prev_;         // previous image (pose-dependent warp target), CV_32F 1ch
+  PointCloudSourceConstPtr visual_src_;  // optional dense f2f source (null -> use input_)
+  int visual_src_max_;          // stride the dense source down to <= this many points
   Eigen::Isometry3f T_cw_cur_;  // world -> current camera (from prior pose)
   Eigen::Isometry3f T_cw_prev_; // world -> previous camera (previous optimized pose)
   float visual_gate_max_trans_; // gate rescue BUDGET: max total translation deviation per scan [m]

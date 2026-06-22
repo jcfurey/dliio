@@ -685,6 +685,13 @@ void dlio::OdomNode::getParams() {
       "Huber threshold on the normalized visual residual (<= 0 disables robustification)");
   dlio::declare_param(this, "odom/visual/maxTimeDiff", this->visual_max_dt_, 0.05,
       "Max |image_stamp - scan_stamp| [s] to pair a camera frame with a scan");
+  // Dense source for the frame-to-frame term: project the full deskewed scan
+  // (not the sparse voxelised registration cloud) so the narrow camera FOV stays
+  // populated. OFF by default -> the f2f term iterates input_ (bit-identical).
+  dlio::declare_param(this, "odom/visual/denseSource/enabled", this->visual_dense_source_, false,
+      "Feed the f2f visual term the dense deskewed scan instead of the voxelised registration cloud");
+  dlio::declare_param(this, "odom/visual/denseSource/maxPoints", this->visual_dense_max_, 4000,
+      "Stride the dense f2f source down to <= this many points (bounds per-iteration cost)");
   // Degeneracy-gate safety floor: when the visual term rescues a LiDAR-
   // degenerate axis, its total deviation from the IMU prior along that axis is
   // bounded to these PER-SCAN budgets (summed across LM iterations), so a
@@ -2146,6 +2153,12 @@ bool dlio::OdomNode::setupVisualForScan() {
                                     static_cast<float>(this->visual_gate_max_rot_));
     if (this->visual_has_prev_) { this->gicp.setVisualEnabled(true); }
     this->gicp.setVisualPreviousFrame(this->visual_prev_img_, this->visual_T_cw_prev_);
+    // Dense source: project the full deskewed scan (world frame) so the narrow
+    // camera FOV stays populated as the registration cloud shrinks. Null when
+    // disabled -> the term iterates the voxelised input_ (bit-identical).
+    this->gicp.setVisualSource(
+        this->visual_dense_source_ ? this->deskewed_scan : nullptr,
+        this->visual_dense_max_);
   }
 
   return want_f2m || (want_f2f && this->visual_has_prev_);
