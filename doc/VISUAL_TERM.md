@@ -181,6 +181,16 @@ numeric Jacobian). Full suite 21/21.
 
 ## Status / results (06042026 tunnel, n=3, see test-harness notes)
 
+> **2026-06-22 update:** per-gate instrumentation confirmed the frame-to-frame
+> term engages and produces ~160 in-bounds visual points/scan when the pose is
+> healthy (pairing, intrinsics, extrinsic, world-frame source all verified). The
+> `Visual Points = 0` reported on 2026-06-18 was a measurement artifact, not a
+> bug: the points collapse late-run at the *reference* projection as the
+> voxelised source cloud shrinks and the narrow side-camera FOV empties
+> (`behind_mov = oob_mov = grad = 0` all run). Highest-leverage de-starve =
+> project the dense deskewed cloud instead of the voxelised `input_`. See
+> `FINDINGS_2026-06-22.md`.
+
 The term is correctly engineered and the mechanism is verified at runtime
 (healthy runs: `deg=1, rescued=1, ~450 visual points`; failures are full
 collapses `deg=6, vpts→0` resembling the LiDAR-only baseline instability — not

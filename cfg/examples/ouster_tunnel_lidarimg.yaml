@@ -24,6 +24,17 @@
   ros__parameters:
     odom/lidar_image/enabled: true
 
+    # 2026-06-22: DO NOT keep tuning this scalar. Instrumenting the gate showed the
+    # term rescues the degenerate axis essentially NEVER (Visual Rescued Axes ≈ 0)
+    # at BOTH w0.05 and w0.30 — a no-op for the tunnel degeneracy at any sane
+    # weight: its isotropic count-normalized mass lands on the strong (wall) axes
+    # and is diluted off the weak along-axis, so it never clears the 0.005·λ_max
+    # rescue bar and the gate erases its along-axis contribution. The "DIV" the
+    # 06-18 sweep blamed on it is the baseline geometric collapse (deg=6 from
+    # H_geo, term passive). The fix is a code change (direction-scaled weighting /
+    # degeneracy-complementary point selection / absolute-floor rescue), NOT a
+    # weight. See doc/FINDINGS_2026-06-22.md Part 2.
+    #
     # Count-normalized weight (the term's Hessian mass is normalized to a nominal
     # point count, so this is comparable to the geometric term and stable
     # regardless of how many points are visible). The old raw weight 0.3
