@@ -12,6 +12,7 @@
 
 #include "dlio/odom.h"
 #include "dlio/utils.h"
+#include "dlio/degeneracy_governor.h"
 #include <set>
 #include <unordered_map>
 #include <limits>
@@ -265,6 +266,29 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Tightest cap fraction at full degeneracy (multiplier in (0,1])", 0.0, 1.0);
   this->gicp.setAdaptiveClamp(adaptiveClampEnabled, static_cast<float>(clampMarginLo),
       static_cast<float>(clampMarginHi), static_cast<float>(clampFloor));
+
+  // Degeneracy GOVERNOR (fail-safe for the held-prior runaway). On the axes the
+  // gate flagged degenerate and held to the IMU prior, that prior dead-reckons
+  // (and double-integrates accel/gyro bias) into the km-scale tunnel runaway
+  // that no existing clamp catches (maxCorrection bounds the GICP CORRECTION,
+  // not the prior). The governor caps per-scan OUTPUT motion along those
+  // world-frame directions vs the previous pose to a physical per-scan step;
+  // bounding the pose pulls the velocity back via updateState()'s observer.
+  // Cov inflation marks the held axes untrusted for downstream consumers.
+  // Master off / 0 caps = bit-identical. maxStep is a per-scan cap [m]/[rad]
+  // (~ platform max speed / scan rate, e.g. 3 m/s at 10 Hz -> 0.30 m).
+  dlio::declare_param(this, "odom/degenGov/enabled", this->degen_gov_enabled_, false);
+  double degenMaxStepTrans, degenMaxStepRot;
+  dlio::declare_param(this, "odom/degenGov/maxStepTrans", degenMaxStepTrans, 0.0,
+      "Max per-scan output motion along a held-degenerate translation axis [m] (0 disables)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/degenGov/maxStepRot", degenMaxStepRot, 0.0,
+      "Max per-scan output motion about a held-degenerate rotation axis [rad] (0 disables)", 0.0, 3.1416);
+  this->degen_gov_max_step_trans_ = static_cast<float>(degenMaxStepTrans);
+  this->degen_gov_max_step_rot_ = static_cast<float>(degenMaxStepRot);
+  dlio::declare_param(this, "odom/degenGov/covPosVar", this->degen_gov_cov_pos_var_, 0.0,
+      "Variance added to /odom pose cov along a held-degenerate position axis [m^2] (0 = none)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/degenGov/covRotVar", this->degen_gov_cov_rot_var_, 0.0,
+      "Variance added to /odom pose cov along a held-degenerate rotation axis [rad^2] (0 = none)", 0.0, 1e6);
 
   // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
   // nominal residual count so its weight is independent of how many points are
@@ -848,10 +872,21 @@ void dlio::OdomNode::publishPose() {
   // lock) so the published pose is internally consistent, not a torn read.
   State st;
   rclcpp::Time stamp;
+  const bool cov_inflate = this->degen_gov_enabled_ &&
+      (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0);
+  std::array<double, 36> cov_extra{};
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
     st = this->state;
     stamp = this->imu_stamp;
+    if (cov_inflate) { cov_extra = this->degen_cov_extra_; }
+  }
+
+  // Degeneracy cov inflation: base diagonal + the rank-1 held-axis terms. Only
+  // when active -> otherwise the ctor-set constant cov is published untouched.
+  if (cov_inflate) {
+    for (int i = 0; i < 36; ++i) { this->odom_ros.pose.covariance[i] = cov_extra[i]; }
+    for (int i = 0; i < 6; ++i) { this->odom_ros.pose.covariance[i * 7] += this->pose_cov_[i]; }
   }
 
   // nav_msgs::msg::Odometry  (frame_id / child_frame_id set once in the ctor)
@@ -2449,8 +2484,30 @@ void dlio::OdomNode::getNextPose() {
   }
 
   // Get final transformation in global frame
+  const Eigen::Matrix4f T_prev_governed = this->T;   // previous (governed) output pose
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
+
+  // Degeneracy GOVERNOR: cap per-scan output motion along the eigen-directions
+  // the gate held to the IMU prior, so a held axis cannot dead-reckon into the
+  // km-scale runaway. Clamps the displacement of this->T vs the previous output
+  // pose, projected onto each held world-frame direction, to a physical
+  // per-scan step; recomputes T_corr so the published cloud stays consistent.
+  // Bounding the pose pulls the velocity estimate back via updateState()'s
+  // observer. Off / 0 caps / no held dirs -> untouched (bit-identical).
+  if (this->degen_gov_enabled_ &&
+      (this->degen_gov_max_step_trans_ > 0.f || this->degen_gov_max_step_rot_ > 0.f)) {
+    const Eigen::Matrix4f T_governed = dlio::governPose(
+        T_prev_governed, this->T,
+        this->gicp.lastDegenTransDirs(), this->gicp.lastDegenRotDirs(),
+        this->degen_gov_max_step_trans_, this->degen_gov_max_step_rot_);
+    if (!T_governed.isApprox(this->T)) {
+      this->T = T_governed;
+      // keep the correction consistent with the governed pose (publish cloud,
+      // keyframe transforms downstream both use T_corr).
+      this->T_corr = this->T * this->T_prior.inverse();
+    }
+  }
 
   // Promote this scan's camera frame to "previous" for the next scan's warp,
   // using the corrected pose (world -> camera at this->T).
@@ -2810,6 +2867,31 @@ void dlio::OdomNode::updateState() {
   this->geo.prev_q = this->state.q;
   this->geo.prev_vel = this->state.v.lin.w;
 
+  // Degeneracy covariance inflation (under geo.mtx, read by publishPose): mark
+  // the held world-frame axes untrusted with a rank-1 add (covVar * d d^T) on
+  // the position / rotation blocks. Off (or no held axis) -> left zero and the
+  // base diagonal cov is published unchanged (bit-identical). The held dirs are
+  // valid on this (scan) thread until the next align().
+  if (this->degen_gov_enabled_ &&
+      (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0)) {
+    this->degen_cov_extra_.fill(0.0);
+    if (this->degen_gov_cov_pos_var_ > 0.0) {
+      for (const auto& dd : this->gicp.lastDegenTransDirs()) {
+        const Eigen::Vector3d d = dd.normalized();
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            this->degen_cov_extra_[r * 6 + c] += this->degen_gov_cov_pos_var_ * d(r) * d(c);
+      }
+    }
+    if (this->degen_gov_cov_rot_var_ > 0.0) {
+      for (const auto& dd : this->gicp.lastDegenRotDirs()) {
+        const Eigen::Vector3d d = dd.normalized();
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            this->degen_cov_extra_[(3 + r) * 6 + (3 + c)] += this->degen_gov_cov_rot_var_ * d(r) * d(c);
+      }
+    }
+  }
 }
 
 sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu_raw) {

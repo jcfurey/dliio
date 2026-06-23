@@ -359,6 +359,15 @@ public:
   float lastKernelScale() const;
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
+  // World-frame eigen-directions the gate flagged degenerate AND HELD (not
+  // visually rescued) in the last align(). The correction was erased along
+  // these, so the pose dead-reckons the IMU prior there -- the downstream
+  // "degeneracy governor" clamps per-scan motion along them, and covariance
+  // inflation marks them untrusted. The vectors live in the same frame as the
+  // optimization step dx (left/world perturbation of T_corr), i.e. world.
+  // Empty when the gate did not fire (or is disabled).
+  const std::vector<Eigen::Vector3d>& lastDegenRotDirs() const;
+  const std::vector<Eigen::Vector3d>& lastDegenTransDirs() const;
   // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs
   // the initial guess / IMU prior) to this translation [m] and rotation [rad]
   // envelope. Over a ~0.1s scan the IMU prior is high-confidence, so the
@@ -496,6 +505,10 @@ protected:
   int last_degenerate_directions_;
   float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a
+  // World-frame eigen-directions held degenerate (not rescued) in the last
+  // align(); consumed by the downstream degeneracy governor + cov inflation.
+  std::vector<Eigen::Vector3d> last_degen_rot_dirs_;
+  std::vector<Eigen::Vector3d> last_degen_trans_dirs_;
   float max_corr_trans_;               // [m]   per-scan total-correction translation cap; 0 = off
   float max_corr_rot_;                 // [rad] per-scan total-correction rotation cap;    0 = off
   bool  adaptive_clamp_enabled_;       // scale the caps by the trust margin; off = base caps

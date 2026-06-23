@@ -151,6 +151,47 @@ TEST(NanoGICP, DegeneracyGateCanBeDisabled) {
   EXPECT_EQ(gicp.lastDegenerateDirections(), 0);
 }
 
+// The held degenerate eigen-directions are EXPOSED (world-frame unit vectors)
+// for the downstream governor + covariance inflation. On a single plane the
+// in-plane translation dofs are held and must show up.
+TEST(NanoGICP, ExposesHeldDegenerateDirs) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto gicp = makeGICP();
+  gicp.setInputTarget(target);
+  gicp.setInputSource(source);
+
+  Cloud aligned;
+  gicp.align(aligned);
+
+  const auto& tdirs = gicp.lastDegenTransDirs();
+  const auto& rdirs = gicp.lastDegenRotDirs();
+  EXPECT_GE(tdirs.size(), 2u);                 // >= 2 in-plane translation dofs held
+  for (const auto& d : tdirs) { EXPECT_NEAR(d.norm(), 1.0, 1e-6); }
+  for (const auto& d : rdirs) { EXPECT_NEAR(d.norm(), 1.0, 1e-6); }
+  // No rescue term here, so every held dir is exposed; the converged-iteration
+  // count cannot exceed the max-over-iterations reported count.
+  EXPECT_LE(static_cast<int>(tdirs.size() + rdirs.size()), gicp.lastDegenerateDirections());
+  EXPECT_GE(static_cast<int>(tdirs.size() + rdirs.size()), 2);
+}
+
+// Gate off -> no held dirs exposed (mirrors lastDegenerateDirections == 0).
+TEST(NanoGICP, DegenDirsEmptyWhenGateDisabled) {
+  auto target = makePlane(1.0f, 0.05f);
+  auto gicp = makeGICP();
+  gicp.setDegeneracyThreshRatio(0.f);
+  gicp.setInputTarget(target);
+  gicp.setInputSource(target);
+
+  Cloud aligned;
+  gicp.align(aligned);
+  EXPECT_TRUE(gicp.lastDegenTransDirs().empty());
+  EXPECT_TRUE(gicp.lastDegenRotDirs().empty());
+}
+
 // Per-scan IMU-consistency clamp: bound the TOTAL correction (final pose vs the
 // identity guess) so a large map-lock "jump" cannot run away. Well-conditioned
 // corner geometry + gate OFF, so the solve genuinely wants the full transform;

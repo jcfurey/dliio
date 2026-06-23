@@ -14,6 +14,8 @@
 
 #include "dlio/dlio.h"
 
+#include <array>
+
 // ROS
 #include "rclcpp/rclcpp.hpp"
 #include <nav_msgs/msg/odometry.hpp>
@@ -434,6 +436,23 @@ private:
   // scan, and the cumulative count of scans where the gate fired.
   int loc_gate_axes_current_ = 0;
   uint64_t loc_gate_updates_cumulative_ = 0;
+
+  // Degeneracy GOVERNOR (fail-safe): on the eigen-directions the gate held to
+  // the IMU prior, that prior dead-reckons and can run away (the km-scale
+  // tunnel divergence). The governor caps per-scan output motion along those
+  // world-frame directions to a physical envelope; bounding the pose feeds the
+  // velocity back down through updateState()'s observer (err = lidarPose - state
+  // -> Kv). 0 caps disable each axis (bit-identical). Plus covariance inflation
+  // so a downstream consumer de-weights the held axes. All written/read on the
+  // scan thread except the cov, snapshotted under geo.mtx for publishPose().
+  bool degen_gov_enabled_ = false;
+  float degen_gov_max_step_trans_ = 0.f;  // [m]   max per-scan motion along a held trans axis; 0 = off
+  float degen_gov_max_step_rot_ = 0.f;    // [rad] max per-scan motion about a held rot axis;   0 = off
+  double degen_gov_cov_pos_var_ = 0.0;    // [m^2]   variance added along a held position axis; 0 = none
+  double degen_gov_cov_rot_var_ = 0.0;    // [rad^2] variance added along a held rotation axis; 0 = none
+  // Extra pose covariance from the inflation, world frame, written on the scan
+  // thread under geo.mtx and read by publishPose() under the same lock.
+  std::array<double, 36> degen_cov_extra_{};  // row-major 6x6, added onto the base pose cov
 
   // CPU-starvation indicators (see /diagnostics): scans whose compute time
   // exceeded the scan period, and an estimate of transport-dropped scans.

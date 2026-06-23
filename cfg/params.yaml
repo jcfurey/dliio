@@ -187,6 +187,24 @@
     odom/gicp/adaptiveClamp/marginHi: 3.0   # base cap at/above this margin
     odom/gicp/adaptiveClamp/floor: 0.25     # tightest cap fraction at full degeneracy
 
+    # Degeneracy GOVERNOR (fail-safe for the held-prior runaway). The gate above
+    # holds the IMU prior on unobservable eigen-directions; on a long featureless
+    # tunnel that prior dead-reckons (accel/gyro bias double-integrates) into a
+    # km-scale divergence that maxCorrection does NOT catch (it bounds the GICP
+    # correction, not the prior). The governor caps per-scan OUTPUT motion along
+    # the held world-frame directions vs the previous pose to a physical step;
+    # bounding the pose pulls the velocity back through the geometric observer.
+    # maxStep* are per-scan caps (~ platform max speed / scan rate, e.g. 3 m/s at
+    # 10 Hz -> 0.30 m). enabled false / 0 caps -> bit-identical (no behavior change).
+    odom/degenGov/enabled: false
+    odom/degenGov/maxStepTrans: 0.0   # [m]   max per-scan motion along a held trans axis; 0 = off
+    odom/degenGov/maxStepRot: 0.0     # [rad] max per-scan motion about a held rot axis;   0 = off
+    # Covariance inflation: add variance along the held axes so a downstream
+    # consumer de-weights the dead-reckoned directions. 0 = publish the constant
+    # base cov unchanged.
+    odom/degenGov/covPosVar: 0.0      # [m^2]   added along a held position axis
+    odom/degenGov/covRotVar: 0.0      # [rad^2] added along a held rotation axis
+
     # Term mass-normalization (opt-in). Each residual term accumulates into a
     # shared information-form Hessian (H += weight * J^T J); for the photometric
     # and camera terms the accumulated "mass" scales with how many points happen

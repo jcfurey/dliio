@@ -649,6 +649,16 @@ int NanoGICP<PointSource, PointTarget>::lastDegenerateDirections() const {
 }
 
 template <typename PointSource, typename PointTarget>
+const std::vector<Eigen::Vector3d>& NanoGICP<PointSource, PointTarget>::lastDegenRotDirs() const {
+    return this->last_degen_rot_dirs_;
+}
+
+template <typename PointSource, typename PointTarget>
+const std::vector<Eigen::Vector3d>& NanoGICP<PointSource, PointTarget>::lastDegenTransDirs() const {
+    return this->last_degen_trans_dirs_;
+}
+
+template <typename PointSource, typename PointTarget>
 const CovarianceList& NanoGICP<PointSource, PointTarget>::getSourceCovariances() const {
     return source_covs_;
 }
@@ -861,6 +871,11 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // gate addresses). -1 = not computed (gate disabled). Does NOT affect the solve.
     this->last_geo_rot_margin_ = -1.0f;
     this->last_geo_trans_margin_ = -1.0f;
+    // Held-degenerate eigen-directions for the downstream governor + cov
+    // inflation; refilled inside the gate, cleared here so a gate-off (or
+    // non-firing) scan reports none.
+    this->last_degen_rot_dirs_.clear();
+    this->last_degen_trans_dirs_.clear();
     // Adaptive kernel: warm-start each scan at the least-robust shape and the
     // default scale, then adapt both (alpha + data-driven c) over the LM loop.
     if (this->adaptive_kernel_enabled_) {
@@ -1024,6 +1039,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             // Telemetry only: weakest-axis margin vs the gate threshold.
             this->last_geo_rot_margin_ = (rr_thresh > 0.0)
                 ? static_cast<float>(eig_rr.eigenvalues()(0) / rr_thresh) : -1.0f;
+            // Refill the held-direction snapshot each gate pass so it reflects
+            // the converged iteration (not the union over LM steps).
+            this->last_degen_rot_dirs_.clear();
+            this->last_degen_trans_dirs_.clear();
             for (int k = 0; k < 3; ++k) {
                 const double lam = eig_rr.eigenvalues()(k);
                 const Eigen::Vector3d v = eig_rr.eigenvectors().col(k);
@@ -1039,6 +1058,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         ++rescued;
                         continue;  // rescued: the soft prior-hold below does not apply
                     }
+                    // held degenerate (not rescued): record for the governor + cov
+                    this->last_degen_rot_dirs_.push_back(v);
                 }
                 // Probabilistic gate (Hatleskog & Alexis): keep-fraction is the
                 // confidence the eigenvalue clears an absolute noise floor; 0
@@ -1070,6 +1091,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         ++rescued;
                         continue;  // rescued: the soft prior-hold below does not apply
                     }
+                    // held degenerate (not rescued): record for the governor + cov
+                    this->last_degen_trans_dirs_.push_back(v);
                 }
                 const double keep = this->prob_gate_enabled_
                     ? probGateKeepFraction(lam,

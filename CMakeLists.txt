@@ -184,6 +184,12 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_degeneracy_governor test/test_degeneracy_governor.cpp)
+  target_compile_definitions(test_degeneracy_governor PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_degeneracy_governor
+    dlio_components
+  )
+
   ament_add_gtest(test_intensity test/test_intensity.cpp)
   target_compile_definitions(test_intensity PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_intensity
