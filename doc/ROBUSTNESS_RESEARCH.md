@@ -44,25 +44,35 @@ now-trustworthy) IMU on exactly the pitch/Z axes that lost their constraint.
 ## Validation status (read before trusting any knob)
 
 Everything below is **off by default and unit-tested**, but "implemented" is not
-"validated." The 2026-06-18 clean-harness n=5 sweep (`doc/FINDINGS_2026-06-18.md`)
-is the only bench so far, and its verdict is sobering: **only geometry+gate is
-stable; every auxiliary constraint term destabilizes the tunnel basin or is
-broken.** Per feature:
+"validated." Two benches exist: the 2026-06-18 n=5 sweep
+(`doc/FINDINGS_2026-06-18.md`) and the **2026-06-22 mechanism-level A/Bs**
+(`doc/FINDINGS_2026-06-22.md`), which **instrumented the actual gate/projection
+mechanism** and overturned two of the 06-18 aggregate verdicts. The 06-22 doc is
+the authoritative read.
 
-| feature | bench status (2026-06-18) |
+**Definitive conclusion (2026-06-22):** every available auxiliary observation term
+has now been instrumented and A/B'd, and **none re-constrains the degenerate
+tunnel axis on the 06042026 rig.** The degeneracy is a weak **rotation (yaw)**
+axis (not translation — the along-X slosh is *downstream* of held rotation), and
+the gate's rescue bar (`ratio·λ_max`) is missed by **250×–10,000×**. It is a
+**missing-observation / isotropic-dilution problem**, fixable only by a
+sensor/geometry change (a forward/wider camera, or fiducials) or directional
+weighting of a *non-aliased* along-axis observation — not by any current term.
+
+| feature | bench status |
 |---|---|
-| #1 sub-floor reject | **inert on this segment** — 0 points rejected at default params (no water-pool signature here); mechanism verified live, target failure mode not present to test against |
-| #2 margin-adaptive clamp | **bounding, not fixing** — a global magnitude limiter can't add the missing along-axis observation; the gate already fully holds the prior and it still sloshes |
-| #3 probabilistic gate | **unbenched in isolation** |
-| #5 adaptive kernel | **was harmful, now fixed** — bench found it stripped the Huber and pinned α at L2 → divergence; fixed (Huber floor + MAD scale), **unbenched since the fix** |
-| soft gate / mass-norm / telemetry | telemetry confirmed useful (the trust margin localized the real bug); the rest unbenched in isolation |
+| #1 sub-floor reject | **inert here** (06-18) — 0 rejected at default params (no water-pool signature on this segment); valid for a segment that has the failure |
+| #2 margin-adaptive clamp | **bounding, not fixing** (06-18) — can't add the missing observation; gate already holds the prior and it still sloshes |
+| #3 probabilistic gate | **unbenched in isolation**; note 06-22: it changes the *hold* fraction, not the *rescue* bar, so it can't help the rescue shortfall |
+| #5 adaptive kernel | **was harmful, fixed, unbenched since** (Huber floor + MAD scale) |
+| camera f2f / f2m | **works but FOV-limited** (06-22) — NOT the "Visual Points=0 bug" 06-18 reported (that was a whole-run modal artifact; it opens at ~160 pts/scan). Narrow side camera + tunnel; **dense-source A/B negative** (FOV-limited, not density-limited) |
+| LiDAR-image (COIN-LIO) reflectivity | **no-op for the degeneracy at any weight** (06-22) — along-axis aliased; the 06-18 "injects DIV" was misattributed baseline collapse. **condScale A/B negative** (tripled DIV: drives the aliased anchor) |
+| LiDAR-image near-IR (ambient) + denoise | denoise fixes the shot noise (ratio 1.60→0.52) but the isotropic term **still never rescues the axis** (06-22) — channel quality was not the binding constraint |
+| condScale / dense-source / near-IR | correct, tested, **default-off scaffolds**; all A/B-negative on this rig, retained for rigs where the observation exists |
+| soft gate / mass-norm / telemetry | telemetry confirmed useful (the trust margin + per-gate instrumentation root-caused the terms); the rest unbenched in isolation |
 
-Bigger conclusion from the bench: the along-axis tunnel degeneracy is **not solved
-by any current term**, and a scalar weight does not reliably move the divergence
-basin. The highest-value lever is a **working camera visual term** (independent
-wall-texture info) — currently `Visual Points = 0`; instrumented in `c3c7df9`
-(read `Visual Match dt` / `Visual Rejects` to localize). See
-`doc/FINDINGS_2026-06-18.md` and `doc/FINDINGS_2026-06-17.md`.
+See `doc/FINDINGS_2026-06-22.md` (definitive), `doc/FINDINGS_2026-06-18.md`,
+`doc/FINDINGS_2026-06-17.md`.
 
 ---
 

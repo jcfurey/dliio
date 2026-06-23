@@ -281,6 +281,15 @@
     odom/visual/weight: 0.0          # relative to the geometric GICP term
     odom/visual/huberDelta: 0.05     # Huber on the normalized residual (<=0 off)
     odom/visual/maxTimeDiff: 0.05    # max |image - scan| stamp gap to pair [s]
+    # Dense source for the frame-to-frame term: project the full deskewed scan
+    # (strided to maxPoints) instead of the sparse voxelised registration cloud,
+    # to keep a narrow camera FOV populated. OFF -> iterate the registration
+    # cloud (bit-identical). BENCH (2026-06-22, n=12): raised peak population 2.4x
+    # but the camera term is FOV-limited, not density-limited on the 06042026 rig
+    # (median/p90 visual points stayed 0/1), so it did NOT help the tunnel. Kept
+    # as a de-starvation lever for a forward/wide camera. See FINDINGS_2026-06-22.
+    odom/visual/denseSource/enabled: false
+    odom/visual/denseSource/maxPoints: 4000   # stride the dense source down to <= this
     # Gate safety floor: the gate still detects LiDAR degeneracy from geometry
     # alone; on a degenerate axis the visual term may drive motion only if it
     # stiffened that axis, and its total deviation from the IMU prior there is
@@ -305,6 +314,33 @@
     # absolute-anchor gate budget above). Needs an organized scan. OFF by default.
     odom/lidar_image/enabled: false
     odom/lidar_image/weight: 0.0
+    odom/lidar_image/rangeAbsTol: 0.5   # occlusion: absolute range tol [m] for a projected map point
+    odom/lidar_image/rangeRelTol: 0.1   # occlusion: relative range tol (fraction of pixel range)
+
+    # Condition-scaled directional weighting: boost the LiDAR-map term along the
+    # geometrically-weak (degenerate) axes so it can clear the gate's rescue bar
+    # there, instead of an isotropic scalar weight (which the bench proved can
+    # never move the term's mass onto the weak axis; doc/REVIEW.md #8). OFF ->
+    # the term accumulates directly (bit-identical). BENCH (2026-06-22, n=12): the
+    # mechanism works (it rescues the axis) but on this rig it TRIPLED divergence
+    # (2->6) -- reflectivity in a uniform tunnel is along-axis aliased, so forcing
+    # the term onto the weak axis drives it WRONG. Kept as a literature-backed
+    # scaffold for a rig whose intensity image carries real along-axis texture.
+    odom/lidar_image/condScale/enabled: false
+    odom/lidar_image/condScale/power: 1.0   # exponent on (lambda_max/lambda_k) per eigen-direction
+    odom/lidar_image/condScale/cap: 50.0    # max per-direction boost (alpha)
+
+    # Image channel + normalization (2026-06-22). The per-point image slot is
+    # filled from this cloud field; near-IR/ambient carries ~100x reflectivity's
+    # dynamic range (mean ~645 vs ~19) and real wall texture, but is shot-noise-
+    # dominated per pixel -> pair it with denoiseKernel. Default reflectivity +
+    # scale 255 + denoise off is bit-identical to prior behavior. BENCH
+    # (2026-06-22): denoise fixes the shot noise (temporal ratio 1.60->0.52) but
+    # the isotropic term still never rescues the axis (the binding constraint is
+    # rescue-bar dilution, not channel quality). Untested: near-IR + condScale.
+    odom/lidar_image/channel: reflectivity   # 'reflectivity' | 'intensity' | 'ambient' (near-IR)
+    odom/lidar_image/scale: 255.0            # channel full-scale (reflectivity ~255, near-IR ~thousands)
+    odom/lidar_image/denoiseKernel: 0        # KxK box-blur of the image channel (<=1 = off)
 
     # Diagonal covariance stamped on the published nav_msgs/Odometry
     # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
