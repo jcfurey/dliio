@@ -30,6 +30,13 @@ named below — the tables here are the durable record.
 > extrinsic and voxel fixes in place. The currently-live failure on this bag is
 > the specular water-pool blow-up (`FINDINGS_2026-06-17.md` §3), not the
 > degeneracy these findings chased.
+>
+> **Definitive follow-up (2026-06-22, `doc/FINDINGS_2026-06-22.md`):** with the
+> two bugs fixed, every auxiliary term (camera f2f/f2m, LiDAR reflectivity and
+> near-IR images) was instrumented and A/B'd and **none re-constrains the
+> degenerate axis** — which is a weak **yaw rotation**, not the along-tunnel
+> translation these findings assumed. It is a missing-observation problem on this
+> sensor suite, not a tuning problem. Treat Findings 1–6 below as historical.
 
 ## The problem
 

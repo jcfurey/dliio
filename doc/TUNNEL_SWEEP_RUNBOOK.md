@@ -119,10 +119,12 @@ loosen a strongly-degenerate axis: eigenvalue ~0 << thresh still keeps ~0
   scan-to-scan jumps in the degenerate count and lower twist, not a change in the
   steady-state count. Live-tunable.
 
-### Newest levers (2026-06-17/18) — read the bench verdicts first
+### Newest levers (2026-06-17/22) — read the bench verdicts first
 
-All off by default. The 2026-06-18 n=5 sweep (`doc/FINDINGS_2026-06-18.md`) already
-weighed in on some; don't re-discover the negatives.
+All off by default. The 2026-06-18 n=5 sweep and the **2026-06-22 mechanism-level
+A/Bs** (`doc/FINDINGS_2026-06-{18,22}.md`) already weighed in on most of these —
+several are **A/B-negative on this rig**; don't re-discover them. Overall 06-22
+verdict: no current term re-constrains the degenerate (yaw) axis here.
 
 - **`odom/preprocessing/subFloorReject/enabled`** (+ `margin` 0.30, `radius` 8.0)
   — drops specular sub-floor "ghost" returns (water-pool drag-down). **Bench: 0
@@ -146,6 +148,25 @@ weighed in on some; don't re-discover the negatives.
   0 = data-driven MAD (Chebrolu et al.). **Was harmful, fixed 2026-06-18,
   unbenched since.** Watch `Photometric Kernel Alpha` (drops below 2 = engaging on
   outliers) and `Photometric Kernel Scale` (the MAD c).
+- **`odom/lidar_image/condScale/enabled`** (+ `power` 1.0, `cap` 50) — direction-
+  scales the LiDAR-image term onto the geometrically-weak axis so it can clear the
+  rescue bar (this is per-direction routing; `REVIEW.md #8`). **Bench (06-22, n=12):
+  NEGATIVE — tripled DIV (2→6).** The mechanism works (rescues the axis) but
+  reflectivity here is along-axis *aliased*, so driving the weak axis drives it
+  wrong. Watch `Visual Rescued Axes` (goes nonzero = engaging — and on this rig
+  that correlates with *divergence*). Untested: gentler `cap`/`power`, or near-IR.
+- **`odom/visual/denseSource/enabled`** (+ `maxPoints` 4000) — feeds the camera
+  f2f term the dense deskewed scan, not the voxelised cloud. **Bench (06-22, n=12):
+  NEGATIVE — the camera term is FOV-limited, not density-limited** (median/p90
+  visual points stayed 0/1; raised only the peaks). De-starvation lever for a
+  forward/wide camera only.
+- **`odom/lidar_image/channel` + `denoiseKernel` + `scale`** — select the image
+  channel (`reflectivity`|`intensity`|`ambient` near-IR) with optional K×K denoise
+  and per-channel full-scale. Near-IR has ~100× the texture but is shot-noise-
+  dominated → pair with `denoiseKernel: 5`, `scale: 2000`. **Bench (06-22): denoise
+  fixed the shot noise (ratio 1.60→0.52) but the isotropic term still never rescued
+  the axis** (channel quality wasn't the binding constraint). Untested: near-IR +
+  condScale (the one combination that pairs richer texture with directional mass).
 
 ## 3. What to log and read (exact /diagnostics keys)
 

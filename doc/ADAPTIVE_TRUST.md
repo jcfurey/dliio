@@ -193,12 +193,18 @@ step that changes the solve's *decisions* rather than instrumenting them, so it 
 gated on (a) the "observe first" pass above and (b) an explicit go-ahead, and it
 will land behind a default-off master flag with the safety mechanisms above.
 
-> **Bench reality check (2026-06-18).** The first n=5 sweep
-> (`doc/FINDINGS_2026-06-18.md`, summarized in `doc/ROBUSTNESS_RESEARCH.md`
-> "Validation status") found that **a scalar weight does not reliably move the
-> divergence basin** and every auxiliary term either destabilizes or is broken.
-> This sharpens the case for *per-direction* routing (Layer 2) over per-term
-> scalar trust (Layer 1) — but it also means Layer 2 is only as good as the term
-> feeding the degenerate axis, and right now **no term adds clean along-axis
-> information** (the camera term emits 0 points). So Layer 2 is effectively
-> blocked on a working camera/aux term, not on this policy.
+> **Bench reality check (2026-06-18 → 2026-06-22).** The n=5 sweep found that a
+> scalar weight does not reliably move the divergence basin; the **2026-06-22
+> mechanism-level A/Bs** (`doc/FINDINGS_2026-06-22.md`, summarized in
+> `doc/ROBUSTNESS_RESEARCH.md` "Validation status") then closed the question: every
+> available auxiliary term was instrumented and **none re-constrains the degenerate
+> (yaw-rotation) axis on this rig.** Crucially for this doc, **Layer 2 was even
+> built and A/B'd** — `conditionScaleTerm` *is* per-direction routing for the
+> LiDAR-image term, and it works mechanically (rescues the axis) but **tripled
+> divergence**, because the reflectivity anchor it routes is along-axis *aliased*:
+> per-direction routing is only as good as the observation it routes, and on this
+> rig there is no clean along-axis observation to route (the camera term works but
+> is FOV-limited; reflectivity/near-IR are aliased/isotropic). So Layer 2 is not
+> blocked on *policy* — it is blocked on a **sensor/geometry change** that supplies
+> a non-aliased along-axis observation. The adaptive-trust machinery remains valid
+> for a rig where that observation exists.
