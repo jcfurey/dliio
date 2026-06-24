@@ -19,14 +19,20 @@
 # Plus covariance inflation so a downstream consumer de-weights the held axes.
 #
 # Overlay ON TOP of ouster_tunnel.yaml (+ ouster_06042026_extrinsics.yaml). The
-# caps are physical: maxStepTrans 0.30 m/scan ~ 3 m/s at 10 Hz (well above the
-# platform's real speed, ~50x below the 140 m/s runaway); maxStepRot 0.05
+# caps are physical: maxStepTrans 0.15 m/scan ~ 1.5 m/s at 10 Hz (above the
+# platform's real speed, well below the 140 m/s runaway); maxStepRot 0.05
 # rad/scan ~ 0.5 rad/s. Tune to the platform, not the bag.
+#
+# 0.15 is the n=24-VALIDATED value (2026-06-24): on the near-IR substrate it cut
+# the catastrophic deg=6 runaway from 6/24 reps (worst 35 km) to 0/24 (worst 270 m,
+# a bounded slosh), with no regression on healthy reps. In the n=4 cap screen a
+# looser 0.30 left a 654 m outlier and a tighter 0.10 was WORSE (non-monotonic).
+# See results/SESSION_2026-06-24_governor_validated_n24.md (top-level test harness).
 
 /**:
   ros__parameters:
     odom/degenGov/enabled: true
-    odom/degenGov/maxStepTrans: 0.30   # [m]   per-scan cap along a held translation axis
+    odom/degenGov/maxStepTrans: 0.15   # [m]   per-scan cap along a held translation axis (n=24-validated)
     odom/degenGov/maxStepRot: 0.05     # [rad] per-scan cap about a held rotation axis
     odom/degenGov/covPosVar: 100.0     # [m^2]   ~10 m std on a held position axis (untrusted)
     odom/degenGov/covRotVar: 1.0       # [rad^2] held rotation axis untrusted
