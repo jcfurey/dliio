@@ -760,6 +760,22 @@ void dlio::OdomNode::getParams() {
       "Cond-scale exponent on (lambda_max/lambda_k) per geometric eigen-direction");
   dlio::declare_param(this, "odom/lidar_image/condScale/cap", this->lidar_cs_cap_, 50.0,
       "Cond-scale max per-direction boost (alpha) applied to the LiDAR-map term");
+  // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
+  // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
+  // mix an isotropic point-to-point metric into the GICP cost to regularize the
+  // unconstrained tunnel axis; healthy scans stay pure point-to-plane. Static
+  // config (no per-scan state), so it is pushed to the gicp once here. floor = 1
+  // (default) -> blend OFF, bit-identical.
+  dlio::declare_param(this, "odom/genz/enabled", this->genz_enabled_, false,
+      "Enable the GenZ-ICP adaptive point-to-plane/point-to-point blend (degeneracy-robust)");
+  dlio::declare_param(this, "odom/genz/floor", this->genz_floor_, 1.0,
+      "Smallest point-to-plane weight alpha in [0,1] (1 = blend off; ~0.5 = up to 50/50 worst case)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/genz/knee", this->genz_knee_, 0.1,
+      "Conditioning (trans-block lambda_min/lambda_max) below which point-to-point starts mixing in", 0.0, 1.0);
+  dlio::declare_param(this, "odom/genz/pointWeight", this->genz_point_weight_, 1.0,
+      "Isotropic point-to-point metric weight [1/m^2] (~ the plane metric's typical eigenvalue)", 0.0, 1e6);
+  this->gicp.setGenZWeighting(this->genz_enabled_, static_cast<float>(this->genz_floor_),
+      static_cast<float>(this->genz_knee_), static_cast<float>(this->genz_point_weight_));
   // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
   // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
   // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is

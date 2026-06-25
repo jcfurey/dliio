@@ -348,6 +348,17 @@
     odom/lidar_image/condScale/power: 1.0   # exponent on (lambda_max/lambda_k) per eigen-direction
     odom/lidar_image/condScale/cap: 50.0    # max per-direction boost (alpha)
 
+    # GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L
+    # 2025). On an ill-conditioned scan (geometric translation lambda_min/lambda_max
+    # < knee) mix an isotropic point-to-point metric into the GICP cost to
+    # regularize the unconstrained tunnel axis; healthy scans stay pure
+    # point-to-plane. floor 1 (default) = blend OFF (bit-identical); ~0.5 = up to a
+    # 50/50 worst case. pointWeight [1/m^2] ~ the plane metric's typical eigenvalue.
+    odom/genz/enabled: false
+    odom/genz/floor: 1.0            # smallest point-to-plane weight alpha in [0,1] (1 = off)
+    odom/genz/knee: 0.1            # lambda_min/lambda_max below which point-to-point mixes in
+    odom/genz/pointWeight: 1.0     # isotropic point-to-point metric weight [1/m^2]
+
     # Image channel + normalization (2026-06-22). The per-point image slot is
     # filled from this cloud field; near-IR/ambient carries ~100x reflectivity's
     # dynamic range (mean ~645 vs ~19) and real wall texture, but is shot-noise-

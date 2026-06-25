@@ -19,6 +19,7 @@
  */
 
 #include "nano_gicp/nano_gicp.h"
+#include "nano_gicp/genz_weight.h"
 #include "dlio/dlio.h"
 #include <algorithm>
 #include <cmath>
@@ -326,6 +327,11 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->lidar_cond_scale_enabled_ = false;  // direction-scaling OFF -> bit-identical
   this->lidar_cs_power_ = 1.0f;
   this->lidar_cs_cap_ = 50.0f;
+  this->genz_enabled_ = false;       // GenZ point/plane blend OFF -> pure point-to-plane (bit-identical)
+  this->genz_floor_ = 1.0f;          // alpha floor 1 = no blend
+  this->genz_knee_ = 0.1f;           // start blending below lambda_min/lambda_max = 0.1
+  this->genz_point_weight_ = 1.0f;   // isotropic point-to-point metric scale [1/m^2]
+  this->current_genz_alpha_ = 1.0f;  // pure point-to-plane until a scan sets it
   this->last_lidar_map_rms_ = 0.0f;
   this->last_lidar_map_count_ = 0;
 }
@@ -575,6 +581,15 @@ void NanoGICP<PointSource, PointTarget>::setLidarCondScale(bool enabled, float p
     this->lidar_cond_scale_enabled_ = enabled;
     this->lidar_cs_power_ = (power > 0.f) ? power : 0.f;
     this->lidar_cs_cap_   = (cap   > 1.f) ? cap   : 1.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setGenZWeighting(bool enabled, float floor, float knee, float point_weight) {
+    this->genz_enabled_ = enabled;
+    // floor in [0,1]; >= 1 means no blend (feature effectively off even if enabled).
+    this->genz_floor_ = (floor < 1.f) ? ((floor > 0.f) ? floor : 0.f) : 1.f;
+    this->genz_knee_ = (knee > 0.f) ? knee : 0.f;
+    this->genz_point_weight_ = (point_weight > 0.f) ? point_weight : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -883,6 +898,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         this->current_kernel_c_ = (this->kernel_scale_ > 0.f) ? this->kernel_scale_
                                                               : this->photometric_huber_delta_;
     }
+    // GenZ-ICP blend: warm-start each scan at pure point-to-plane (alpha = 1);
+    // the per-iteration conditioning estimate below lowers it if degenerate.
+    this->current_genz_alpha_ = 1.0f;
 
     // Step acceptance (retrospective LM-style damping): the plain GN loop
     // took every step unconditionally -- on an ill-conditioned submap a bad
@@ -933,6 +951,22 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // masks the degeneracy, the gate releases its prior-hold, and the pose
         // diverges along the (still physically unobservable) axis.
         const Eigen::Matrix<double, 6, 6> H_geo = H;
+
+        // GenZ-ICP adaptive blend weight (lagged one iteration, like the kernel):
+        // from the geometric translation block's conditioning (lambda_min/lambda_max
+        // of H_geo[3:6,3:6]), set how much point-to-plane vs point-to-point the NEXT
+        // linearize() mixes. Off (genz_floor_ >= 1) -> alpha stays 1 -> pure
+        // point-to-plane (bit-identical). Adapted from GenZ-ICP (Lee et al., RA-L
+        // 2025): degenerate scan -> blend in an isotropic point-to-point metric to
+        // regularize the unconstrained axis. See nano_gicp/genz_weight.h.
+        if (this->genz_enabled_) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_g(H_geo.template block<3, 3>(3, 3));
+            const double lmax = eig_g.eigenvalues()(2);
+            const double ratio = (lmax > 0.0) ? (eig_g.eigenvalues()(0) / lmax) : 0.0;
+            this->current_genz_alpha_ = static_cast<float>(
+                genzPlaneWeight(ratio, static_cast<double>(this->genz_floor_),
+                                static_cast<double>(this->genz_knee_)));
+        }
 
         // Direct visual (camera) photometric term: accumulate into the SAME
         // H/b that linearize() built, BEFORE damping and the degeneracy gate,
@@ -1271,7 +1305,17 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         J_geometric.block<3, 3>(0, 3) = Eigen::Matrix3f::Identity();
         
         Eigen::Matrix3f M = mahalanobis_[i].block<3, 3>(0, 0);
-        
+        // GenZ-ICP blend (Lee et al., RA-L 2025): on an ill-conditioned scan
+        // (current_genz_alpha_ < 1) convex-mix an isotropic point-to-point metric
+        // into the plane metric to regularize the unconstrained axis, reusing the
+        // same residual + Jacobian. alpha == 1 (default / healthy) -> pure
+        // point-to-plane, bit-identical. genz_point_weight_ [1/m^2] sets the
+        // point-to-point scale (~ the plane metric's typical eigenvalue).
+        if (this->genz_enabled_ && this->current_genz_alpha_ < 1.0f) {
+            const float a = this->current_genz_alpha_;
+            M = a * M + (1.0f - a) * this->genz_point_weight_ * Eigen::Matrix3f::Identity();
+        }
+
         H_private[thread_num] += (J_geometric.transpose() * M * J_geometric).cast<double>();
         b_private[thread_num] += (J_geometric.transpose() * M * residual).cast<double>();
         cost_sum += residual.transpose() * M * residual;

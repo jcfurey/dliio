@@ -308,6 +308,15 @@ public:
   // exponent on (lambda_max/lambda_k), cap = max per-direction boost. enabled =
   // false (default) -> the term accumulates directly, bit-identical.
   void setLidarCondScale(bool enabled, float power, float cap);
+  // GenZ-ICP adaptive point-to-plane / point-to-point blend (genz_weight.h, Lee
+  // et al. RA-L 2025): on an ill-conditioned scan -- geometric translation block
+  // lambda_min/lambda_max below `knee` -- convex-mix an isotropic point-to-point
+  // metric into the GICP cost (weight 1-alpha) to regularize the unconstrained
+  // axis; a healthy scan stays pure point-to-plane (alpha = 1). `floor` in [0,1]
+  // is the smallest plane weight (1 = OFF / bit-identical; ~0.5 a typical enable);
+  // `point_weight` [1/m^2] sets the point-to-point metric scale (~ the plane
+  // metric's typical eigenvalue). enabled = false (default) -> bit-identical.
+  void setGenZWeighting(bool enabled, float floor, float knee, float point_weight);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
 
@@ -563,6 +572,11 @@ protected:
   bool  lidar_cond_scale_enabled_;    // direction-scale the term along weak geom axes; off = bit-identical
   float lidar_cs_power_;              // exponent on (lambda_max/lambda_k) per direction
   float lidar_cs_cap_;               // max per-direction boost (alpha)
+  bool  genz_enabled_;                // GenZ point-to-plane/point-to-point blend; off = bit-identical
+  float genz_floor_;                  // min point-to-plane weight alpha (1 = off)
+  float genz_knee_;                   // trans-block lambda_min/lambda_max at which blending starts
+  float genz_point_weight_;           // isotropic point-to-point metric weight [1/m^2]
+  float current_genz_alpha_;          // alpha in effect this iteration (lagged); 1 = pure point-to-plane
   float last_lidar_map_rms_;
   int last_lidar_map_count_;
 };

@@ -190,6 +190,18 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_genz_weight test/test_genz_weight.cpp)
+  target_compile_definitions(test_genz_weight PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_genz_weight
+    dlio_components
+  )
+
+  ament_add_gtest(test_xicp_localizability test/test_xicp_localizability.cpp)
+  target_compile_definitions(test_xicp_localizability PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_xicp_localizability
+    dlio_components
+  )
+
   ament_add_gtest(test_intensity test/test_intensity.cpp)
   target_compile_definitions(test_intensity PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_intensity
