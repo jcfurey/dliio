@@ -20,6 +20,7 @@
 
 #include "nano_gicp/nano_gicp.h"
 #include "nano_gicp/genz_weight.h"
+#include "nano_gicp/xicp_localizability.h"
 #include "dlio/dlio.h"
 #include <algorithm>
 #include <cmath>
@@ -332,6 +333,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->genz_knee_ = 0.1f;           // start blending below lambda_min/lambda_max = 0.1
   this->genz_point_weight_ = 1.0f;   // isotropic point-to-point metric scale [1/m^2]
   this->current_genz_alpha_ = 1.0f;  // pure point-to-plane until a scan sets it
+  this->xicp_ternary_enabled_ = false;  // X-ICP ternary gate OFF -> existing gate (bit-identical)
+  this->xicp_full_ratio_ = 0.05f;        // localizable bar; > degeneracy_thresh_ratio_ (0.005 default)
   this->last_lidar_map_rms_ = 0.0f;
   this->last_lidar_map_count_ = 0;
 }
@@ -590,6 +593,12 @@ void NanoGICP<PointSource, PointTarget>::setGenZWeighting(bool enabled, float fl
     this->genz_floor_ = (floor < 1.f) ? ((floor > 0.f) ? floor : 0.f) : 1.f;
     this->genz_knee_ = (knee > 0.f) ? knee : 0.f;
     this->genz_point_weight_ = (point_weight > 0.f) ? point_weight : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setXicpTernary(bool enabled, float full_ratio) {
+    this->xicp_ternary_enabled_ = enabled;
+    this->xicp_full_ratio_ = (full_ratio > 0.f) ? full_ratio : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1070,6 +1079,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             // near the threshold are partially held instead of toggled, killing
             // the scan-to-scan chatter that seeds divergence.
             const double rr_thresh = degeneracy_thresh_ratio_ * eig_rr.eigenvalues()(2);
+            // X-ICP upper (localizable) bar: directions above it are fully
+            // trusted; between it and rr_thresh get a partial admit. Only used
+            // when the ternary gate is enabled.
+            const double rr_full = this->xicp_full_ratio_ * eig_rr.eigenvalues()(2);
             // Telemetry only: weakest-axis margin vs the gate threshold.
             this->last_geo_rot_margin_ = (rr_thresh > 0.0)
                 ? static_cast<float>(eig_rr.eigenvalues()(0) / rr_thresh) : -1.0f;
@@ -1099,14 +1112,20 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 // confidence the eigenvalue clears an absolute noise floor; 0
                 // floor -> fall back to the ratio threshold (probit shape). Off
                 // -> the ratio/smoothstep soft gate (bit-identical).
-                const double keep = this->prob_gate_enabled_
-                    ? probGateKeepFraction(lam,
-                        (this->prob_noise_floor_rot_ > 0.f) ? this->prob_noise_floor_rot_ : rr_thresh,
-                        this->prob_confidence_s_, this->prob_spread_)
-                    : softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_);
+                // X-ICP ternary gate (Tuna et al., T-RO 2024): a controlled
+                // partial admit across [rr_thresh, rr_full], replacing the
+                // soft/prob keep-fraction. Off -> the existing gate, bit-identical.
+                const double keep = this->xicp_ternary_enabled_
+                    ? xicpPartialScale(lam, rr_thresh, rr_full)
+                    : (this->prob_gate_enabled_
+                        ? probGateKeepFraction(lam,
+                            (this->prob_noise_floor_rot_ > 0.f) ? this->prob_noise_floor_rot_ : rr_thresh,
+                            this->prob_confidence_s_, this->prob_spread_)
+                        : softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_));
                 dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
+            const double tt_full = this->xicp_full_ratio_ * eig_tt.eigenvalues()(2);  // X-ICP localizable bar
             // Telemetry only: weakest-axis margin vs the gate threshold.
             this->last_geo_trans_margin_ = (tt_thresh > 0.0)
                 ? static_cast<float>(eig_tt.eigenvalues()(0) / tt_thresh) : -1.0f;
@@ -1128,11 +1147,15 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                     // held degenerate (not rescued): record for the governor + cov
                     this->last_degen_trans_dirs_.push_back(v);
                 }
-                const double keep = this->prob_gate_enabled_
-                    ? probGateKeepFraction(lam,
-                        (this->prob_noise_floor_trans_ > 0.f) ? this->prob_noise_floor_trans_ : tt_thresh,
-                        this->prob_confidence_s_, this->prob_spread_)
-                    : softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_);
+                // X-ICP ternary gate: partial admit across [tt_thresh, tt_full];
+                // off -> the existing soft/prob gate (bit-identical).
+                const double keep = this->xicp_ternary_enabled_
+                    ? xicpPartialScale(lam, tt_thresh, tt_full)
+                    : (this->prob_gate_enabled_
+                        ? probGateKeepFraction(lam,
+                            (this->prob_noise_floor_trans_ > 0.f) ? this->prob_noise_floor_trans_ : tt_thresh,
+                            this->prob_confidence_s_, this->prob_spread_)
+                        : softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_));
                 dx.tail<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
             }
         }

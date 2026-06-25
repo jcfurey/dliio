@@ -359,6 +359,46 @@ TEST(NanoGICP, SoftGateStillHoldsStronglyDegenerateAxis) {
   EXPECT_GE(g.lastDegenerateDirections(), 2);  // still flags the unobservable dofs
 }
 
+// X-ICP ternary gate OFF (default) must be bit-identical to the existing gate:
+// explicitly disabling it changes nothing vs. a never-configured instance.
+TEST(NanoGICP, XicpTernaryDisabledIsBitIdentical) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto run = [&](bool set) {
+    auto g = makeGICP();
+    if (set) { g.setXicpTernary(false, 0.05f); }  // explicit off
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);          // never configured -> default off
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));        // explicit off: exact
+}
+
+// With the X-ICP ternary gate ON, a STRONGLY unobservable axis (in-plane on a
+// single plane, eigenvalue ~0 << the partial bar) still gets xicpPartialScale 0,
+// so the prior is fully held -- the partial-admit band only affects directions
+// between the two bars, never a hard-degenerate one.
+TEST(NanoGICP, XicpTernaryStillHoldsStronglyDegenerateAxis) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto g = makeGICP();
+  g.setXicpTernary(true, 0.05f);  // ternary on; partial bar = degeneracyThreshRatio
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  const float translation_norm = g.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(translation_norm, 0.05f);          // in-plane shift still held
+  EXPECT_GE(g.lastDegenerateDirections(), 2);  // unobservable dofs still flagged
+}
+
 // --- Term mass-normalization (refCountScale + the photometric path) ---
 
 TEST(RefCountScale, OffReturnsRawScale) {

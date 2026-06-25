@@ -359,6 +359,15 @@
     odom/genz/knee: 0.1            # lambda_min/lambda_max below which point-to-point mixes in
     odom/genz/pointWeight: 1.0     # isotropic point-to-point metric weight [1/m^2]
 
+    # X-ICP ternary localizability gate (Tuna et al., T-RO 2024). Adds a
+    # controlled partial-admit band between the degeneracy bar
+    # (degeneracyThreshRatio*lambda_max, prior held) and a looser localizable bar
+    # (fullRatio*lambda_max, fully trusted); in between the data update is admitted
+    # linearly. Replaces the soft/prob keep-fraction when on. enabled false
+    # (default) = the existing binary/soft gate (bit-identical).
+    odom/xicp/ternaryEnabled: false
+    odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); > degeneracyThreshRatio
+
     # Image channel + normalization (2026-06-22). The per-point image slot is
     # filled from this cloud field; near-IR/ambient carries ~100x reflectivity's
     # dynamic range (mean ~645 vs ~19) and real wall texture, but is shot-noise-

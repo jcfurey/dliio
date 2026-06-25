@@ -18,7 +18,7 @@ not fit the architecture — so a reviewer knows the status of each.
 |---|---|---|
 | Governor test gaps (oblique + multi-held-dir) | self (review) | **Landed** — 2 new gtests in `test_degeneracy_governor.cpp` |
 | GenZ-ICP adaptive point-to-plane / point-to-point blend | Lee et al., RA-L 2025 | **Landed, wired, default-off** — `genz_weight.h` + gate wiring + params + gtests |
-| X-ICP ternary localizability | Tuna et al., T-RO 2024 | **Kernel landed + tested; binary half already in the gate.** Ternary *wiring* is the documented next step (below) |
+| X-ICP ternary localizability | Tuna et al., T-RO 2024 | **Landed, wired, default-off** — `xicp_localizability.h` + gate wiring + params + kernel & integration gtests |
 | LODESTAR Schmidt-Kalman coupling | Lee/Marsim/Myung, RA-L 2025 | **Not implemented — architectural misfit** (below). The governor's cov-inflation is the pragmatic stand-in |
 
 ---
@@ -66,31 +66,35 @@ a placeholder); the right value is roughly the plane metric's typical eigenvalue
 **Tests:** `test/test_genz_weight.cpp` (off-contract, healthy=pure-plane, linear
 ramp, collapsed-axis floor, NaN/degenerate-input safety).
 
-## 3. X-ICP ternary localizability — kernel landed, wiring is next
+## 3. X-ICP ternary localizability — landed, wired, default-off
 
-The binary half of X-ICP **already exists**: the gate at `nano_gicp.cc:~989` is
+The binary half of X-ICP **already existed**: the gate at `nano_gicp.cc:~989` is
 Zhang solution remapping (hard prior-hold on non-localizable directions), and
 `softGateKeepFraction` already does a smooth partial hold near the threshold.
 X-ICP's distinct contribution is the **explicit ternary judgment** with a *second*
-threshold and a controlled partial-admit band.
+threshold and a controlled partial-admit band — now implemented.
 
-`include/nano_gicp/xicp_localizability.h` adds that as pure, tested kernels:
+`include/nano_gicp/xicp_localizability.h` adds the pure, tested kernels:
 `xicpCategory(eigval, κ_partial, κ_full)` → {NonLocalizable, Partial, Localizable},
 and `xicpPartialScale(...)` → the controlled-update fraction (0 below the partial
 bar, linear across the band, 1 above the full bar). Equal thresholds reduce to the
 current binary gate; mis-ordered thresholds are sanitized.
 
-**Wiring plan (not yet applied — deliberately, it edits the dense gate loop):**
-in the gate's per-eigen-direction loop, replace the binary `keep` with
-`keep = xicpPartialScale(lam, κ_partial, κ_full)` where `κ_partial = ratio·λ_max`
-(today's `degeneracy_thresh_ratio`) and `κ_full = full_ratio·λ_max` for a new,
-looser `full_ratio` param — behind a `setXicpTernary(enabled, full_ratio)` flag,
-default-off so equal-threshold ⇒ bit-identical. Left for a focused, separately
-reviewed change because the gate loop is the riskiest spot to edit without a
-compiler in-loop; the kernel + tests de-risk the math half now.
+**Wiring (applied):** in the gate's per-eigen-direction loop (both the rotation
+and translation blocks), when the ternary gate is enabled the binary/soft/prob
+`keep` is replaced by `keep = xicpPartialScale(lam, κ_partial, κ_full)` with
+`κ_partial = degeneracyThreshRatio·λ_max` (the existing degeneracy bar) and
+`κ_full = fullRatio·λ_max` (a new, looser localizable bar). Held-direction
+recording, degenerate counting, and the visual-rescue path are unchanged (a
+hard-degenerate direction `lam ≤ κ_partial` still records and still gets
+`keep = 0`). Controls: `setXicpTernary(enabled, full_ratio)`; params
+`odom/xicp/{ternaryEnabled,fullRatio}`; documented in `cfg/params.yaml`.
+`ternaryEnabled = false` (default) → the existing gate, **bit-identical**.
 
-**Tests:** `test/test_xicp_localizability.cpp` (ternary split, linear partial
-scale, binary reduction, mis-ordered-threshold safety).
+**Tests:** `test/test_xicp_localizability.cpp` (kernel: ternary split, linear
+partial scale, binary reduction, mis-ordered-threshold safety) plus two gate-level
+integration tests in `test/test_nano_gicp.cpp` (`XicpTernaryDisabledIsBitIdentical`,
+`XicpTernaryStillHoldsStronglyDegenerateAxis`).
 
 ## 4. LODESTAR Schmidt-Kalman — architectural misfit (not implemented)
 
@@ -122,8 +126,9 @@ update. Documented as a deferred direction, not attempted as a bolt-on.
 - `test/test_degeneracy_governor.cpp` — +2 gtests (§1)
 - `include/nano_gicp/genz_weight.h` *(new)*, `test/test_genz_weight.cpp` *(new)* — §2
 - `include/nano_gicp/xicp_localizability.h` *(new)*, `test/test_xicp_localizability.cpp` *(new)* — §3
-- `include/nano_gicp/nano_gicp.h`, `src/nano_gicp/nano_gicp.cc` — GenZ setter/members/wiring (§2)
-- `include/dlio/odom.h`, `src/dlio/odom.cc`, `cfg/params.yaml` — GenZ params (§2)
+- `test/test_nano_gicp.cpp` — +2 X-ICP gate integration gtests (§3)
+- `include/nano_gicp/nano_gicp.h`, `src/nano_gicp/nano_gicp.cc` — GenZ + X-ICP setters/members/wiring (§2, §3)
+- `include/dlio/odom.h`, `src/dlio/odom.cc`, `cfg/params.yaml` — GenZ + X-ICP params (§2, §3)
 - `CMakeLists.txt` — register the two new gtests
 - `doc/IMPLEMENTATION_NOTES.md` *(this file)*
 

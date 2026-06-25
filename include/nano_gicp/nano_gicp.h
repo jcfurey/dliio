@@ -317,6 +317,14 @@ public:
   // `point_weight` [1/m^2] sets the point-to-point metric scale (~ the plane
   // metric's typical eigenvalue). enabled = false (default) -> bit-identical.
   void setGenZWeighting(bool enabled, float floor, float knee, float point_weight);
+  // X-ICP ternary localizability gate (xicp_localizability.h, Tuna et al. T-RO
+  // 2024). Generalizes the binary degeneracy gate with a SECOND, looser bar: a
+  // direction whose block eigenvalue >= full_ratio*lambda_max is fully trusted,
+  // <= degeneracyThreshRatio*lambda_max holds the prior (unchanged), and in
+  // between gets a controlled PARTIAL admit (linear across the band). full_ratio
+  // should exceed degeneracyThreshRatio. When enabled this REPLACES the soft/prob
+  // keep-fraction; enabled = false (default) -> the existing gate, bit-identical.
+  void setXicpTernary(bool enabled, float full_ratio);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
 
@@ -577,6 +585,8 @@ protected:
   float genz_knee_;                   // trans-block lambda_min/lambda_max at which blending starts
   float genz_point_weight_;           // isotropic point-to-point metric weight [1/m^2]
   float current_genz_alpha_;          // alpha in effect this iteration (lagged); 1 = pure point-to-plane
+  bool  xicp_ternary_enabled_;        // X-ICP ternary localizability gate; off = existing binary/soft gate
+  float xicp_full_ratio_;             // upper (localizable) bar as a fraction of lambda_max (partial bar = degeneracy_thresh_ratio_)
   float last_lidar_map_rms_;
   int last_lidar_map_count_;
 };

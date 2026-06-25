@@ -613,6 +613,8 @@ private:
   double genz_floor_ = 1.0;            // min point-to-plane weight alpha (1 = off)
   double genz_knee_ = 0.1;             // trans-block lambda_min/lambda_max at which blending starts
   double genz_point_weight_ = 1.0;     // isotropic point-to-point metric weight [1/m^2]
+  bool xicp_ternary_enabled_ = false;  // X-ICP ternary localizability gate; off = existing gate
+  double xicp_full_ratio_ = 0.05;      // upper (localizable) bar as a fraction of lambda_max
   std::string lidar_image_channel_;    // cloud field feeding the image slot: reflectivity|intensity|ambient
   double lidar_image_scale_;           // image full-scale normalization (per-channel; default 255)
   int lidar_image_denoise_kernel_;     // K x K spatial box-blur of the organized channel (<=1 = off; tames near-IR shot noise)

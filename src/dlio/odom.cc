@@ -776,6 +776,15 @@ void dlio::OdomNode::getParams() {
       "Isotropic point-to-point metric weight [1/m^2] (~ the plane metric's typical eigenvalue)", 0.0, 1e6);
   this->gicp.setGenZWeighting(this->genz_enabled_, static_cast<float>(this->genz_floor_),
       static_cast<float>(this->genz_knee_), static_cast<float>(this->genz_point_weight_));
+  // X-ICP ternary localizability gate (Tuna et al., T-RO 2024): adds a controlled
+  // partial-admit band between the existing degeneracy bar (degeneracyThreshRatio)
+  // and a looser localizable bar (fullRatio). Static config -> pushed once here.
+  // enabled = false (default) -> the existing binary/soft gate, bit-identical.
+  dlio::declare_param(this, "odom/xicp/ternaryEnabled", this->xicp_ternary_enabled_, false,
+      "Enable the X-ICP ternary localizability gate (partial-admit band above the degeneracy bar)");
+  dlio::declare_param(this, "odom/xicp/fullRatio", this->xicp_full_ratio_, 0.05,
+      "X-ICP localizable bar as a fraction of lambda_max; should exceed degeneracyThreshRatio", 0.0, 1.0);
+  this->gicp.setXicpTernary(this->xicp_ternary_enabled_, static_cast<float>(this->xicp_full_ratio_));
   // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
   // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
   // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is
