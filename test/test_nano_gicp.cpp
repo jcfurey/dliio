@@ -399,6 +399,47 @@ TEST(NanoGICP, XicpTernaryStillHoldsStronglyDegenerateAxis) {
   EXPECT_GE(g.lastDegenerateDirections(), 2);  // unobservable dofs still flagged
 }
 
+// GenZ-ICP blend OFF (default / floor 1) is bit-identical to the existing solve.
+TEST(NanoGICP, GenZDisabledIsBitIdentical) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto run = [&](bool set) {
+    auto g = makeGICP();
+    if (set) { g.setGenZWeighting(false, 0.5f, 0.1f, 1.0f); }  // explicit off
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);          // never configured -> default off
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));        // explicit off: exact
+}
+
+// GenZ-ICP blend exercised end-to-end on a degenerate (planar) scan: the
+// translation block is ill-conditioned, so alpha drops below 1 and the
+// point-to-point metric is mixed into the GICP cost in linearize(). Asserts the
+// solve stays finite and bounded -- this is also the ASan/UBSan coverage for the
+// linearize() blend edit (the hot loop the off-path tests never enter).
+TEST(NanoGICP, GenZBlendRunsOnDegenerateScan) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto g = makeGICP();
+  g.setGenZWeighting(true, 0.5f, 0.1f, 1.0f);  // blend engages on the ill-conditioned plane
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  const Eigen::Matrix4f T = g.getFinalTransformation();
+  const float tnorm = T.block<3, 1>(0, 3).norm();  // hoisted: comma in <3,1> breaks the macro
+  EXPECT_TRUE(T.allFinite());
+  EXPECT_LT(tnorm, 1.0f);  // bounded; no divergence from the blend
+}
+
 // --- Term mass-normalization (refCountScale + the photometric path) ---
 
 TEST(RefCountScale, OffReturnsRawScale) {
