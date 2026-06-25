@@ -111,6 +111,40 @@ TEST(DegeneracyGovernor, BlocksAreIndependent) {
   EXPECT_TRUE(R_out.isApprox(R_cur, 1e-5f));                  // yaw intact
 }
 
+// (8) OBLIQUE held axis: the clamp must act only along the (non-axis-aligned)
+// held direction and leave the orthogonal component of the motion intact. This
+// is the case the real gate actually produces -- its eigenvectors are skew
+// yaw/translation mixes, never clean unit axes -- and the one the axis-aligned
+// tests above cannot exercise (true projection vs. coordinate masking).
+TEST(DegeneracyGovernor, ClampsAlongObliqueHeldAxis) {
+  const Eigen::Matrix4f prev = Eigen::Matrix4f::Identity();
+  const Eigen::Vector3d d = Eigen::Vector3d(1.0, 1.0, 0.0).normalized();   // 45 deg in xy
+  const Eigen::Vector3d ortho = Eigen::Vector3d(1.0, -1.0, 0.0).normalized();
+  const Eigen::Vector3d move = 10.0 * d + 0.20 * ortho;  // runaway along d, small ortho
+  const Eigen::Matrix4f cur =
+      translated((float)move.x(), (float)move.y(), (float)move.z());
+  const std::vector<Eigen::Vector3d> held{d};
+  const Eigen::Matrix4f out = governPose(prev, cur, held, kNoDirs, 0.30f, 0.f);
+  const Eigen::Vector3d p = out.block<3, 1>(0, 3).cast<double>();
+  EXPECT_NEAR(d.dot(p), 0.30, 1e-4);          // along-axis component clamped to the cap
+  EXPECT_NEAR(ortho.dot(p), 0.20, 1e-4);      // orthogonal motion preserved exactly
+}
+
+// (9) MULTIPLE simultaneous held translation axes: each held (orthonormal) axis
+// is clamped independently and the unheld axis is untouched. Pins the
+// order-independence of the sequential per-axis clamp -- correct only because the
+// gate's held directions are orthonormal eigenvectors of one self-adjoint block.
+TEST(DegeneracyGovernor, ClampsMultipleHeldAxesIndependently) {
+  const Eigen::Matrix4f prev = Eigen::Matrix4f::Identity();
+  const Eigen::Matrix4f cur = translated(14.f, 9.f, 0.05f);   // x,y runaway; z under cap
+  const std::vector<Eigen::Vector3d> held{Eigen::Vector3d::UnitX(),
+                                          Eigen::Vector3d::UnitY()};
+  const Eigen::Matrix4f out = governPose(prev, cur, held, kNoDirs, 0.30f, 0.f);
+  EXPECT_NEAR(out(0, 3), 0.30f, 1e-5f);   // x clamped
+  EXPECT_NEAR(out(1, 3), 0.30f, 1e-5f);   // y clamped
+  EXPECT_NEAR(out(2, 3), 0.05f, 1e-5f);   // z (not held) preserved
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
