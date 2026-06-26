@@ -377,6 +377,15 @@
     odom/xicp/ternaryEnabled: false
     odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); > degeneracyThreshRatio
 
+    # Saliency-weighted point selection (anti-dilution). Up-weight rare salient
+    # source points (edges/ribs/corners, from the local covariance shape) by up to
+    # `boost` so the abundant planar walls don't swamp the weak along-axis DOF;
+    # planar points stay at weight 1. boost 1 (default) = off / unit weights /
+    # bit-identical (and the per-point saliency eigendecomposition is skipped).
+    # See doc/EXPLORATION_2026-06-26.md #1.
+    odom/saliency/enabled: false
+    odom/saliency/boost: 1.0       # weight of a maximally-salient point (e.g. 4 = up to 4x)
+
     # Image channel + normalization (2026-06-22). The per-point image slot is
     # filled from this cloud field; near-IR/ambient carries ~100x reflectivity's
     # dynamic range (mean ~645 vs ~19) and real wall texture, but is shot-noise-

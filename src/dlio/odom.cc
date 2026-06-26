@@ -794,6 +794,14 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/xicp/fullRatio", this->xicp_full_ratio_, 0.05,
       "X-ICP localizable bar as a fraction of lambda_max; should exceed degeneracyThreshRatio", 0.0, 1.0);
   this->gicp.setXicpTernary(this->xicp_ternary_enabled_, static_cast<float>(this->xicp_full_ratio_));
+  // Saliency-weighted point selection (anti-dilution): up-weight rare salient
+  // source points (edges/ribs/corners) so the abundant planar walls don't swamp
+  // the weak along-axis DOF. boost = 1 (default) -> unit weights, bit-identical.
+  dlio::declare_param(this, "odom/saliency/enabled", this->saliency_enabled_, false,
+      "Enable saliency-weighted geometric GICP (up-weight edge/rib/corner points)");
+  dlio::declare_param(this, "odom/saliency/boost", this->saliency_boost_, 1.0,
+      "Weight of a maximally-salient source point (1 = off; e.g. 4 = up to 4x on salient points)", 1.0, 100.0);
+  this->gicp.setSaliencyWeighting(this->saliency_enabled_, static_cast<float>(this->saliency_boost_));
   // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
   // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
   // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is

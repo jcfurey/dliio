@@ -21,6 +21,7 @@
 #include "nano_gicp/nano_gicp.h"
 #include "nano_gicp/genz_weight.h"
 #include "nano_gicp/xicp_localizability.h"
+#include "nano_gicp/saliency_weight.h"
 #include "dlio/dlio.h"
 #include <algorithm>
 #include <cmath>
@@ -362,6 +363,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->current_genz_alpha_ = 1.0f;  // pure point-to-plane until a scan sets it
   this->xicp_ternary_enabled_ = false;  // X-ICP ternary gate OFF -> existing gate (bit-identical)
   this->xicp_full_ratio_ = 0.05f;        // localizable bar; > degeneracy_thresh_ratio_ (0.005 default)
+  this->saliency_enabled_ = false;       // anti-dilution saliency weighting OFF -> unit weights (bit-identical)
+  this->saliency_boost_ = 1.0f;          // weight of a maximally-salient point (1 = off)
   this->last_lidar_map_rms_ = 0.0f;
   this->last_lidar_map_count_ = 0;
 }
@@ -635,6 +638,12 @@ void NanoGICP<PointSource, PointTarget>::setXicpTernary(bool enabled, float full
 }
 
 template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setSaliencyWeighting(bool enabled, float boost) {
+    this->saliency_enabled_ = enabled;
+    this->saliency_boost_ = (boost > 1.f) ? boost : 1.f;   // boost <= 1 -> off (unit weights)
+}
+
+template <typename PointSource, typename PointTarget>
 float NanoGICP<PointSource, PointTarget>::lastLidarMapRms() const {
     return this->last_lidar_map_rms_;
 }
@@ -732,7 +741,11 @@ void NanoGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceCo
   input_kdtree_.reset(new nanoflann::KdTreeFLANN<PointSource>(false));
   input_kdtree_->setInputCloud(cloud);
 
-  calculate_covariances(cloud, *input_kdtree_, source_covs_, &source_density_);
+  // Compute per-source-point saliency only when the anti-dilution weighting is
+  // on (else the extra per-point eigendecomposition is skipped; source_saliency_
+  // stays empty -> linearize falls back to unit weights, bit-identical).
+  calculate_covariances(cloud, *input_kdtree_, source_covs_, &source_density_,
+                        this->saliency_enabled_ ? &this->source_saliency_ : nullptr);
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1396,6 +1409,14 @@ void NanoGICP<PointSource, PointTarget>::linearize(
             const float a = this->current_genz_alpha_;
             M = a * M + (1.0f - a) * this->genz_point_weight_ * Eigen::Matrix3f::Identity();
         }
+        // Saliency weighting (anti-dilution): up-weight rare salient source points
+        // (edges/ribs/corners that constrain the along-axis DOF) so the abundant
+        // planar walls don't swamp the weak axis. Off / boost<=1 / missing saliency
+        // -> unit weight, bit-identical. Scales this point's whole contribution
+        // (H, b, cost). See nano_gicp/saliency_weight.h, EXPLORATION_2026-06-26 #1.
+        if (this->saliency_enabled_ && i < static_cast<int>(this->source_saliency_.size())) {
+            M *= saliencyMultiplier(this->source_saliency_[i], this->saliency_boost_);
+        }
 
         H_private[thread_num] += (J_geometric.transpose() * M * J_geometric).cast<double>();
         b_private[thread_num] += (J_geometric.transpose() * M * residual).cast<double>();
@@ -1931,9 +1952,13 @@ void NanoGICP<PointSource, PointTarget>::calculate_covariances(
     const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
     const nanoflann::KdTreeFLANN<PointT>& kdtree,
     CovarianceList& covs,
-    float* density) {
+    float* density,
+    std::vector<float>* saliency) {
 
     covs.resize(cloud->size());
+    // Per-point saliency (anti-dilution GICP weighting): only filled when
+    // requested (source cloud, feature on) so a disabled run pays no extra cost.
+    if (saliency != nullptr) { saliency->assign(cloud->size(), 0.f); }
     float sum_k_sq_distances = 0.0f;
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) \
@@ -1974,6 +1999,15 @@ void NanoGICP<PointSource, PointTarget>::calculate_covariances(
 
         Eigen::Matrix4f cov = (centered * centered.transpose()) / static_cast<float>(found);
         cov(3, 3) = 1.0;
+
+        // Saliency from the RAW neighborhood covariance shape (before the
+        // regularization below flattens it): planar wall -> ~0, edge/rib/corner
+        // -> ~1. Only when requested (source cloud, feature on).
+        if (saliency != nullptr) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(
+                cov.block<3, 3>(0, 0), Eigen::EigenvaluesOnly);
+            (*saliency)[i] = pointSaliency(es.eigenvalues());
+        }
 
         // NOTE: this rewrite historically labeled its clamped-singular-value
         // regularization "PLANE"; true GICP plane-to-plane (fast_gicp) replaces
