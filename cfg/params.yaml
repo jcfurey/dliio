@@ -357,6 +357,14 @@
     odom/lidar_image/dirSeparated/enabled: false
     odom/lidar_image/dirSeparated/ratio: 0.05   # weak-subspace bar (fraction of lambda_max, per block)
 
+    # Frame-to-FRAME LiDAR flow term (doc/EXPLORATION_2026-06-26.md #2). Registers
+    # the current scan against the PREVIOUS scan's image to observe the along-tunnel
+    # motion the frame-to-map reflectivity term can't (aliased). Pairs with
+    # dirSeparated so it only constrains the degenerate axis. weight 0 (default) =
+    # off / bit-identical.
+    odom/lidar_image/flow/enabled: false
+    odom/lidar_image/flow/weight: 0.0   # count-normalized; comparable to lidar_image/weight
+
     # GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L
     # 2025). On an ill-conditioned scan (geometric translation lambda_min/lambda_max
     # < knee) mix an isotropic point-to-point metric into the GICP cost to

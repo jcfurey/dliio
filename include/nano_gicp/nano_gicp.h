@@ -296,6 +296,16 @@ public:
   // from the organized scan. The current scan's reflectivity image + projection
   // + world->lidar transform are set per scan.
   void setLidarMapWeight(float weight);
+  // Frame-to-FRAME LiDAR flow term (doc/EXPLORATION_2026-06-26.md #2): register the
+  // current scan against the PREVIOUS scan's image to observe the along-tunnel
+  // motion the frame-to-map reflectivity term can't. weight <= 0 (default) -> off,
+  // bit-identical. setLidarFlowPrev supplies the previous image (deep-copied here
+  // -- owns the buffer) and the previous scan's world->lidar pose; the caller
+  // sets it before align() and direction-separates the term so it only constrains
+  // the degenerate axis. Threading: the accumulator snapshots the image (refcount
+  // hold) for the loop's lifetime; the member is never mutated in place.
+  void setLidarFlowWeight(float weight);
+  void setLidarFlowPrev(const cv::Mat& prev_img, const Eigen::Isometry3f& T_lw_prev);
   void setLidarImage(const cv::Mat& refl_norm);  // CV_32FC1, reflectivity/scale
   // Linear spherical model: col = (atan2(Y,X) - az_b)/az_a, row = (elev - el_b)/el_a.
   void setLidarProjection(float az_a, float az_b, float el_a, float el_b);
@@ -488,6 +498,14 @@ protected:
                                   Eigen::Matrix<double, 6, 1>* b,
                                   double* cost = nullptr);
 
+  // Frame-to-FRAME LiDAR flow contribution: project the CORRECTED source points
+  // into the PREVIOUS scan's image (left-perturbation Jacobian + spherical dpi).
+  // No-op unless setLidarFlowWeight(>0) and a previous image is set.
+  void accumulateLidarFlowResidual(const Eigen::Isometry3f& trans,
+                                   Eigen::Matrix<double, 6, 6>* H,
+                                   Eigen::Matrix<double, 6, 1>* b,
+                                   double* cost = nullptr);
+
 protected:
   using pcl::Registration<PointSource, PointTarget>::reg_name_;
   using pcl::Registration<PointSource, PointTarget>::input_;
@@ -606,6 +624,11 @@ protected:
   float lidar_el_a_, lidar_el_b_;     // row = (elev - el_b) / el_a (fallback)
   std::vector<float> lidar_el_lut_;   // per-row elevation [rad]; supersedes el_a/el_b when non-empty
   Eigen::Isometry3f T_lw_cur_;        // world -> lidar from the prior pose
+  float lidar_flow_weight_;            // frame-to-frame flow term weight; 0 = off (bit-identical)
+  cv::Mat lidar_flow_prev_img_;       // PREVIOUS scan's image (owned deep copy), CV_32FC1, /scale
+  Eigen::Isometry3f T_lw_prev_flow_;  // world -> previous lidar (previous scan's corrected pose)
+  int last_lidar_flow_count_;         // diagnostics: flow residuals last scan
+  float last_lidar_flow_rms_;
   cv::Mat lidar_range_img_;           // current range image [m], CV_32FC1, <=0 invalid (optional)
   float lidar_range_abs_tol_;         // occlusion tolerance: absolute [m]
   float lidar_range_rel_tol_;         // occlusion tolerance: relative (fraction of range)
