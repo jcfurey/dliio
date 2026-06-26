@@ -349,6 +349,13 @@ public:
   // should exceed degeneracyThreshRatio. When enabled this REPLACES the soft/prob
   // keep-fraction; enabled = false (default) -> the existing gate, bit-identical.
   void setXicpTernary(bool enabled, float full_ratio);
+  // Saliency-weighted point selection (saliency_weight.h, anti-dilution). Up-weight
+  // rare salient source points (edges/ribs/corners, from the local covariance
+  // shape) by up to `boost` so the abundant planar walls do not swamp the weak
+  // along-axis DOF; planar points stay at weight 1. enabled = false / boost <= 1
+  // (default) -> unit weights, bit-identical, and the per-point saliency
+  // eigendecomposition is skipped entirely. See doc/EXPLORATION_2026-06-26.md #1.
+  void setSaliencyWeighting(bool enabled, float boost);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
 
@@ -448,7 +455,8 @@ protected:
   void calculate_covariances(const typename pcl::PointCloud<PointT>::ConstPtr& cloud,
                              const nanoflann::KdTreeFLANN<PointT>& kdtree,
                              CovarianceList& covariances,
-                             float* density = nullptr);
+                             float* density = nullptr,
+                             std::vector<float>* saliency = nullptr);
 
   bool estimate_spatial_intensity_gradient(int target_index, Eigen::Vector3f& gradient) const;
   void calculate_target_intensity_gradients();
@@ -613,6 +621,9 @@ protected:
   float current_genz_alpha_;          // alpha in effect this iteration (lagged); 1 = pure point-to-plane
   bool  xicp_ternary_enabled_;        // X-ICP ternary localizability gate; off = existing binary/soft gate
   float xicp_full_ratio_;             // upper (localizable) bar as a fraction of lambda_max (partial bar = degeneracy_thresh_ratio_)
+  bool  saliency_enabled_;            // anti-dilution saliency weighting of the geometric term; off = unit weights
+  float saliency_boost_;              // weight of a maximally-salient source point (1 = off)
+  std::vector<float> source_saliency_; // per-source-point saliency in [0,1] (filled only when saliency_enabled_)
   float last_lidar_map_rms_;
   int last_lidar_map_count_;
 };

@@ -208,6 +208,12 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_saliency_weight test/test_saliency_weight.cpp)
+  target_compile_definitions(test_saliency_weight PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_saliency_weight
+    dlio_components
+  )
+
   ament_add_gtest(test_intensity test/test_intensity.cpp)
   target_compile_definitions(test_intensity PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_intensity

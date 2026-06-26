@@ -618,6 +618,8 @@ private:
   double genz_point_weight_ = 1.0;     // isotropic point-to-point metric weight [1/m^2]
   bool xicp_ternary_enabled_ = false;  // X-ICP ternary localizability gate; off = existing gate
   double xicp_full_ratio_ = 0.05;      // upper (localizable) bar as a fraction of lambda_max
+  bool saliency_enabled_ = false;      // anti-dilution saliency weighting of the geometric term
+  double saliency_boost_ = 1.0;        // weight of a maximally-salient source point (1 = off)
   std::string lidar_image_channel_;    // cloud field feeding the image slot: reflectivity|intensity|ambient
   double lidar_image_scale_;           // image full-scale normalization (per-channel; default 255)
   int lidar_image_denoise_kernel_;     // K x K spatial box-blur of the organized channel (<=1 = off; tames near-IR shot noise)

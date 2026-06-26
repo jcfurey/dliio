@@ -480,6 +480,46 @@ TEST(NanoGICP, XicpTernaryRecordsNothingOnObservableGeometry) {
   EXPECT_TRUE(g.lastDegenRotDirs().empty());
 }
 
+// Saliency weighting OFF (default / boost 1) is bit-identical to the existing
+// solve, and skips the per-point saliency eigendecomposition entirely.
+TEST(NanoGICP, SaliencyDisabledIsBitIdentical) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto run = [&](bool set) {
+    auto g = makeGICP();
+    if (set) { g.setSaliencyWeighting(false, 4.0f); }  // explicit off
+    g.setInputTarget(target);
+    g.setInputSource(source);
+    Cloud a; g.align(a);
+    return g.getFinalTransformation();
+  };
+  const Eigen::Matrix4f base = run(false);
+  EXPECT_TRUE(run(true).isApprox(base, 0.f));        // explicit off: exact
+}
+
+// With saliency weighting ON, a well-conditioned solve still converges accurately
+// (up-weighting edge/corner points must not break correct registration).
+TEST(NanoGICP, SaliencyOnStillRecoversTransform) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 3>(0, 0) =
+      Eigen::AngleAxisf(0.02f, Eigen::Vector3f::UnitZ()).toRotationMatrix();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g = makeGICP();
+  g.setSaliencyWeighting(true, 4.0f);   // up-weight salient (edge/corner) points
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  ASSERT_TRUE(g.hasConverged());
+  const Eigen::Matrix4f T = g.getFinalTransformation();
+  EXPECT_LT((T.block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm(), 0.03f);
+}
+
 // --- Term mass-normalization (refCountScale + the photometric path) ---
 
 TEST(RefCountScale, OffReturnsRawScale) {
