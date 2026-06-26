@@ -761,6 +761,14 @@ void dlio::OdomNode::getParams() {
       "Cond-scale exponent on (lambda_max/lambda_k) per geometric eigen-direction");
   dlio::declare_param(this, "odom/lidar_image/condScale/cap", this->lidar_cs_cap_, 50.0,
       "Cond-scale max per-direction boost (alpha) applied to the LiDAR-map term");
+  // Direction-separated LiDAR fusion (LOFF-style): restrict the term to the
+  // geometrically-weak subspace so it can only move the degenerate axis and can't
+  // perturb the well-observed ones. Off (default) -> term added in full,
+  // bit-identical. Composes with condScale (boost then separate).
+  dlio::declare_param(this, "odom/lidar_image/dirSeparated/enabled", this->lidar_dir_separated_enabled_, false,
+      "Restrict the LiDAR-map term to the geometrically-weak (degenerate) subspace (LOFF-style)");
+  dlio::declare_param(this, "odom/lidar_image/dirSeparated/ratio", this->lidar_ds_ratio_, 0.05,
+      "Weak-subspace bar as a fraction of lambda_max (per block) for direction separation", 0.0, 1.0);
   // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
   // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
   // mix an isotropic point-to-point metric into the GICP cost to regularize the
@@ -2490,6 +2498,8 @@ void dlio::OdomNode::getNextPose() {
     this->gicp.setLidarCondScale(this->lidar_cond_scale_enabled_,
                                  static_cast<float>(this->lidar_cs_power_),
                                  static_cast<float>(this->lidar_cs_cap_));
+    this->gicp.setLidarDirSeparate(this->lidar_dir_separated_enabled_,
+                                   static_cast<float>(this->lidar_ds_ratio_));
     this->gicp.setLidarMapWeight(static_cast<float>(this->lidar_image_weight_));
   } else {
     this->gicp.setLidarMapWeight(0.f);

@@ -348,6 +348,15 @@
     odom/lidar_image/condScale/power: 1.0   # exponent on (lambda_max/lambda_k) per eigen-direction
     odom/lidar_image/condScale/cap: 50.0    # max per-direction boost (alpha)
 
+    # Direction-SEPARATED LiDAR fusion (LOFF-style; doc/EXPLORATION_2026-06-26.md
+    # #2). Restrict the LiDAR-map term to the geometrically-weak (degenerate)
+    # subspace so it can ONLY move the unobservable axis and cannot perturb the
+    # well-observed ones (the opposite knob to condScale; composes with it). A
+    # fully-observed scan suppresses the term entirely. enabled false (default) =
+    # term added in full, bit-identical.
+    odom/lidar_image/dirSeparated/enabled: false
+    odom/lidar_image/dirSeparated/ratio: 0.05   # weak-subspace bar (fraction of lambda_max, per block)
+
     # GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L
     # 2025). On an ill-conditioned scan (geometric translation lambda_min/lambda_max
     # < knee) mix an isotropic point-to-point metric into the GICP cost to

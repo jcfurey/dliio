@@ -1100,6 +1100,65 @@ TEST(CondScale, CapBoundsBoost) {
   EXPECT_NEAR(b(2), cap, 1e-9);
 }
 
+// --- Direction-separated fusion (directionSeparateTerm) ---
+
+// ratio <= 0 -> OFF: the term is returned untouched (bit-identical).
+TEST(DirSep, RatioOffIsIdentity) {
+  const auto Hgeo = diagGeo(100, 50, 1, 80, 2, 40);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity() * 3.0;
+  Eigen::Matrix<double, 6, 1> b; b << 1, 2, 3, 4, 5, 6;
+  const auto H0 = H; const auto b0 = b;
+  nano_gicp::directionSeparateTerm(Hgeo, 0.0, &H, &b);
+  EXPECT_TRUE(H.isApprox(H0, 0.0));
+  EXPECT_TRUE(b.isApprox(b0, 0.0));
+}
+
+// The term is projected onto the WEAK axis of each block; the strong-axis
+// components are removed. rot {1,100,100} + trans {1,50,50}, ratio 0.05 -> axis 0
+// of each block is weak (1 <= 0.05*lmax), the rest strong.
+TEST(DirSep, KeepsWeakZeroesStrong) {
+  const auto Hgeo = diagGeo(1, 100, 100, 1, 50, 50);
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::directionSeparateTerm(Hgeo, 0.05, &H, &b);
+  EXPECT_NEAR(H(0, 0), 1.0, 1e-12); EXPECT_NEAR(H(1, 1), 0.0, 1e-12); EXPECT_NEAR(H(2, 2), 0.0, 1e-12);
+  EXPECT_NEAR(H(3, 3), 1.0, 1e-12); EXPECT_NEAR(H(4, 4), 0.0, 1e-12); EXPECT_NEAR(H(5, 5), 0.0, 1e-12);
+  Eigen::Matrix<double, 6, 1> bexp; bexp << 1, 0, 0, 1, 0, 0;
+  EXPECT_TRUE(b.isApprox(bexp, 1e-12));
+}
+
+// A FULLY-OBSERVED block (no weak direction) is suppressed to zero -> a
+// non-degenerate scan cannot be perturbed by the term.
+TEST(DirSep, FullyObservedBlockSuppressed) {
+  const auto Hgeo = diagGeo(100, 100, 100, 1, 50, 50);  // rot all strong, trans axis 0 weak
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::directionSeparateTerm(Hgeo, 0.05, &H, &b);
+  EXPECT_NEAR(H(0, 0), 0.0, 1e-12); EXPECT_NEAR(H(1, 1), 0.0, 1e-12); EXPECT_NEAR(H(2, 2), 0.0, 1e-12);
+  EXPECT_NEAR(H(3, 3), 1.0, 1e-12);  // trans weak axis kept
+}
+
+// An EMPTY block (no observability info, lambda_max <= 0) is left untouched.
+TEST(DirSep, EmptyBlockUntouched) {
+  const auto Hgeo = diagGeo(0, 0, 0, 1, 50, 50);  // rot block empty
+  Eigen::Matrix<double, 6, 6> H = Eigen::Matrix<double, 6, 6>::Identity();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Ones();
+  nano_gicp::directionSeparateTerm(Hgeo, 0.05, &H, &b);
+  EXPECT_NEAR(H(0, 0), 1.0, 1e-12); EXPECT_NEAR(H(1, 1), 1.0, 1e-12); EXPECT_NEAR(H(2, 2), 1.0, 1e-12);
+}
+
+// Symmetry + PSD preserved for a coupled PSD term (P H P with P a projector).
+TEST(DirSep, PreservesSymmetryAndPSD) {
+  const auto Hgeo = diagGeo(100, 10, 1, 80, 5, 1);
+  Eigen::Matrix<double, 6, 6> M = Eigen::Matrix<double, 6, 6>::Random();
+  Eigen::Matrix<double, 6, 6> H = M * M.transpose();
+  Eigen::Matrix<double, 6, 1> b = Eigen::Matrix<double, 6, 1>::Random();
+  nano_gicp::directionSeparateTerm(Hgeo, 0.05, &H, &b);
+  EXPECT_LT((H - H.transpose()).norm(), 1e-9);
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(H);
+  EXPECT_GT(es.eigenvalues()(0), -1e-9);
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

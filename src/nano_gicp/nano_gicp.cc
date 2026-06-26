@@ -145,6 +145,31 @@ void conditionScaleTerm(const Eigen::Matrix<double, 6, 6>& H_geo,
     *b_term = S * (*b_term);                         //            drive     x alpha
 }
 
+// Direction-separated fusion of a map term (see nano_gicp.h). Pure, unit-tested.
+void directionSeparateTerm(const Eigen::Matrix<double, 6, 6>& H_geo, double ratio,
+                           Eigen::Matrix<double, 6, 6>* H_term,
+                           Eigen::Matrix<double, 6, 1>* b_term) {
+    if (!(ratio > 0.0)) { return; }                  // off -> term untouched
+    Eigen::Matrix<double, 6, 6> P = Eigen::Matrix<double, 6, 6>::Identity();
+    for (int blk = 0; blk < 2; ++blk) {
+        const int o = 3 * blk;                       // 0 = rotation, 3 = translation
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(H_geo.block<3, 3>(o, o));
+        const double lmax = es.eigenvalues()(2);     // ascending: (2) is largest
+        if (!(lmax > 0.0)) { continue; }             // no observability info: keep identity
+        const double thresh = ratio * lmax;
+        Eigen::Matrix3d Pb = Eigen::Matrix3d::Zero();
+        for (int k = 0; k < 3; ++k) {                // project onto the WEAK directions
+            if (es.eigenvalues()(k) <= thresh) {
+                const Eigen::Vector3d v = es.eigenvectors().col(k);
+                Pb += v * v.transpose();
+            }
+        }
+        P.block<3, 3>(o, o) = Pb;                     // 0 if the block is fully observed
+    }
+    *H_term = P * (*H_term) * P;                      // J -> J·P : keep only the weak-subspace action
+    *b_term = P * (*b_term);
+}
+
 // Margin-adaptive clamp scale (see nano_gicp.h). Pure and unit-tested.
 double clampScaleFromMargin(double margin, double margin_lo, double margin_hi,
                             double clamp_floor) {
@@ -328,6 +353,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->lidar_cond_scale_enabled_ = false;  // direction-scaling OFF -> bit-identical
   this->lidar_cs_power_ = 1.0f;
   this->lidar_cs_cap_ = 50.0f;
+  this->lidar_dir_separated_enabled_ = false;  // direction-separation OFF -> bit-identical
+  this->lidar_ds_ratio_ = 0.05f;               // weak-subspace bar (fraction of lambda_max)
   this->genz_enabled_ = false;       // GenZ point/plane blend OFF -> pure point-to-plane (bit-identical)
   this->genz_floor_ = 1.0f;          // alpha floor 1 = no blend
   this->genz_knee_ = 0.1f;           // start blending below lambda_min/lambda_max = 0.1
@@ -584,6 +611,12 @@ void NanoGICP<PointSource, PointTarget>::setLidarCondScale(bool enabled, float p
     this->lidar_cond_scale_enabled_ = enabled;
     this->lidar_cs_power_ = (power > 0.f) ? power : 0.f;
     this->lidar_cs_cap_   = (cap   > 1.f) ? cap   : 1.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarDirSeparate(bool enabled, float ratio) {
+    this->lidar_dir_separated_enabled_ = enabled;
+    this->lidar_ds_ratio_ = (ratio > 0.f) ? ratio : 0.f;   // <=0 -> off (term untouched)
 }
 
 template <typename PointSource, typename PointTarget>
@@ -993,18 +1026,25 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         }
         // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
         if (lidar_map_weight_ > 0.f) {
-            if (lidar_cond_scale_enabled_) {
-                // Direction-scale the term toward the geometrically-weak axes so
-                // it can clear the gate's rescue bar there (its isotropic mass is
-                // otherwise ~250-10000x short on the degenerate axis). Accumulate
-                // into a separate H_lid/b_lid, reweight via the GEOMETRIC eigenbasis
-                // (H_geo, judged before any term), then add. The per-scan rescue
-                // budget below still bounds the resulting motion. See REVIEW.md #8.
+            if (lidar_cond_scale_enabled_ || lidar_dir_separated_enabled_) {
+                // Reweight the term before adding, judged from the GEOMETRIC
+                // eigenbasis (H_geo, before any term): conditionScale BOOSTS it
+                // toward the weak axes so it can clear the gate's rescue bar there;
+                // directionSeparate RESTRICTS it to the weak subspace (LOFF-style,
+                // so it can only move the degenerate axis, never perturb the strong
+                // ones). Either or both; the per-scan rescue budget still bounds the
+                // resulting motion. See REVIEW.md #8, EXPLORATION_2026-06-26 #2.
                 Eigen::Matrix<double, 6, 6> H_lid = Eigen::Matrix<double, 6, 6>::Zero();
                 Eigen::Matrix<double, 6, 1> b_lid = Eigen::Matrix<double, 6, 1>::Zero();
                 accumulateLidarMapResidual(trans, &H_lid, &b_lid, nullptr);
-                conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
-                                   static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
+                if (lidar_cond_scale_enabled_) {
+                    conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
+                                       static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
+                }
+                if (lidar_dir_separated_enabled_) {
+                    directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
+                                          &H_lid, &b_lid);
+                }
                 H += H_lid;
                 b += b_lid;
             } else {
