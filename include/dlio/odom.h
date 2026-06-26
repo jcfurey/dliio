@@ -610,6 +610,11 @@ private:
   bool lidar_cond_scale_enabled_;      // direction-scale the lidar-map term along weak geom axes
   double lidar_cs_power_, lidar_cs_cap_;  // cond-scale exponent + per-direction boost cap
   bool lidar_dir_separated_enabled_ = false;  // restrict the lidar term to the weak subspace (LOFF)
+  bool lidar_flow_enabled_ = false;    // frame-to-frame LiDAR flow term (EXPLORATION #2)
+  double lidar_flow_weight_ = 0.0;     // flow term weight (count-normalized); 0 = off
+  cv::Mat lidar_flow_prev_img_;        // previous scan's image, stashed for the flow term
+  Eigen::Isometry3f lidar_flow_T_lw_prev_ = Eigen::Isometry3f::Identity();  // prev scan corrected world->lidar
+  bool lidar_flow_prev_valid_ = false; // a previous image has been stashed
   double lidar_ds_ratio_ = 0.05;       // weak-subspace bar (fraction of lambda_max)
   bool genz_enabled_ = false;          // GenZ-ICP point-to-plane/point-to-point blend; off = bit-identical
   double genz_floor_ = 1.0;            // min point-to-plane weight alpha (1 = off)

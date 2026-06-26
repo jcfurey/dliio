@@ -41,15 +41,11 @@ existing reflectivity frame-to-map term — which the findings showed is along-a
 *aliased* — it mostly removes that term from the strong axes; its value is
 unlocked by a term that actually carries weak-axis information. That term is:
 
-### Sketch — frame-to-frame range-flow term (the next, larger piece)
-Store the previous scan's **range** image + lidar pose (`lidar_prev_range_`,
-`T_lw_prev_`), project the current scan's points into it via the existing
-spherical model (reuse `accumulateLidarMapResidual`'s projection + Jacobian, but
-frame-to-frame instead of frame-to-map), form a range/photometric flow residual,
-and run it through `directionSeparateTerm` so it only constrains the along-axis
-DOF. The range image (unlike reflectivity) carries geometric structure — ribs,
-junctions — that varies *along* the tunnel, so it may observe the motion
-reflectivity can't. The new risk is the **previous-image lifecycle** in the node's
-scan loop (the same threading-hazard class as the photometric-loop crash), which
-is why it warrants its own focused, separately-reviewed PR rather than riding in
-with this pure-kernel change. Validate with a `ratio` × flow-weight A/B on the bag.
+### Frame-to-frame flow term — implemented (the signal half)
+Built in a follow-on PR (`doc/LIDAR_FLOW_TERM.md`): `accumulateLidarFlowResidual`
+projects the current scan's corrected points into the **previous** scan's image
+(reusing the spherical projection + the visual frame-to-frame Jacobian), and the
+solve runs it through `directionSeparateTerm` so it only constrains the along-axis
+DOF. The previous-image lifecycle mirrors the proven `visual_prev_` pattern, with
+an owned deep copy + a refcount snapshot in the parallel loop for thread safety.
+Default-off; validate with a `ratio` × flow-weight A/B on the bag.
