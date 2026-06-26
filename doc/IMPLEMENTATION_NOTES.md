@@ -192,5 +192,6 @@ write race would need a snapshot-under-lock, noted but not indicated here).
 
 All three are default-path-preserving (5.1 guarded by `xicp_ternary_enabled_`;
 5.2 identical for finite inputs; 5.3 pure lifetime change), so the off-paths stay
-bit-identical. Validated by build + `colcon test` in a ROS 2 Jazzy container
-(see the commit/CI run).
+bit-identical. Validated in a ROS 2 Jazzy container: clean build + `colcon test`
+(146 tests, 0 failures) and the ASan+UBSan (`-fsanitize=address,undefined`) build
++ test run, 0 errors / 0 failures / no sanitizer reports.
