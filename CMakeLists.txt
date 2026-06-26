@@ -190,6 +190,12 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_degeneracy_observer test/test_degeneracy_observer.cpp)
+  target_compile_definitions(test_degeneracy_observer PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_degeneracy_observer
+    dlio_components
+  )
+
   ament_add_gtest(test_genz_weight test/test_genz_weight.cpp)
   target_compile_definitions(test_genz_weight PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_genz_weight

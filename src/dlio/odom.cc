@@ -13,6 +13,7 @@
 #include "dlio/odom.h"
 #include "dlio/utils.h"
 #include "dlio/degeneracy_governor.h"
+#include "dlio/degeneracy_observer.h"
 #include <set>
 #include <unordered_map>
 #include <limits>
@@ -875,6 +876,11 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/geo/Kq", this->geo_Kq_, 1.0, "Observer orientation gain (live-tunable)", 0.0, 100.0);
   dlio::declare_param(this, "odom/geo/Kab", this->geo_Kab_, 1.0, "Observer accel-bias gain (live-tunable)", 0.0, 100.0);
   dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0, "Observer gyro-bias gain (live-tunable)", 0.0, 100.0);
+  // LODESTAR-flavored degeneracy-aware observer gain: scale the LiDAR correction
+  // on held-degenerate axes (1 = off / full trust, 0 = freeze the axis to the IMU
+  // prior). Reads the gate's held world-frame dirs; 1.0 (default) -> bit-identical.
+  dlio::declare_param(this, "odom/geo/degenObsGain", this->geo_degen_obs_gain_, 1.0,
+      "Observer correction gain on held-degenerate axes (1 = off, 0 = freeze to IMU prior)", 0.0, 1.0);
   dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0, "Accel-bias clamp [m/s^2] (live-tunable)", 0.0, 50.0);
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0, "Gyro-bias clamp [rad/s] (live-tunable)", 0.0, 10.0);
 }
@@ -2861,6 +2867,21 @@ void dlio::OdomNode::updateState() {
 
   Eigen::Vector3f err = pin - this->state.p;
   Eigen::Vector3f err_body;
+
+  // LODESTAR-flavored degeneracy-aware observer gain (default 1 = off,
+  // bit-identical). On the world-frame axes the gate flagged degenerate and HELD,
+  // attenuate the LiDAR correction so the state rides the IMU-propagated prior
+  // there instead of absorbing registration noise into the runaway -- the
+  // contracting-observer analogue of LODESTAR's reduced-gain "fixed" state
+  // (see include/dlio/degeneracy_observer.h, doc/EXPLORATION_2026-06-26.md).
+  // err (world) drives position, velocity, AND accel bias (via err_body below);
+  // qcorr.vec() (world, after qhat*qcorr) drives orientation. The held dirs are
+  // read from gicp on this scan thread, same as the cov inflation below.
+  if (this->geo_degen_obs_gain_ < 1.0) {
+    const float g = static_cast<float>(this->geo_degen_obs_gain_);
+    err = dlio::attenuateAlongHeldAxes(err, this->gicp.lastDegenTransDirs(), g);
+    qcorr.vec() = dlio::attenuateAlongHeldAxes(qcorr.vec(), this->gicp.lastDegenRotDirs(), g);
+  }
 
   err_body = qhat.conjugate()._transformVector(err);
 

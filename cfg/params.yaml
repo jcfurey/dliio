@@ -401,5 +401,11 @@
     odom/geo/Kq: 4.0
     odom/geo/Kab: 2.25
     odom/geo/Kgb: 1.0
+    # LODESTAR-flavored degeneracy-aware observer gain (default 1 = off). On the
+    # gate's held-degenerate axes, scale the LiDAR pose correction by this factor
+    # so the state rides the IMU prior there (0 = fully freeze the axis, the
+    # reduced-gain "fixed" state; 1 = full trust / bit-identical). Pairs with the
+    # governor cov inflation. See doc/EXPLORATION_2026-06-26.md.
+    odom/geo/degenObsGain: 1.0
     odom/geo/abias_max: 5.0   # [m/s^2]
     odom/geo/gbias_max: 0.5   # [rad/s]
