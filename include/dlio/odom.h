@@ -535,6 +535,7 @@ private:
   double geo_Kq_;
   double geo_Kab_;
   double geo_Kgb_;
+  double geo_degen_obs_gain_ = 1.0;  // LODESTAR-flavored observer gain on held-degenerate axes; 1 = off
   double geo_abias_max_;
   double geo_gbias_max_;
   // Intensity range correction

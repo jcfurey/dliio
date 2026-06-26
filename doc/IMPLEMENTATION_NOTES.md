@@ -19,7 +19,7 @@ not fit the architecture — so a reviewer knows the status of each.
 | Governor test gaps (oblique + multi-held-dir) | self (review) | **Landed** — 2 new gtests in `test_degeneracy_governor.cpp` |
 | GenZ-ICP adaptive point-to-plane / point-to-point blend | Lee et al., RA-L 2025 | **Landed, wired, default-off** — `genz_weight.h` + gate wiring + params + gtests |
 | X-ICP ternary localizability | Tuna et al., T-RO 2024 | **Landed, wired, default-off** — `xicp_localizability.h` + gate wiring + params + kernel & integration gtests |
-| LODESTAR Schmidt-Kalman coupling | Lee/Marsim/Myung, RA-L 2025 | **Not implemented — architectural misfit** (below). The governor's cov-inflation is the pragmatic stand-in |
+| LODESTAR Schmidt-Kalman coupling | Lee/Marsim/Myung, RA-L 2025 | **Tractable slice prototyped** — observability-scheduled observer gain (`degeneracy_observer.h`, default-off). Full ESKF still deferred. See §4 + `doc/EXPLORATION_2026-06-26.md` |
 
 ---
 
@@ -112,12 +112,19 @@ downstream consumers; it does not feed back into our own observer).
 
 A faithful LODESTAR port would mean **replacing the observer with a covariance-
 propagating filter (ESKF/UKF)** — a back-end rearchitecture, not a default-off
-feature, and out of scope for this branch. Recommendation: keep the governor's
-informational cov-inflation as the pragmatic stand-in; if a future revision moves
-DLIO to an ESKF (cf. ALIVE-LIO, arXiv:2604.02706, which adds a learned velocity
-update to an ESKF-based LIO), adopt LODESTAR's fixed/active partition then — it
-would subsume *both* the governor clamp and the inflation into one principled
-update. Documented as a deferred direction, not attempted as a bolt-on.
+feature. **Update (2026-06-26):** rather than the full rewrite, a *tractable slice*
+is now prototyped — `include/dlio/degeneracy_observer.h`'s
+`attenuateAlongHeldAxes`, applied in `updateState()` behind `odom/geo/degenObsGain`
+(default 1.0 = off / bit-identical). It is the contracting-observer analogue of
+LODESTAR's reduced-gain "fixed" state: on the gate's held axes the observer's
+LiDAR correction is scaled toward the IMU prior, so the runaway is attenuated *at
+the source* (inside the estimator) rather than only bounded after the fact by the
+governor. It does **not** add covariance cross-coupling or snap-back — that still
+needs the ESKF. Full design, trade-offs, and the recommended novel directions
+(saliency reweighting, direction-separated range-image flow) are in
+`doc/EXPLORATION_2026-06-26.md`. If the slice's gain-scheduling proves
+insufficient on the bag, adopt the ESKF + LODESTAR fixed/active partition then
+(cf. ALIVE-LIO, arXiv:2604.02706).
 
 ---
 
