@@ -440,6 +440,46 @@ TEST(NanoGICP, GenZBlendRunsOnDegenerateScan) {
   EXPECT_LT(tnorm, 1.0f);  // bounded; no divergence from the blend
 }
 
+// X-ICP partial-band recording for the governor (FINDINGS_2026-06-25 fix): with
+// the ternary gate on, the gate still records the hard-degenerate in-plane axes
+// for the governor and the new partial-band recording path runs without
+// disturbing that or the solve. (Partial-band efficacy itself is validated by the
+// empirical combo A/B; an eigenvalue in (thresh, fullRatio)*lmax is not
+// constructible deterministically from a clean plane here.)
+TEST(NanoGICP, XicpTernaryStillRecordsGovernorDirs) {
+  auto target = makePlane(2.0f, 0.05f);
+  Eigen::Matrix4f T_shift = Eigen::Matrix4f::Identity();
+  T_shift(0, 3) = 0.4f;
+  auto source = transformCloud(target, T_shift);
+
+  auto g = makeGICP();
+  g.setXicpTernary(true, 0.05f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  EXPECT_GE(g.lastDegenTransDirs().size(), 2u);  // in-plane axes recorded for the governor
+  const float tnorm = g.getFinalTransformation().block<3, 1>(0, 3).norm();
+  EXPECT_LT(tnorm, 0.05f);                        // still held / bounded
+}
+
+// A fully-observable scan records NOTHING for the governor even with the ternary
+// gate on -- the partial-band recording must not fire on localizable axes.
+TEST(NanoGICP, XicpTernaryRecordsNothingOnObservableGeometry) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+
+  auto g = makeGICP();
+  g.setXicpTernary(true, 0.05f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  EXPECT_EQ(g.lastDegenerateDirections(), 0);
+  EXPECT_TRUE(g.lastDegenTransDirs().empty());   // no false partial-band recording
+  EXPECT_TRUE(g.lastDegenRotDirs().empty());
+}
+
 // --- Term mass-normalization (refCountScale + the photometric path) ---
 
 TEST(RefCountScale, OffReturnsRawScale) {

@@ -135,3 +135,62 @@ update. Documented as a deferred direction, not attempted as a bolt-on.
 All new flags default off; with them off the registration path is bit-identical
 to pre-change. Build + `colcon test` in a ROS 2 env is the remaining gate before
 any tunnel A/B.
+
+---
+
+## 5. Follow-ups after the 2026-06-25 A/B (validation feedback loop)
+
+`doc/FINDINGS_2026-06-25.md` reported the empirical result: **X-ICP ternary
+validated** (base 7/24 → ~2/24 DIV, degeneracy capped at 1 direction — it
+*prevents* the collapse), **GenZ negative** at every `pointWeight` (left
+default-off, documented), plus two open items. This cycle addresses all three
+open items it raised:
+
+### 5.1 X-ICP + governor now compose (partial-band recording)
+
+The PM addendum found the governor and X-ICP cover **disjoint axis sets**: the
+governor only records *hard-degenerate* axes (`lam ≤ degeneracyThreshRatio·λmax`)
+for clamping, while X-ICP's **partial-admit band**
+(`degeneracyThreshRatio·λmax < lam < fullRatio·λmax`) takes a partial update but
+was *not* recorded — so a runaway along a partially-admitted axis escaped the
+governor's cap (a 14 km combo DIV with the governor active).
+
+Fix (`nano_gicp.cc`, both gate blocks): after the keep-fraction is applied,
+also record the direction for the governor when
+`xicp_ternary_enabled_ && lam > thresh && keep < 1` — i.e. the partial-band axes
+the gate is still holding part of the prior on. The governor's per-scan physical
+cap then bounds them too. Guarded by `xicp_ternary_enabled_`, so the
+binary/soft/prob gate's recorded set is **unchanged / bit-identical**; a fully
+localizable axis (`keep == 1`) is never recorded. This uses the governor's
+existing physical cap (platform max-speed × scan period) rather than a per-axis
+`1-keep`-weighted clamp — the cap is a motion bound, so legitimate sub-cap motion
+on a marginal axis is untouched and only a runaway is clamped; a proportional
+clamp remains an available refinement if a rig needs it. Efficacy to be confirmed
+by re-running the combo n=24 (per the findings); the unit tests guard the path
+and the no-false-recording invariant.
+
+### 5.2 Photometric loop: NaN-safe projection bounds
+
+`bilinearSample` does an unchecked raw-pointer read (`img.ptr<float>(y0)[x0]`); a
+non-finite projected `(u,v)` slipped through the `u < bw || u > umax` test (NaN
+compares false on every branch) and reached it as a wild read. All four
+projection bounds checks (camera f2f ref + moving, camera map, lidar map) are
+rewritten to positive form `!(u >= bw && u <= umax && …)`, which is identical for
+finite `(u,v)` and **rejects** NaN. No behavior change on finite inputs.
+
+### 5.3 Photometric loop: source-cloud lifetime (the 1/48 crash)
+
+The `std::out_of_range` at `src.at(i)` was a dangling-reference / use-after-free:
+`accumulateVisualResidual` bound `const auto& src = *input_` (or `*visual_src_`)
+— a reference holding **no ownership** — so if another thread dropped the last
+external ref to that cloud mid-loop, it was freed and `src.size()` read garbage.
+Fixed by holding the `shared_ptr` (`PointCloudSourceConstPtr src_ptr = …`) for the
+whole parallel loop, keeping the cloud alive until the function returns. This
+removes the dangling-pointer vector (the evidence — garbage size, load-triggered,
+under contention — points to a freed cloud, not in-place mutation; an in-place
+write race would need a snapshot-under-lock, noted but not indicated here).
+
+All three are default-path-preserving (5.1 guarded by `xicp_ternary_enabled_`;
+5.2 identical for finite inputs; 5.3 pure lifetime change), so the off-paths stay
+bit-identical. Validated by build + `colcon test` in a ROS 2 Jazzy container
+(see the commit/CI run).

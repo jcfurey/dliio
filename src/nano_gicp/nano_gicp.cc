@@ -1123,6 +1123,17 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                             this->prob_confidence_s_, this->prob_spread_)
                         : softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_));
                 dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
+                // Belt-and-suspenders for the X-ICP ternary gate: a PARTIAL-admit
+                // band axis (rr_thresh < lam < rr_full, 0 < keep < 1) takes a
+                // partial update but is not hard-degenerate, so the block above did
+                // not record it for the governor. Record it too, so the degeneracy
+                // governor's per-scan cap also bounds a runaway proceeding along a
+                // partially-admitted axis (the combo-mode escape in
+                // FINDINGS_2026-06-25 PM). Ternary-on only -> the binary/soft/prob
+                // gate's recorded set is unchanged (bit-identical).
+                if (this->xicp_ternary_enabled_ && lam > rr_thresh && keep < 1.0) {
+                    this->last_degen_rot_dirs_.push_back(v);
+                }
             }
             const double tt_thresh = degeneracy_thresh_ratio_ * eig_tt.eigenvalues()(2);
             const double tt_full = this->xicp_full_ratio_ * eig_tt.eigenvalues()(2);  // X-ICP localizable bar
@@ -1157,6 +1168,13 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                             this->prob_confidence_s_, this->prob_spread_)
                         : softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_));
                 dx.tail<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
+                // Belt-and-suspenders (see the rotation block): record an X-ICP
+                // PARTIAL-admit-band translation axis (tt_thresh < lam < tt_full)
+                // for the governor too, so its per-scan cap also bounds a runaway
+                // along a partially-admitted axis. Ternary-on only -> bit-identical.
+                if (this->xicp_ternary_enabled_ && lam > tt_thresh && keep < 1.0) {
+                    this->last_degen_trans_dirs_.push_back(v);
+                }
             }
         }
         this->last_degenerate_directions_ = std::max(this->last_degenerate_directions_, degenerate);
@@ -1492,7 +1510,16 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
     // else the voxelised registration cloud (input_) at stride 1 (bit-identical).
     // Both are the same deskewed WORLD frame, so the projection math is identical.
     const bool use_dense = (this->visual_src_ && !this->visual_src_->empty());
-    const auto& src = use_dense ? *this->visual_src_ : *input_;
+    // Hold a shared_ptr to the source cloud for the WHOLE parallel loop, not just
+    // a reference: binding `const auto& src = *input_` keeps no ownership, so if
+    // another thread drops the last external ref to input_/visual_src_ mid-loop
+    // (next-scan setInputSource / setVisualSource), the cloud is freed and `src`
+    // dangles -> garbage size() -> the load-triggered std::out_of_range at the
+    // src.at(i) below (FINDINGS_2026-06-25, 1/48 reps under contention). Owning a
+    // local ref keeps it alive until this function returns.
+    const PointCloudSourceConstPtr src_ptr = use_dense ? this->visual_src_ : input_;
+    if (!src_ptr) { return; }
+    const auto& src = *src_ptr;
     const int n_src = static_cast<int>(src.size());
     const int stride = (use_dense && this->visual_src_max_ > 0 && n_src > this->visual_src_max_)
                            ? (n_src / this->visual_src_max_) : 1;
@@ -1511,7 +1538,11 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
         if (Pc_ref.z() <= zmin) { ++rej_behind; continue; }
         const float u_ref = fx * Pc_ref.x() / Pc_ref.z() + cx;
         const float v_ref = fy * Pc_ref.y() / Pc_ref.z() + cy;
-        if (u_ref < bw || u_ref > cur_umax || v_ref < bw || v_ref > cur_vmax) { ++rej_oob; continue; }
+        // Positive-form bounds test so a non-finite projection is REJECTED: NaN
+        // fails every comparison, so the old `u<bw || u>umax` let NaN through to
+        // bilinearSample's unchecked pointer read. Identical to the old test for
+        // finite (u, v). (FINDINGS_2026-06-25 hardening.)
+        if (!(u_ref >= bw && u_ref <= cur_umax && v_ref >= bw && v_ref <= cur_vmax)) { ++rej_oob; continue; }
         const float I_ref = bilinearSample(visual_cur_, u_ref, v_ref);
 
         // Moving brightness: project the CORRECTED world point into the PREVIOUS
@@ -1521,7 +1552,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
         const float invz = 1.f / Pc.z();
         const float u = fx * Pc.x() * invz + cx;
         const float v = fy * Pc.y() * invz + cy;
-        if (u < bw || u > prev_umax || v < bw || v > prev_vmax) { ++rej_oob; continue; }
+        if (!(u >= bw && u <= prev_umax && v >= bw && v <= prev_vmax)) { ++rej_oob; continue; }  // NaN-safe (see above)
         const float I_mov = bilinearSample(visual_prev_, u, v);
 
         // Image gradient (central difference) on the previous image, normalized.
@@ -1645,7 +1676,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualMapResidual(
         const float invz = 1.f / Pc.z();
         const float u = fx * Pc.x() * invz + cx;
         const float v = fy * Pc.y() * invz + cy;
-        if (u < bw || u > umax || v < bw || v > vmax) { continue; }
+        if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }  // NaN-safe bounds
 
         const float I_mov = bilinearSample(visual_cur_, u, v);
         const float gu = 0.5f * (bilinearSample(visual_cur_, u + 1.f, v) - bilinearSample(visual_cur_, u - 1.f, v));
@@ -1775,7 +1806,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
             v = (el - lidar_el_b_) * inv_el_a;
             inv_el_eff = inv_el_a;
         }
-        if (u < bw || u > umax || v < bw || v > vmax) { continue; }  // (drops the azimuth seam strip)
+        if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }  // NaN-safe; drops the azimuth seam strip
 
         // Occlusion / wrong-surface rejection (FAST-LIVO-style depth-consistency
         // cull, Zheng et al. IROS 2022): the FIXED map point must be the surface
