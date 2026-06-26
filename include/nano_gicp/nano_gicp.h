@@ -102,6 +102,23 @@ void conditionScaleTerm(const Eigen::Matrix<double, 6, 6>& H_geo,
                         Eigen::Matrix<double, 6, 6>* H_term,
                         Eigen::Matrix<double, 6, 1>* b_term);
 
+// Direction-SEPARATED fusion of a map term (LOFF-style; doc/EXPLORATION_2026-06-26
+// #2). Restrict an auxiliary term to the GEOMETRICALLY-WEAK (degenerate) subspace
+// so it can ONLY move the unobservable axis and cannot perturb the well-observed
+// axes -- the opposite knob to conditionScaleTerm (which boosts the weak axis but
+// keeps the strong ones). For each 3x3 block of `H_geo`, P_block = sum over the
+// eigen-directions with eigenvalue <= ratio*lambda_max of v·vᵀ (orthogonal
+// projector onto the weak subspace); with P = blockdiag(P_rr, P_tt) apply
+// *H_term = P·(*H_term)·P, *b_term = P·(*b_term). Keeps H_term symmetric PSD. A
+// well-observed block (no weak direction) -> P_block = 0 -> the term is suppressed
+// there (so a non-degenerate scan can't be perturbed by it). A block with
+// lambda_max <= 0 (no observability info) is left untouched (identity), and
+// ratio <= 0 leaves the whole term untouched (feature OFF). Pure free function
+// (unit-tested), defined next to conditionScaleTerm.
+void directionSeparateTerm(const Eigen::Matrix<double, 6, 6>& H_geo, double ratio,
+                           Eigen::Matrix<double, 6, 6>* H_term,
+                           Eigen::Matrix<double, 6, 1>* b_term);
+
 // Margin-adaptive clamp scale: shrinks the IMU-consistency clamp cap as the
 // geometric trust margin degrades, so the correction is bounded harder toward the
 // IMU prior exactly where observability collapses (e.g. a specular floor dropout
@@ -308,6 +325,13 @@ public:
   // exponent on (lambda_max/lambda_k), cap = max per-direction boost. enabled =
   // false (default) -> the term accumulates directly, bit-identical.
   void setLidarCondScale(bool enabled, float power, float cap);
+  // Direction-separated LiDAR-image fusion (directionSeparateTerm, LOFF-style):
+  // restrict the term to the geometrically-weak (degenerate) subspace so it can
+  // only move the unobservable axis and cannot perturb the well-observed ones.
+  // ratio = weak-subspace bar as a fraction of lambda_max (per block). enabled =
+  // false (default) -> the term is added in full, bit-identical. Composes with
+  // setLidarCondScale (boost then separate). See doc/EXPLORATION_2026-06-26.md #2.
+  void setLidarDirSeparate(bool enabled, float ratio);
   // GenZ-ICP adaptive point-to-plane / point-to-point blend (genz_weight.h, Lee
   // et al. RA-L 2025): on an ill-conditioned scan -- geometric translation block
   // lambda_min/lambda_max below `knee` -- convex-mix an isotropic point-to-point
@@ -577,6 +601,8 @@ protected:
   cv::Mat lidar_range_img_;           // current range image [m], CV_32FC1, <=0 invalid (optional)
   float lidar_range_abs_tol_;         // occlusion tolerance: absolute [m]
   float lidar_range_rel_tol_;         // occlusion tolerance: relative (fraction of range)
+  bool  lidar_dir_separated_enabled_; // restrict the lidar term to the weak subspace (LOFF); off = bit-identical
+  float lidar_ds_ratio_;              // weak-subspace bar as a fraction of lambda_max
   bool  lidar_cond_scale_enabled_;    // direction-scale the term along weak geom axes; off = bit-identical
   float lidar_cs_power_;              // exponent on (lambda_max/lambda_k) per direction
   float lidar_cs_cap_;               // max per-direction boost (alpha)

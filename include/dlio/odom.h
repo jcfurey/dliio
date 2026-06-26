@@ -609,6 +609,8 @@ private:
   double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
   bool lidar_cond_scale_enabled_;      // direction-scale the lidar-map term along weak geom axes
   double lidar_cs_power_, lidar_cs_cap_;  // cond-scale exponent + per-direction boost cap
+  bool lidar_dir_separated_enabled_ = false;  // restrict the lidar term to the weak subspace (LOFF)
+  double lidar_ds_ratio_ = 0.05;       // weak-subspace bar (fraction of lambda_max)
   bool genz_enabled_ = false;          // GenZ-ICP point-to-plane/point-to-point blend; off = bit-identical
   double genz_floor_ = 1.0;            // min point-to-plane weight alpha (1 = off)
   double genz_knee_ = 0.1;             // trans-block lambda_min/lambda_max at which blending starts
