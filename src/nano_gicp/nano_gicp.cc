@@ -348,6 +348,10 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->lidar_az_a_ = 1.0f; this->lidar_az_b_ = 0.0f;
   this->lidar_el_a_ = 1.0f; this->lidar_el_b_ = 0.0f;
   this->T_lw_cur_ = Eigen::Isometry3f::Identity();
+  this->lidar_flow_weight_ = 0.0f;       // frame-to-frame flow term OFF -> bit-identical
+  this->T_lw_prev_flow_ = Eigen::Isometry3f::Identity();
+  this->last_lidar_flow_count_ = 0;
+  this->last_lidar_flow_rms_ = 0.0f;
   this->lidar_range_abs_tol_ = 0.5f;
   this->lidar_range_rel_tol_ = 0.1f;
   this->lidar_cond_scale_enabled_ = false;  // direction-scaling OFF -> bit-identical
@@ -572,6 +576,20 @@ int NanoGICP<PointSource, PointTarget>::lastVisualMapCount() const {
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setLidarMapWeight(float weight) {
     this->lidar_map_weight_ = weight;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarFlowWeight(float weight) {
+    this->lidar_flow_weight_ = (weight > 0.f) ? weight : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarFlowPrev(const cv::Mat& prev_img,
+                                                         const Eigen::Isometry3f& T_lw_prev) {
+    // Deep copy: own the buffer for the whole next scan, so a concurrent reassign
+    // of the node's image can't free it under the parallel flow loop.
+    this->lidar_flow_prev_img_ = prev_img.empty() ? cv::Mat() : prev_img.clone();
+    this->T_lw_prev_flow_ = T_lw_prev;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1050,6 +1068,23 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             } else {
                 accumulateLidarMapResidual(trans, &H, &b, nullptr);  // bit-identical
             }
+        }
+
+        // Frame-to-FRAME LiDAR flow term (EXPLORATION #2): accumulate into its own
+        // H_flow/b_flow, then direction-separate (when enabled) so the flow only
+        // constrains the geometrically-weak axis -- it observes the along-tunnel
+        // motion, fused only where it's needed. Weight 0 (default) -> no-op /
+        // bit-identical. Judged from H_geo (before any term), like the lidar term.
+        if (lidar_flow_weight_ > 0.f) {
+            Eigen::Matrix<double, 6, 6> H_flow = Eigen::Matrix<double, 6, 6>::Zero();
+            Eigen::Matrix<double, 6, 1> b_flow = Eigen::Matrix<double, 6, 1>::Zero();
+            accumulateLidarFlowResidual(trans, &H_flow, &b_flow, nullptr);
+            if (lidar_dir_separated_enabled_) {
+                directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
+                                      &H_flow, &b_flow);
+            }
+            H += H_flow;
+            b += b_flow;
         }
 
         // Snapshot the combined (geometric + photometric) Hessian BEFORE
@@ -1923,6 +1958,134 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
     if (cost != nullptr) { *cost += cost_sum * norm; }
     this->last_lidar_map_count_ = static_cast<int>(count);
     this->last_lidar_map_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
+}
+
+// Frame-to-FRAME LiDAR range/intensity flow term (doc/EXPLORATION_2026-06-26.md
+// #2): register the current scan against the PREVIOUS scan's image to observe the
+// along-tunnel motion the frame-to-map reflectivity term can't (aliased). Iterates
+// the current SOURCE points, moves each by the correction (x = trans * p_w), and
+// projects it into the previous lidar image via the spherical model; residual =
+// prev_image(projection) - the point's own brightness. Jacobian is the visual
+// frame-to-frame LEFT-perturbation form [-G·skew(x) | G] (G = grad_I·dpi·R_lw_prev)
+// with the spherical dpi of the map term -- correct by construction from those two
+// in-tree terms. The caller direction-separates the result so it only constrains
+// the degenerate axis. weight <= 0 (default) -> no-op / bit-identical.
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
+    const Eigen::Isometry3f& trans,
+    Eigen::Matrix<double, 6, 6>* H,
+    Eigen::Matrix<double, 6, 1>* b,
+    double* cost) {
+
+    this->last_lidar_flow_count_ = 0;
+    this->last_lidar_flow_rms_ = 0.0f;
+
+    if (lidar_flow_weight_ <= 0.f) { return; }
+    // Snapshot the previous-frame image (cv::Mat refcount hold) so the parallel
+    // loop owns a stable buffer for its whole lifetime even if another thread
+    // reassigns the member mid-loop -- the same ownership guard as the
+    // photometric-loop fix. The member is set via clone(), never mutated in place.
+    const cv::Mat prev = this->lidar_flow_prev_img_;
+    if (prev.empty() || prev.type() != CV_32FC1 || !input_) { return; }
+    if (std::abs(lidar_az_a_) < 1e-12f || std::abs(lidar_el_a_) < 1e-12f) { return; }
+
+    const float inv_scale = 1.f / lidar_image_scale_;
+    // world -> PREVIOUS lidar (the previous scan's corrected pose, fixed here).
+    const Eigen::Matrix3f R_lw_prev = this->T_lw_prev_flow_.linear();
+    const Eigen::Vector3f t_lw_prev = this->T_lw_prev_flow_.translation();
+
+    const float bw = 2.f;
+    const float umax = static_cast<float>(prev.cols) - 1.f - bw;
+    const float vmax = static_cast<float>(prev.rows) - 1.f - bw;
+    const float inv_az_a = 1.f / lidar_az_a_;
+    const float inv_el_a = 1.f / lidar_el_a_;
+    const bool use_el_lut = (static_cast<int>(lidar_el_lut_.size()) == prev.rows);
+
+    std::vector<Eigen::Matrix<double, 6, 6>> H_private(num_threads_, Eigen::Matrix<double, 6, 6>::Zero());
+    std::vector<Eigen::Matrix<double, 6, 1>> b_private(num_threads_, Eigen::Matrix<double, 6, 1>::Zero());
+    double cost_sum = 0.0, sq_sum = 0.0;
+    long count = 0;
+
+    constexpr int kFlowMaxPoints = 4000;                 // stride the source to bound per-iter cost
+    const int n_src = static_cast<int>(input_->size());
+    const int stride = std::max(1, n_src / kFlowMaxPoints);
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
+    for (int i = 0; i < n_src; i += stride) {
+        const auto& sp = input_->at(i);
+        const Eigen::Vector3f p_w(sp.x, sp.y, sp.z);         // current source point (world)
+        const float ref = sp.reflectivity * inv_scale;       // its own measured brightness
+        const Eigen::Vector3f x = trans * p_w;               // pose-corrected world point
+        const Eigen::Vector3f Pl = R_lw_prev * x + t_lw_prev;  // into the PREVIOUS lidar frame
+
+        const float X = Pl.x(), Y = Pl.y(), Z = Pl.z();
+        const float rxy2 = X * X + Y * Y;
+        if (rxy2 < 1e-6f) { continue; }
+        const float rxy = std::sqrt(rxy2);
+        const float rr2 = rxy2 + Z * Z;
+
+        const float az = std::atan2(Y, X);
+        const float el = std::atan2(Z, rxy);
+        const float u = (az - lidar_az_b_) * inv_az_a;
+        float v, inv_el_eff;
+        if (use_el_lut) {
+            float slope;
+            if (!rowFromElevationLut(lidar_el_lut_, el, v, slope)) { continue; }
+            inv_el_eff = 1.f / slope;
+        } else {
+            v = (el - lidar_el_b_) * inv_el_a;
+            inv_el_eff = inv_el_a;
+        }
+        if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }   // NaN-safe bounds
+
+        const float I_mov = bilinearSample(prev, u, v);
+        const float gu = 0.5f * (bilinearSample(prev, u + 1.f, v) - bilinearSample(prev, u - 1.f, v));
+        const float gv = 0.5f * (bilinearSample(prev, u, v + 1.f) - bilinearSample(prev, u, v - 1.f));
+        if (std::abs(gu) < 1e-6f && std::abs(gv) < 1e-6f) { continue; }
+
+        const float r = I_mov - ref;
+
+        Eigen::Matrix<float, 2, 3> dpi;                      // spherical dpi/dP_l (as the map term)
+        dpi(0, 0) = inv_az_a * (-Y / rxy2);
+        dpi(0, 1) = inv_az_a * ( X / rxy2);
+        dpi(0, 2) = 0.f;
+        dpi(1, 0) = inv_el_eff * (-Z * X / (rxy * rr2));
+        dpi(1, 1) = inv_el_eff * (-Z * Y / (rxy * rr2));
+        dpi(1, 2) = inv_el_eff * ( rxy / rr2);
+        Eigen::Matrix<float, 1, 2> gI;
+        gI << gu, gv;
+        // x = trans·p_w perturbs on the LEFT -> J = [-G·skew(x) | G], same as the
+        // visual frame-to-frame term; G = grad_I · dpi · R_lw_prev.
+        const Eigen::Matrix<float, 1, 3> G = gI * dpi * R_lw_prev;
+        Eigen::Matrix<float, 1, 6> J;
+        J.block<1, 3>(0, 0) = -G * skew(x);
+        J.block<1, 3>(0, 3) = G;
+
+        float weight = lidar_flow_weight_;
+        const float abs_r = std::abs(r);
+        if (photometric_huber_delta_ > 0.f && abs_r > photometric_huber_delta_) {
+            weight *= photometric_huber_delta_ / abs_r;
+        }
+
+        const int tn = omp_get_thread_num();
+        H_private[tn] += (weight * J.transpose() * J).cast<double>();
+        b_private[tn] += (weight * J.transpose() * r).cast<double>();
+        cost_sum += weight * r * r;
+        sq_sum += static_cast<double>(r) * r;
+        count += 1;
+    }
+
+    // Count-normalize like the frame-to-map term so `weight` is count-independent.
+    Eigen::Matrix<double, 6, 6> H_sum = Eigen::Matrix<double, 6, 6>::Zero();
+    Eigen::Matrix<double, 6, 1> b_sum = Eigen::Matrix<double, 6, 1>::Zero();
+    for (int t = 0; t < num_threads_; ++t) { H_sum += H_private[t]; b_sum += b_private[t]; }
+    constexpr double kFlowRefCount = 1000.0;
+    const double norm = refCountScale(kFlowRefCount, count);
+    (*H) += H_sum * norm;
+    (*b) += b_sum * norm;
+    if (cost != nullptr) { *cost += cost_sum * norm; }
+    this->last_lidar_flow_count_ = static_cast<int>(count);
+    this->last_lidar_flow_rms_ = (count > 0) ? std::sqrt(static_cast<float>(sq_sum / count)) : 0.0f;
 }
 
 template <typename PointSource, typename PointTarget>

@@ -769,6 +769,13 @@ void dlio::OdomNode::getParams() {
       "Restrict the LiDAR-map term to the geometrically-weak (degenerate) subspace (LOFF-style)");
   dlio::declare_param(this, "odom/lidar_image/dirSeparated/ratio", this->lidar_ds_ratio_, 0.05,
       "Weak-subspace bar as a fraction of lambda_max (per block) for direction separation", 0.0, 1.0);
+  // Frame-to-FRAME LiDAR flow term (EXPLORATION #2): register the current scan
+  // against the PREVIOUS scan's image to observe along-tunnel motion. Pairs with
+  // dirSeparated so it only constrains the degenerate axis. weight 0 (default) = off.
+  dlio::declare_param(this, "odom/lidar_image/flow/enabled", this->lidar_flow_enabled_, false,
+      "Enable the frame-to-frame LiDAR flow term (registers against the previous scan's image)");
+  dlio::declare_param(this, "odom/lidar_image/flow/weight", this->lidar_flow_weight_, 0.0,
+      "Weight of the frame-to-frame LiDAR flow residual (count-normalized; 0 = off)", 0.0, 1e6);
   // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
   // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
   // mix an isotropic point-to-point metric into the GICP cost to regularize the
@@ -2475,7 +2482,9 @@ void dlio::OdomNode::getNextPose() {
   // COIN-LIO LiDAR intensity-image term: project map points into this scan's
   // reflectivity image (world->lidar from the prior pose). No-op unless enabled
   // and an organized image + spherical model are ready.
-  if (this->lidar_image_enabled_ && this->lidar_image_weight_ > 0.0 &&
+  const bool lidar_map_active = this->lidar_image_enabled_ && this->lidar_image_weight_ > 0.0;
+  const bool lidar_flow_active = this->lidar_flow_enabled_ && this->lidar_flow_weight_ > 0.0;
+  if ((lidar_map_active || lidar_flow_active) &&
       this->lidar_img_ready_ && this->lidar_proj_ready_) {
     Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
     Eigen::Isometry3f T_lw;
@@ -2500,9 +2509,19 @@ void dlio::OdomNode::getNextPose() {
                                  static_cast<float>(this->lidar_cs_cap_));
     this->gicp.setLidarDirSeparate(this->lidar_dir_separated_enabled_,
                                    static_cast<float>(this->lidar_ds_ratio_));
-    this->gicp.setLidarMapWeight(static_cast<float>(this->lidar_image_weight_));
+    this->gicp.setLidarMapWeight(lidar_map_active ? static_cast<float>(this->lidar_image_weight_) : 0.f);
+    // Frame-to-frame flow term: hand the gicp the PREVIOUS scan's image + corrected
+    // pose (it deep-copies and snapshots them). No previous stashed yet (first
+    // scan) -> off this scan.
+    if (lidar_flow_active && this->lidar_flow_prev_valid_) {
+      this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_);
+      this->gicp.setLidarFlowWeight(static_cast<float>(this->lidar_flow_weight_));
+    } else {
+      this->gicp.setLidarFlowWeight(0.f);
+    }
   } else {
     this->gicp.setLidarMapWeight(0.f);
+    this->gicp.setLidarFlowWeight(0.f);
   }
 
   // Align with current submap with global IMU transformation as initial guess
@@ -2560,6 +2579,18 @@ void dlio::OdomNode::getNextPose() {
     // NOTE: keep visual_cur_pending_valid_ true here so updateKeyframes() can
     // sample this scan's image for keyframe visual refs; it is reset at the top
     // of the next setupVisualForScan().
+  }
+
+  // Promote this scan's LiDAR image to "previous" for the next scan's flow term,
+  // tagged with the CORRECTED world->lidar pose (this->T). cv::Mat assignment is a
+  // shallow ref; the node builds a FRESH image every scan (never mutates this one
+  // in place), so the buffer stays valid, and the gicp deep-copies it at
+  // setLidarFlowPrev. Mirrors the visual stash above.
+  if (this->lidar_flow_enabled_ && this->lidar_img_ready_ && !this->lidar_refl_img_.empty()) {
+    Eigen::Matrix4f T_wl = this->T * this->extrinsics.baselink2lidar_T;
+    this->lidar_flow_T_lw_prev_.matrix() = T_wl.inverse();
+    this->lidar_flow_prev_img_ = this->lidar_refl_img_;
+    this->lidar_flow_prev_valid_ = true;
   }
 
   // Update next global pose
