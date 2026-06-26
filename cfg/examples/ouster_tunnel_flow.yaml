@@ -1,0 +1,34 @@
+# EXAMPLE: frame-to-frame LiDAR flow term + direction-separated fusion
+# (EXPLORATION #2, the second pick). Default-off elsewhere. (2026-06-26,
+# doc/LIDAR_FLOW_TERM.md + doc/DIRECTION_SEPARATED_FUSION.md.)
+#
+# Premise: the frame-to-MAP reflectivity term is along-axis ALIASED (a smooth
+# tunnel looks the same a metre forward), so it can't observe along-tunnel motion.
+# The frame-to-FRAME flow term registers the current scan against the PREVIOUS
+# scan's image, where that motion shows up as image flow, and is fused through
+# directionSeparateTerm so it ONLY constrains the geometrically-weak (degenerate)
+# subspace and can't perturb the well-observed axes — the "fuse only into the
+# degenerate direction" anti-dilution guard the scalar intensity term lacked.
+#
+# REQUIRES the lidar_image infra (the node builds the image the flow term
+# projects into) — overlay ON TOP of ouster_tunnel.yaml +
+# ouster_06042026_extrinsics.yaml + ouster_tunnel_lidarimg.yaml [+ _nearir] +
+# ouster_tunnel_xicp.yaml.
+#
+# NOT validated on real data: the Jacobian is correct-by-construction (reuses the
+# spherical-map + visual-f2f derivations) and TSan/ASan/UBSan clean, but a
+# sign/frame slip can only be ruled out on the bag, and whether range/intensity
+# flow actually recovers the along-axis DOF is the open question. SMOKE-TEST the
+# sign first (n=3): flow ON must not be WORSE than X-ICP-only; if max|x| explodes
+# vs baseline the residual sign is likely flipped. Then sweep:
+#   EXTRA_PARAMS="odom/lidar_image/flow/weight=0.05 odom/lidar_image/dirSeparated/ratio=0.05"
+# weight {0.02,0.05,0.1} x ratio {0.02,0.05}. Start the weight low.
+
+/**:
+  ros__parameters:
+    # restrict the LiDAR-image term to the weak subspace (composes with the flow term)
+    odom/lidar_image/dirSeparated/enabled: true
+    odom/lidar_image/dirSeparated/ratio: 0.05   # weak-subspace bar (fraction of lambda_max)
+    # frame-to-frame flow signal (count-normalized; comparable to lidar_image/weight 0.05)
+    odom/lidar_image/flow/enabled: true
+    odom/lidar_image/flow/weight: 0.02   # START LOW; sweep {0.02,0.05,0.1}
