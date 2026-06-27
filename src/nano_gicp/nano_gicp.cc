@@ -1343,6 +1343,7 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
 
     std::vector<int> k_indices(1);
     std::vector<float> k_sq_dists(1);
+    const int n_target = static_cast<int>(target_->size());
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) \
         firstprivate(k_indices, k_sq_dists)
@@ -1350,18 +1351,31 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
         PointTarget transformed_pt;
         transformed_pt.getVector4fMap() = trans * input_->at(i).getVector4fMap();
 
-        target_kdtree_->nearestKSearch(transformed_pt, 1, k_indices, k_sq_dists);
-        
-        float max_dist_sq = this->corr_dist_threshold_ * this->corr_dist_threshold_;
-        if (k_sq_dists[0] < max_dist_sq) {
+        // Skip a non-finite transformed query. Under a diverged (deg=6) pose the
+        // source points map to NaN/Inf; nanoflann's nearestKSearch on a non-finite
+        // query can return a GARBAGE index that still clears the distance gate
+        // below, which then propagates to an out-of-range target_->at() in
+        // linearize (the recurring std::out_of_range -- garbage __n >> size,
+        // FINDINGS_2026-06-26) and an out-of-bounds (*target_covs_)[] read. Leaving
+        // the correspondence at -1 makes the consumers skip this point.
+        if (!transformed_pt.getVector4fMap().allFinite()) { continue; }
+
+        const int found = target_kdtree_->nearestKSearch(transformed_pt, 1, k_indices, k_sq_dists);
+
+        const float max_dist_sq = this->corr_dist_threshold_ * this->corr_dist_threshold_;
+        // Trust k_indices[0] only with a found neighbour, an IN-RANGE index, and a
+        // finite in-threshold distance -- defence against a garbage search result
+        // (a healthy scan satisfies all of these, so this is bit-identical there).
+        if (found > 0 && k_indices[0] >= 0 && k_indices[0] < n_target &&
+            std::isfinite(k_sq_dists[0]) && k_sq_dists[0] < max_dist_sq) {
             correspondences_[i] = k_indices[0];
             sq_distances_[i] = k_sq_dists[0];
-            
+
             const Eigen::Matrix4f& source_cov = source_covs_[i];
             const Eigen::Matrix4f& target_cov = (*target_covs_)[k_indices[0]];
             Eigen::Matrix4f RCR = (source_cov + target_cov);
             RCR(3, 3) = 1.0;
-            
+
             mahalanobis_[i] = RCR.inverse();
             mahalanobis_[i](3, 3) = 0.0;
         }
@@ -1415,11 +1429,15 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     for(int i = 0; i < input_->size(); ++i) {
         int thread_num = omp_get_thread_num();
         int target_index = correspondences_[i];
-        
-        if(target_index < 0) {
+
+        // Defence in depth: update_correspondences only stores in-range indices,
+        // but guard the upper bound too so a stray value can never reach the
+        // target_->at()/target_covs_[]/gradient_valid_[] accesses below (the
+        // std::out_of_range root-caused in FINDINGS_2026-06-26).
+        if(target_index < 0 || target_index >= static_cast<int>(target_->size())) {
             continue;
         }
-        
+
         const auto& source_pt = input_->at(i);
         Eigen::Vector4f source_homogeneous = trans * source_pt.getVector4fMap();
         Eigen::Vector3f transformed_source = source_homogeneous.head<3>();

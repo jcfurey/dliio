@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include <Eigen/Dense>
 
@@ -1258,6 +1259,23 @@ TEST(NanoGICP, LidarFlowAccumulatorRunsUnderSanitizers) {
   const float tnorm = T.block<3, 1>(0, 3).norm();  // hoisted: comma in <3,1> breaks the macro
   EXPECT_TRUE(T.allFinite());                    // accumulator ran without NaN / crash
   EXPECT_LT(tnorm, 5.0f);                         // bounded
+}
+
+// A non-finite pose guess (the diverged deg=6 case that fed NaN queries to the
+// kd-tree and produced garbage correspondences -> std::out_of_range,
+// FINDINGS_2026-06-26) must not crash: update_correspondences skips non-finite
+// queries and only stores in-range indices, so align() returns instead of
+// throwing on the out-of-range target access.
+TEST(NanoGICP, NonFinitePoseGuessDoesNotThrow) {
+  auto target = makeCorner(1.0f, 0.05f);
+  auto source = makeCorner(1.0f, 0.05f);
+  auto g = makeGICP();
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Eigen::Matrix4f bad = Eigen::Matrix4f::Identity();
+  bad(0, 3) = std::numeric_limits<float>::quiet_NaN();   // NaN translation -> NaN queries
+  Cloud aligned;
+  EXPECT_NO_THROW(g.align(aligned, bad));
 }
 
 int main(int argc, char** argv) {

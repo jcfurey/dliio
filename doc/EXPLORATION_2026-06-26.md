@@ -83,6 +83,20 @@ grown, so X-ICP (prevent) + slice (don't ingest noise) + governor (bound) stack.
 Watch for over-freezing on legitimately-marginal motion (the gate's held set is
 conservative, so `gain = 0` should be safe, but `0.5` is the cautious first try).
 
+> **AMENDED by the 2026-06-26 A/B (`doc/FINDINGS_2026-06-26.md`).** The "`gain = 0`
+> should be safe" hypothesis was **WRONG**: `degenObsGain = 0.0` is *catastrophic*
+> on the bag (5/5 DIV, monotonic) — a **full freeze removes the observer's only
+> correction on the held axis, leaving the IMU-propagated prior to dead-reckon
+> unbounded** (precisely the runaway the governor exists to clamp). The slice's
+> value is a **partial gain**: `0.5` is the sweet spot (crash-free, DIV 4/24 vs the
+> 8/24 baseline — halves it, but insufficient *alone*, p=0.16). So the slice is a
+> crash-free *complement* to a hard bounding lever, not a standalone fix, and
+> `degenObsGain` must stay strictly between 0 and 1 (never 0). Open follow-ups:
+> a finer gain sweep (can a value reach the governor's 0/24 without the governor?)
+> and the X-ICP + governor + slice stack. The governor + X-ICP combo is the
+> decisive divergence-preventer (0/24 genuine DIV); its only blocker is the
+> photometric-loop `std::out_of_range` crash, root-caused and fixed separately.
+
 ---
 
 ## Part 2 — Novel solutions (ranked)
