@@ -313,6 +313,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->last_fit_alpha_ = 2.0f;
   this->current_kernel_c_ = 0.05f;
   this->last_degenerate_directions_ = 0;
+  this->last_oob_corr_count_ = 0;        // corruption telemetry (VERIFICATION_2026-06-27)
   this->last_geo_rot_margin_ = -1.0f;    // telemetry; -1 = gate disabled / not computed
   this->last_geo_trans_margin_ = -1.0f;
   this->max_corr_trans_ = 0.0f;   // per-scan correction clamp OFF by default
@@ -733,6 +734,11 @@ int NanoGICP<PointSource, PointTarget>::lastDegenerateDirections() const {
 }
 
 template <typename PointSource, typename PointTarget>
+long NanoGICP<PointSource, PointTarget>::lastOobCorrespondences() const {
+    return this->last_oob_corr_count_;
+}
+
+template <typename PointSource, typename PointTarget>
 const std::vector<Eigen::Vector3d>& NanoGICP<PointSource, PointTarget>::lastDegenRotDirs() const {
     return this->last_degen_rot_dirs_;
 }
@@ -946,6 +952,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
 
     this->converged_ = false;
     this->last_degenerate_directions_ = 0;
+    this->last_oob_corr_count_ = 0;
     this->last_visual_count_ = 0;
     this->last_visual_rms_ = 0.0f;
     this->last_visual_rescued_ = 0;
@@ -1351,13 +1358,17 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
         PointTarget transformed_pt;
         transformed_pt.getVector4fMap() = trans * input_->at(i).getVector4fMap();
 
-        // Skip a non-finite transformed query. Under a diverged (deg=6) pose the
-        // source points map to NaN/Inf; nanoflann's nearestKSearch on a non-finite
-        // query can return a GARBAGE index that still clears the distance gate
-        // below, which then propagates to an out-of-range target_->at() in
-        // linearize (the recurring std::out_of_range -- garbage __n >> size,
-        // FINDINGS_2026-06-26) and an out-of-bounds (*target_covs_)[] read. Leaving
-        // the correspondence at -1 makes the consumers skip this point.
+        // Skip a non-finite transformed query (a diverged deg=6 pose maps source
+        // points to NaN/Inf). NOTE (VERIFICATION_2026-06-27): source inspection of
+        // the vendored nanoflann shows a non-finite query actually fails SAFE --
+        // the leaf loop only admits `dist < worst_dist` (false for NaN/Inf) and
+        // KNNResultSet::init resets dists[capacity-1] to FLT_MAX every call, so the
+        // distance gate below already rejected these (pinned by test_kdtree.cpp).
+        // This guard (and the store conditions below) are defence-in-depth for the
+        // still-unattributed out-of-range index of FINDINGS_2026-06-26 (evidence
+        // points at memory corruption by an OOB writer elsewhere: the observed
+        // garbage indices are bit-patterns of tiny floats), not a demonstrated
+        // kd-tree failure path.
         if (!transformed_pt.getVector4fMap().allFinite()) { continue; }
 
         const int found = target_kdtree_->nearestKSearch(transformed_pt, 1, k_indices, k_sq_dists);
@@ -1425,7 +1436,14 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     const float kernel_c = (this->kernel_scale_ > 0.f) ? this->kernel_scale_ : this->current_kernel_c_;
     std::vector<std::vector<float>> photo_resid_private(adaptive_kernel ? num_threads_ : 0);
 
-    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum,photo_sq_sum)
+    // Telemetry for the FINDINGS_2026-06-26 out-of-range correspondence: the
+    // kd-tree provably cannot store one (VERIFICATION_2026-06-27), so any trip of
+    // the guard below means the correspondences_ buffer was corrupted by an OOB
+    // writer elsewhere. Counting (instead of silently skipping) turns a survivable
+    // symptom into a signal the node can surface on the bag.
+    long oob_corr = 0;
+
+    #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,photo_cost_sum,photo_sq_sum,oob_corr)
     for(int i = 0; i < input_->size(); ++i) {
         int thread_num = omp_get_thread_num();
         int target_index = correspondences_[i];
@@ -1433,8 +1451,10 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         // Defence in depth: update_correspondences only stores in-range indices,
         // but guard the upper bound too so a stray value can never reach the
         // target_->at()/target_covs_[]/gradient_valid_[] accesses below (the
-        // std::out_of_range root-caused in FINDINGS_2026-06-26).
+        // FINDINGS_2026-06-26 crash; attributed to external memory corruption,
+        // see VERIFICATION_2026-06-27). Count trips as telemetry.
         if(target_index < 0 || target_index >= static_cast<int>(target_->size())) {
+            if (target_index >= 0) { oob_corr += 1; }   // -1 is normal; >= size is corruption
             continue;
         }
 
@@ -1577,6 +1597,10 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         (*b) += bp_sum * norm;
         if (cost != nullptr) { *cost += photo_cost_sum * norm; }
     }
+
+    // Accumulate the corruption telemetry across LM iterations; reset per align()
+    // in computeTransformation, surfaced via lastOobCorrespondences().
+    this->last_oob_corr_count_ += oob_corr;
 }
 
 template <typename PointSource, typename PointTarget>

@@ -21,18 +21,22 @@
 namespace nano_gicp {
 
 // Point saliency in [0,1] from the local neighborhood-covariance eigenvalues
-// (ASCENDING: l0 <= l1 <= l2). saliency = 1 - planarity, planarity = (l1-l0)/l2:
-//   planar wall (l0~0, l1~l2)      -> planarity ~1 -> saliency ~0 (baseline weight)
-//   edge / rib   (l0~l1~0, l2 big) -> planarity ~0 -> saliency ~1 (boosted)
-//   corner/scatter (l0~l1~l2)      -> planarity ~0 -> saliency ~1 (boosted)
+// (ASCENDING: l0 <= l1 <= l2). saliency = LINEARITY = (l2 - l1) / l2, the standard
+// eigen-feature (Demantke et al. 2011; Weinmann et al., ISPRS 2015):
+//   edge / rib   (l0~l1~0, l2 big) -> linearity ~1 -> boosted (the along-axis features)
+//   planar wall (l0~0, l1~l2)      -> linearity ~0 -> baseline weight
+//   scatter/noise (l0~l1~l2)       -> linearity ~0 -> baseline weight
+// The original 2026-06-26 formulation (1 - planarity) also gave SCATTER points
+// saliency ~1, up-weighting isotropic-neighborhood NOISE at full boost -- the
+// likely cause of the sal8 tracking stall in FINDINGS_2026-06-26 (LOAM selects
+// edges by high smoothness/linearity, never scatter; Zhang & Singh, RSS 2014).
+// Linearity targets exactly the edge class and leaves noise at baseline.
 // Degenerate (l2 <= 0) -> 0. Result is clamped to [0,1].
 inline float pointSaliency(const Eigen::Vector3f& eigvals_ascending) {
-  const float l0 = eigvals_ascending(0);
   const float l1 = eigvals_ascending(1);
   const float l2 = eigvals_ascending(2);
   if (!(l2 > 0.f)) { return 0.f; }
-  const float planarity = (l1 - l0) / l2;
-  float s = 1.f - planarity;
+  float s = (l2 - l1) / l2;   // linearity
   if (s < 0.f) { s = 0.f; }
   if (s > 1.f) { s = 1.f; }
   return s;

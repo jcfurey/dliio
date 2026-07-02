@@ -2536,6 +2536,18 @@ void dlio::OdomNode::getNextPose() {
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
+  // Corruption telemetry (VERIFICATION_2026-06-27): an out-of-range
+  // correspondence index is impossible from the kd-tree, so a nonzero count
+  // means the correspondence buffer was scribbled by an out-of-bounds writer
+  // (the FINDINGS_2026-06-26 crash class, now survivable). Surface it loudly --
+  // this is the signal an ASan bag run should chase.
+  if (this->gicp.lastOobCorrespondences() > 0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "MEMORY-CORRUPTION SENTINEL: %ld out-of-range correspondence indices "
+        "skipped this scan (see doc/VERIFICATION_2026-06-27.md)",
+        this->gicp.lastOobCorrespondences());
+  }
+
   // Surface degeneracy (e.g. featureless tunnel): the solver held the IMU
   // prior along the unobservable directions; warn so the operator knows the
   // estimate is dead-reckoning in those directions.
@@ -2911,8 +2923,7 @@ void dlio::OdomNode::updateState() {
 
   // Construct quaternion correction
   qcorr.w() = 1 - abs(qe.w());
-  qcorr.vec() = sgn*qe.vec();
-  qcorr = qhat * qcorr;
+  Eigen::Vector3f qe_vec = sgn*qe.vec();
 
   Eigen::Vector3f err = pin - this->state.p;
   Eigen::Vector3f err_body;
@@ -2923,14 +2934,28 @@ void dlio::OdomNode::updateState() {
   // there instead of absorbing registration noise into the runaway -- the
   // contracting-observer analogue of LODESTAR's reduced-gain "fixed" state
   // (see include/dlio/degeneracy_observer.h, doc/EXPLORATION_2026-06-26.md).
-  // err (world) drives position, velocity, AND accel bias (via err_body below);
-  // qcorr.vec() (world, after qhat*qcorr) drives orientation. The held dirs are
-  // read from gicp on this scan thread, same as the cov inflation below.
+  // err (world) drives position, velocity, AND accel bias (via err_body below).
+  // Rotation: qe is a BODY-frame error quaternion and vec(qhat*p) != R(qhat)*vec(p)
+  // (Sola, arXiv:1711.02508 -- the vector part of a quaternion PRODUCT is not the
+  // rotated error vector), so attenuating the composed qcorr.vec() along world
+  // dirs mixed frames (VERIFICATION_2026-06-27). Instead rotate the held world
+  // dirs INTO the body frame (d_b = R(qhat)^T d) and attenuate qe's vector part
+  // there -- exact for the small-angle error the observer integrates. The held
+  // dirs are read from gicp on this scan thread, same as the cov inflation below.
   if (this->geo_degen_obs_gain_ < 1.0) {
     const float g = static_cast<float>(this->geo_degen_obs_gain_);
     err = dlio::attenuateAlongHeldAxes(err, this->gicp.lastDegenTransDirs(), g);
-    qcorr.vec() = dlio::attenuateAlongHeldAxes(qcorr.vec(), this->gicp.lastDegenRotDirs(), g);
+    std::vector<Eigen::Vector3d> rot_dirs_body;
+    rot_dirs_body.reserve(this->gicp.lastDegenRotDirs().size());
+    for (const auto& d : this->gicp.lastDegenRotDirs()) {
+      rot_dirs_body.push_back(
+          qhat.conjugate()._transformVector(d.cast<float>()).cast<double>());
+    }
+    qe_vec = dlio::attenuateAlongHeldAxes(qe_vec, rot_dirs_body, g);
   }
+
+  qcorr.vec() = qe_vec;
+  qcorr = qhat * qcorr;
 
   err_body = qhat.conjugate()._transformVector(err);
 

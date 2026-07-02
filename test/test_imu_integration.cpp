@@ -106,6 +106,136 @@ TEST(ImuIntegration, GravityIsSubtracted) {
   }
 }
 
+// --- Spline-order verification (VERIFICATION_2026-06-27) ---
+// The deskew kernel is a piecewise CUBIC in position (constant jerk per IMU
+// interval; Chen, Nemiroff & Lopez, ICRA 2023) -- an analytic continuous-time
+// trajectory, DLIO's counterpart to the B-spline trajectories of spline-based
+// CT odometry (e.g. CT-ICP, RESPLE). The tests below pin the spline properties
+// the suite above did not: the cubic term itself, knot continuity at IMU sample
+// boundaries, and agreement with an independent numerical integrator.
+
+namespace {
+
+// Wiggly stream: per-sample lin_accel from a caller-supplied profile a(t).
+template <typename AccelFn>
+std::vector<ImuMeas> makeProfiledStream(double duration, double rate, AccelFn a_of_t) {
+  const double dt = 1.0 / rate;
+  const int n = static_cast<int>(duration * rate) + 1;
+  std::vector<ImuMeas> v;
+  for (int k = 0; k < n; ++k) {
+    ImuMeas m;
+    m.stamp = k * dt;
+    m.dt = dt;
+    m.ang_vel = Eigen::Vector3f::Zero();
+    m.lin_accel = a_of_t(k * dt);
+    v.push_back(m);
+  }
+  return v;
+}
+
+}  // namespace
+
+// The CUBIC term: a linear acceleration ramp a(t) = j*t is EXACTLY representable
+// by the constant-jerk model, so p(t) = j*t^3/6 must be reproduced.
+TEST(ImuIntegration, ConstantJerkMatchesCubicClosedForm) {
+  const Eigen::Vector3f j(0.6f, -0.3f, 0.2f);   // jerk [m/s^3]
+  auto buf = makeProfiledStream(1.0, 100.0, [&](double t) {
+    return Eigen::Vector3f(j * static_cast<float>(t));
+  });
+
+  std::vector<double> stamps{0.3, 0.55, 0.8, 1.0};
+  auto frames = dlio::OdomNode::integrateImuInternal(
+      Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
+      stamps, buf, /*gravity=*/0.0);
+
+  ASSERT_EQ(frames.size(), stamps.size());
+  for (size_t i = 0; i < stamps.size(); ++i) {
+    const float t = static_cast<float>(stamps[i]);
+    const Eigen::Vector3f expected = j * (t * t * t) / 6.f;
+    const Eigen::Vector3f got = frames[i].block<3, 1>(0, 3);
+    EXPECT_NEAR((got - expected).norm(), 0.f, 1e-3)
+        << "t=" << t << " got " << got.transpose()
+        << " expected " << expected.transpose();
+  }
+}
+
+// Knot (C0) continuity at IMU sample boundaries: the piecewise polynomial's
+// segment-k endpoint must equal segment-(k+1)'s start, so deskew stamps
+// straddling a boundary by +-eps must be O(eps*|v|) apart -- even on a wiggly
+// profile where a segment-coefficient mismatch would produce a visible jump.
+TEST(ImuIntegration, KnotContinuityAcrossImuBoundaries) {
+  const double dt = 1.0 / 100.0;
+  auto buf = makeProfiledStream(1.0, 100.0, [](double t) {
+    return Eigen::Vector3f(std::sin(7.0 * t), std::cos(5.0 * t), 0.3 * t);
+  });
+
+  const double eps = 1e-5;
+  std::vector<double> stamps;
+  for (int b = 20; b <= 80; b += 20) {                 // boundaries at b*dt
+    stamps.push_back(b * dt - eps);
+    stamps.push_back(b * dt + eps);
+  }
+  auto frames = dlio::OdomNode::integrateImuInternal(
+      Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
+      stamps, buf, 0.0);
+  ASSERT_EQ(frames.size(), stamps.size());
+  for (size_t i = 0; i + 1 < frames.size(); i += 2) {
+    const Eigen::Vector3f pa = frames[i].block<3, 1>(0, 3);
+    const Eigen::Vector3f pb = frames[i + 1].block<3, 1>(0, 3);
+    EXPECT_NEAR((pb - pa).norm(), 0.f, 1e-3)
+        << "position discontinuity at IMU boundary pair " << i / 2;
+  }
+}
+
+// Independent cross-check: fine-step numerical integration of the SAME
+// piecewise-linear a(t) (zero rotation, so world == body) must agree with the
+// analytic kernel -- two independent integrators, one trajectory.
+TEST(ImuIntegration, MatchesNumericalIntegrationOnWigglyProfile) {
+  const double rate = 100.0, duration = 1.0, dt = 1.0 / rate;
+  auto profile = [](double t) {
+    return Eigen::Vector3f(std::sin(9.0 * t), -0.8 * std::cos(4.0 * t), 0.5 * t);
+  };
+  auto buf = makeProfiledStream(duration, rate, profile);
+  const int n = static_cast<int>(buf.size());
+
+  std::vector<double> stamps{0.33, 0.61, 0.97};
+  auto frames = dlio::OdomNode::integrateImuInternal(
+      Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
+      stamps, buf, 0.0);
+  ASSERT_EQ(frames.size(), stamps.size());
+
+  // Numeric reference: integrate the piecewise-LINEAR interpolation of the
+  // sampled accel (exactly the model the kernel assumes) with small steps.
+  auto accel_at = [&](double t) -> Eigen::Vector3f {
+    int k = static_cast<int>(t / dt);
+    if (k > n - 2) { k = n - 2; }
+    const float s = static_cast<float>((t - k * dt) / dt);
+    return buf[k].lin_accel * (1.f - s) + buf[k + 1].lin_accel * s;
+  };
+  const double h = 1e-4;
+  Eigen::Vector3d p = Eigen::Vector3d::Zero(), v = Eigen::Vector3d::Zero();
+  size_t si = 0;
+  double t = 0.0;
+  while (si < stamps.size()) {
+    double step = h;
+    bool at_stamp = false;
+    if (t + h >= stamps[si]) { step = stamps[si] - t; at_stamp = true; }
+    const Eigen::Vector3d a0 = accel_at(t).cast<double>();
+    const Eigen::Vector3d a1 = accel_at(t + step).cast<double>();
+    // exact update for linear-in-t accel over [t, t+step]
+    p += v * step + (a0 / 2.0 + (a1 - a0) / 6.0) * step * step;
+    v += 0.5 * (a0 + a1) * step;
+    t += step;
+    if (at_stamp) {
+      const Eigen::Vector3f got = frames[si].block<3, 1>(0, 3);
+      EXPECT_NEAR((got.cast<double>() - p).norm(), 0.0, 2e-3)
+          << "stamp " << stamps[si] << " analytic " << got.transpose()
+          << " numeric " << p.transpose();
+      ++si;
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
