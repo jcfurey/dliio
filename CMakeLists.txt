@@ -184,6 +184,13 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_kdtree test/test_kdtree.cpp)
+  target_compile_definitions(test_kdtree PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_kdtree
+    nano_gicp
+    ${PCL_LIBRARIES}
+  )
+
   ament_add_gtest(test_degeneracy_governor test/test_degeneracy_governor.cpp)
   target_compile_definitions(test_degeneracy_governor PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_degeneracy_governor
