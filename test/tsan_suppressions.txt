@@ -1,0 +1,26 @@
+# TSan suppressions — dliio.  See doc/FINDINGS_2026-07-02_tsan_races.md.
+#
+# These are FALSE POSITIVES, not real races. Each suppressed member is touched by
+# a SINGLE MutuallyExclusive callback group and is therefore never genuinely
+# accessed concurrently. TSan reports them only because rclcpp/rcl are not
+# compiled with TSan (only dliio is), so the executor's callback-group
+# happens-before edge between successive callbacks that land on different worker
+# threads is invisible to TSan.
+#
+# Genuine cross-group shared state IS correctly locked and is deliberately NOT
+# suppressed here, so a real regression there still fires:
+#   - state / imu_stamp / degen_cov_extra_   -> geo.mtx
+#   - imu_rates                              -> mtx_imu
+#
+# Scope is kept narrow (single-purpose functions only). callbackImu is NOT
+# suppressed wholesale — its calibration-phase accumulator races
+# (calib_gyro_avg_/accel_avg_/num_samples_, first ~3 s, single-group, benign) are
+# left visible on purpose so a future genuine race in callbackImu is not masked.
+
+# transformImu: per-call state (transform_prev_stamp_, ang_vel_cg_prev_,
+# transform_imu_init_) is IMU-callback-only. odom.cc:3027-3062.
+race:dlio::OdomNode::transformImu
+
+# publishPose: reuses the member Odometry/PoseStamped buffers (odom_ros/pose_ros);
+# publish-timer-only. State is already snapshotted under geo.mtx. odom.cc:922-980.
+race:dlio::OdomNode::publishPose
