@@ -19,9 +19,14 @@ where the weak-axis information is.
 ## How
 
 - **Saliency** (`pointSaliency`, `nano_gicp/saliency_weight.h`) is computed per
-  point from its local neighborhood-covariance eigenvalues (the LOAM/DAMM-LOAM PCA
-  feature test): `saliency = 1 − planarity`, `planarity = (λ1−λ0)/λ2`. Planar
-  wall → ~0; edge/rib/corner → ~1. Computed from the **raw** covariance in
+  point from its local neighborhood-covariance eigenvalues:
+  `saliency = linearity = (λ2−λ1)/λ2` — the standard eigen-feature (Demantké et
+  al. 2011; Weinmann et al., ISPRS 2015). Edge/rib → ~1 (boosted); planar wall →
+  ~0; **scatter/noise → ~0** (baseline). *Revised 2026-06-27*: the original
+  `1 − planarity` form also gave isotropic-scatter (noise) neighborhoods
+  saliency ≈ 1, up-weighting noise at full boost — the likely cause of the `sal8`
+  tracking stall in `FINDINGS_2026-06-26` (LOAM selects edges by high
+  smoothness/linearity, never scatter). Computed from the **raw** covariance in
   `calculate_covariances`, before the GICP regularization flattens the shape, and
   only for the **source** cloud, and only when the feature is on (the extra
   per-point eigendecomposition is skipped otherwise).

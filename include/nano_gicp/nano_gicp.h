@@ -417,6 +417,13 @@ public:
   float lastKernelScale() const;
   // Number of degenerate directions detected during the last align() (0-6).
   int lastDegenerateDirections() const;
+  // Corruption telemetry (VERIFICATION_2026-06-27): correspondences with an
+  // out-of-range (>= target size) index skipped by linearize's guard in the last
+  // align(). The kd-tree provably cannot store one, so any nonzero count means
+  // the correspondences_ buffer was scribbled by an out-of-bounds writer
+  // elsewhere -- surface it (the node logs a throttled warning) instead of
+  // letting the old std::out_of_range kill the node. 0 on healthy scans.
+  long lastOobCorrespondences() const;
   // World-frame eigen-directions the gate flagged degenerate AND HELD (not
   // visually rescued) in the last align(). The correction was erased along
   // these, so the pose dead-reckons the IMU prior there -- the downstream
@@ -570,6 +577,7 @@ protected:
   float last_fit_alpha_;               // diagnostic: alpha fitted in the last linearize()
   float current_kernel_c_;             // Barron scale in effect (data-driven MAD when scale<=0)
   int last_degenerate_directions_;
+  long last_oob_corr_count_;           // out-of-range correspondences skipped last align (corruption telemetry)
   float last_geo_rot_margin_;          // telemetry: rot block weakest-axis eig / gate thresh; -1 = n/a
   float last_geo_trans_margin_;        // telemetry: trans block weakest-axis eig / gate thresh; -1 = n/a
   // World-frame eigen-directions held degenerate (not rescued) in the last

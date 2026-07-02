@@ -16,14 +16,17 @@ TEST(Saliency, PlaneIsNotSalient) {
   EXPECT_NEAR(pointSaliency(Eigen::Vector3f(1e-4f, 1.0f, 1.0f)), 0.0f, 1e-3f);
 }
 
-// An edge / line (l0~l1~0, l2 large) IS salient (~1).
+// An edge / line (l0~l1~0, l2 large) IS salient (~1) -- high linearity.
 TEST(Saliency, EdgeIsSalient) {
   EXPECT_NEAR(pointSaliency(Eigen::Vector3f(1e-4f, 1e-4f, 1.0f)), 1.0f, 1e-3f);
 }
 
-// A scattered / corner neighborhood (l0~l1~l2) is salient (~1).
-TEST(Saliency, ScatterIsSalient) {
-  EXPECT_NEAR(pointSaliency(Eigen::Vector3f(1.0f, 1.0f, 1.0f)), 1.0f, 1e-6f);
+// A scattered / isotropic neighborhood (l0~l1~l2, i.e. NOISE) is NOT salient:
+// linearity ~0. The original 1-planarity formulation boosted scatter at full
+// weight (up-weighting noise -- the sal8 stall, FINDINGS_2026-06-26); the
+// linearity form leaves it at baseline (Weinmann et al. eigen-features).
+TEST(Saliency, ScatterIsNotSalient) {
+  EXPECT_NEAR(pointSaliency(Eigen::Vector3f(1.0f, 1.0f, 1.0f)), 0.0f, 1e-6f);
 }
 
 // Degenerate (l2 <= 0) -> 0, no div-by-zero.
