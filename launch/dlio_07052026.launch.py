@@ -24,6 +24,17 @@ from launch_xml.launch_description_sources import XMLLaunchDescriptionSource
 # (upstream launch files aren't modified in place, per convention — a new
 # sibling file instead, same as RESPLE's dataset launches).
 #
+# TUNNEL MODE (found live 2026-07-08): this bag's environment shows the same
+# along-axis map-lock oscillation/corkscrew as the 06042026 tunnel — so
+# ouster_tunnel.yaml's gate/regularization/photometric-weight base is loaded
+# unconditionally here (not gated behind an arg; there's no evidence yet this
+# dataset needs anything else). use_xicp:=true layers
+# ouster_tunnel_xicp.yaml's n=24-validated ternary gate refinement on top —
+# the only lever in the whole 06042026 investigation confirmed to actually
+# PREVENT the collapse (vs. bounding it after the fact, or the lidar_image/
+# camera terms which don't reach this axis at all). Default false pending a
+# from-scratch validation on THIS dataset (n=24 was 06042026-specific).
+#
 # TIMESTAMP-DOMAIN GOTCHA (found live 2026-07-08): this sensor's metadata says
 # timestamp_mode=TIME_FROM_INTERNAL_OSC (its own free-running oscillator,
 # unrelated to wall time) — fine for LiDAR+IMU-only math (self-consistent
@@ -58,6 +69,12 @@ def generate_launch_description():
                     'frame-to-map anchor (odom/lidar_image/*, cfg/examples/'
                     'ouster_tunnel_lidarimg.yaml). Derived from /ouster/points '
                     'per-point fields directly — no os_image / camera needed.')
+    use_xicp_arg = DeclareLaunchArgument(
+        'use_xicp', default_value='false',
+        description='Enable the X-ICP ternary localizability gate '
+                    '(odom/xicp/*, cfg/examples/ouster_tunnel_xicp.yaml) — '
+                    'n=24-validated on 06042026 to prevent (not just bound) '
+                    'the tunnel along-axis collapse.')
     timestamp_mode_arg = DeclareLaunchArgument(
         'timestamp_mode', default_value='TIME_FROM_ROS_TIME',
         description='ouster_ros os_cloud timestamp_mode. TIME_FROM_ROS_TIME '
@@ -107,14 +124,21 @@ def generate_launch_description():
     cfg_examples = PathJoinSubstitution([dliio_pkg, 'cfg', 'examples'])
     parameters = [
         PathJoinSubstitution([dliio_pkg, 'cfg', 'dlio.yaml']),
+        # Tunnel-mode base (gate/regularization/photometric weight) — see the
+        # header comment above. Loaded before our own extrinsics overlay so
+        # its coarse datasheet IMU extrinsic gets overridden, not the other
+        # way around.
+        PathJoinSubstitution([cfg_examples, 'ouster_tunnel.yaml']),
         PathJoinSubstitution([cfg_examples, 'ouster_07052026_extrinsics.yaml']),
         PathJoinSubstitution([cfg_examples, 'ouster_tunnel_visual.yaml']),
         PathJoinSubstitution([cfg_examples, 'ouster_07052026_visual.yaml']),
         PathJoinSubstitution([cfg_examples, 'ouster_tunnel_lidarimg.yaml']),
+        PathJoinSubstitution([cfg_examples, 'ouster_tunnel_xicp.yaml']),
         {
             'odom/visual/enabled': ParameterValue(LaunchConfiguration('use_visual'), value_type=bool),
             'odom/visual/map/enabled': ParameterValue(LaunchConfiguration('use_visual'), value_type=bool),
             'odom/lidar_image/enabled': ParameterValue(LaunchConfiguration('use_lidar_image'), value_type=bool),
+            'odom/xicp/ternaryEnabled': ParameterValue(LaunchConfiguration('use_xicp'), value_type=bool),
             'odom/debug/dashboard': False,
             'use_sim_time': False,
         },
@@ -160,6 +184,7 @@ def generate_launch_description():
         rviz_arg,
         use_visual_arg,
         use_lidar_image_arg,
+        use_xicp_arg,
         timestamp_mode_arg,
         pointcloud_topic_arg,
         imu_topic_arg,
