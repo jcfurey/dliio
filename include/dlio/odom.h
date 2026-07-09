@@ -13,6 +13,7 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include "dlio/slosh_guard.h"
 
 #include <array>
 
@@ -448,6 +449,22 @@ private:
   bool degen_gov_enabled_ = false;
   float degen_gov_max_step_trans_ = 0.f;  // [m]   max per-scan motion along a held trans axis; 0 = off
   float degen_gov_max_step_rot_ = 0.f;    // [rad] max per-scan motion about a held rot axis;   0 = off
+  // PHYSICS FUSE (physics_fuse.h): clamp the TOTAL per-scan output step (any
+  // direction -- catches the runaways the governor's held-axis scope misses,
+  // including a diverging IMU prior). 0 = off (bit-identical). Scan thread only.
+  double fuse_max_step_trans_ = 0.0;      // [m]   max per-scan output translation; 0 = off
+  double fuse_max_step_rot_ = 0.0;        // [rad] max per-scan output rotation;    0 = off
+  bool fuse_tripped_scan_ = false;        // this scan clamped (vetoes keyframing)
+  long fuse_trips_ = 0;                   // cumulative trips (diagnostics)
+  // SLOSH GUARD (slosh_guard.h): online corkscrew detector on the output step
+  // along the weak axis; when engaged, extra velocity damping + keyframe veto.
+  // All accessed on the scan thread (getNextPose -> updateState -> updateKeyframes).
+  bool slosh_enabled_ = false;
+  double slosh_deadband_ = 0.02;          // [m] ignore steps below this (stationary noise)
+  double slosh_vel_damp_ = 0.5;           // per-scan velocity damping along the axis while engaged
+  dlio::SloshGuard slosh_guard_;          // detector (window/fracs set from params at startup)
+  Eigen::Vector3f slosh_axis_ = Eigen::Vector3f::Zero();  // tracked weak axis (persists across scans)
+  bool slosh_axis_valid_ = false;
   double degen_gov_cov_pos_var_ = 0.0;    // [m^2]   variance added along a held position axis; 0 = none
   double degen_gov_cov_rot_var_ = 0.0;    // [rad^2] variance added along a held rotation axis; 0 = none
   // Extra pose covariance from the inflation, world frame, written on the scan
@@ -538,6 +555,7 @@ private:
   double geo_Kab_;
   double geo_Kgb_;
   double geo_degen_obs_gain_ = 1.0;  // LODESTAR-flavored observer gain on held-degenerate axes; 1 = off
+  double geo_degen_vel_damp_ = 0.0;  // per-scan velocity damping along held axes (flywheel kill); 0 = off
   double geo_abias_max_;
   double geo_gbias_max_;
   // Intensity range correction
@@ -605,8 +623,20 @@ private:
   // --- COIN-LIO LiDAR intensity-image term ---
   bool lidar_image_enabled_;
   double lidar_image_weight_;
+  // Keyframe-image references for the map term (INTENSITY_AUDIT_2026-07-09):
+  // per-point brightness sampled from each keyframe's FULL-RES reflectivity
+  // image at creation (index-aligned with `keyframes`, /scale, < 0 invalid);
+  // concatenated into submap_lidar_refs in buildSubmap and handed to the gicp
+  // so the map term's reference carries pre-voxel texture.
+  bool lidar_image_refs_enabled_ = false;
+  std::vector<std::shared_ptr<const std::vector<float>>> keyframe_lidar_refs;
+  std::shared_ptr<const std::vector<float>> submap_lidar_refs;
+  std::shared_ptr<const std::vector<float>>
+  sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                          const Eigen::Isometry3f& T_lw, const cv::Mat& img);
   cv::Mat lidar_refl_img_;             // current scan reflectivity image (/scale), CV_32FC1
   cv::Mat lidar_range_img_;            // current scan range image [m], CV_32FC1 (occlusion check)
+  float lidar_img_az_grad_energy_ = 0.f;  // mean |dI/dcol| over valid pairs (/scale units): full-res texture present?
   float lidar_az_a_, lidar_az_b_, lidar_el_a_, lidar_el_b_;  // self-calibrated spherical model
   std::vector<float> lidar_el_lut_;    // per-row mean elevation [rad] (non-uniform beams)
   double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
@@ -615,6 +645,8 @@ private:
   bool lidar_dir_separated_enabled_ = false;  // restrict the lidar term to the weak subspace (LOFF)
   bool lidar_flow_enabled_ = false;    // frame-to-frame LiDAR flow term (EXPLORATION #2)
   double lidar_flow_weight_ = 0.0;     // flow term weight (count-normalized); 0 = off
+  bool lidar_flow_image_ref_ = true;   // reference = current full-res image (true) vs voxel-averaged field (false)
+  int lidar_flow_patch_ = 0;           // patch half-width [0,3]; 0 = single pixel (INTENSITY_AUDIT_2026-07-09)
   cv::Mat lidar_flow_prev_img_;        // previous scan's image, stashed for the flow term
   Eigen::Isometry3f lidar_flow_T_lw_prev_ = Eigen::Isometry3f::Identity();  // prev scan corrected world->lidar
   bool lidar_flow_prev_valid_ = false; // a previous image has been stashed

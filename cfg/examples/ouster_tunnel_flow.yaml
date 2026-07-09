@@ -10,10 +10,11 @@
 # subspace and can't perturb the well-observed axes — the "fuse only into the
 # degenerate direction" anti-dilution guard the scalar intensity term lacked.
 #
-# REQUIRES the lidar_image infra (the node builds the image the flow term
-# projects into) — overlay ON TOP of ouster_tunnel.yaml +
-# ouster_06042026_extrinsics.yaml + ouster_tunnel_lidarimg.yaml [+ _nearir] +
-# ouster_tunnel_xicp.yaml.
+# Overlay ON TOP of ouster_tunnel.yaml + ouster_06042026_extrinsics.yaml
+# [+ ouster_tunnel_lidarimg.yaml [+ _nearir]] + ouster_tunnel_xicp.yaml.
+# (2026-07-09: flow/enabled now builds the LiDAR image itself, so the lidarimg
+# overlay is no longer a hard prerequisite — layer it when you also want the
+# frame-to-map term / near-IR channel selection.)
 #
 # NOT validated on real data: the Jacobian is correct-by-construction (reuses the
 # spherical-map + visual-f2f derivations) and TSan/ASan/UBSan clean, but a
@@ -32,3 +33,11 @@
     # frame-to-frame flow signal (count-normalized; comparable to lidar_image/weight 0.05)
     odom/lidar_image/flow/enabled: true
     odom/lidar_image/flow/weight: 0.02   # START LOW; sweep {0.02,0.05,0.1}
+    # Image-to-image reference + patch residuals (doc/INTENSITY_AUDIT_2026-07-09.md):
+    # the reference brightness comes from the CURRENT scan's full-res image, not
+    # the voxel-averaged point field (the voxel blur destroyed the graffiti-scale
+    # texture the term needs), and each point compares a zero-mean (2P+1)^2 patch
+    # (brightness-offset invariant, uses the strokes' spatial structure). imageRef
+    # false + patch 0 reproduces the original term for A/B.
+    odom/lidar_image/flow/imageRef: true
+    odom/lidar_image/flow/patch: 2   # 5x5; sweep {0,1,2,3}

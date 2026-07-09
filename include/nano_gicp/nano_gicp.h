@@ -297,6 +297,14 @@ public:
   // from the organized scan. The current scan's reflectivity image + projection
   // + world->lidar transform are set per scan.
   void setLidarMapWeight(float weight);
+  // Per-target-point reference brightness for the LiDAR frame-to-map term
+  // (doc/INTENSITY_AUDIT_2026-07-09.md): sampled from each KEYFRAME's
+  // full-resolution reflectivity image at keyframe creation, index-aligned with
+  // the target (submap) cloud, already image-normalized (/scale); < 0 = invalid
+  // (skip the point). When set and size-matched, the map term uses these instead
+  // of the target point's voxel-AVERAGED .reflectivity field, which destroys
+  // graffiti-scale texture. null / size mismatch -> field fallback (bit-identical).
+  void setTargetLidarRefs(const std::shared_ptr<const std::vector<float>>& refs);
   // Frame-to-FRAME LiDAR flow term (doc/EXPLORATION_2026-06-26.md #2): register the
   // current scan against the PREVIOUS scan's image to observe the along-tunnel
   // motion the frame-to-map reflectivity term can't. weight <= 0 (default) -> off,
@@ -307,6 +315,17 @@ public:
   // hold) for the loop's lifetime; the member is never mutated in place.
   void setLidarFlowWeight(float weight);
   void setLidarFlowPrev(const cv::Mat& prev_img, const Eigen::Isometry3f& T_lw_prev);
+  // Flow-term reference mode (doc/INTENSITY_AUDIT_2026-07-09.md). image_ref=true
+  // (default): the reference brightness is sampled from the CURRENT scan's
+  // full-resolution image (setLidarImage) at the point's prior-pose projection --
+  // an image-to-image residual, so both sides carry pre-voxel detail (graffiti).
+  // image_ref=false: legacy behavior, reference = the voxel-averaged source
+  // point's .reflectivity field (bit-identical to the original term). patch in
+  // [0,3]: half-width of the square patch compared per point (0 = single pixel,
+  // COIN-LIO uses patches; residuals are zero-mean per patch for P>0 to shed
+  // per-scan gain/offset, and the per-point weight is divided by the pixel count
+  // so the term's total influence is patch-size invariant).
+  void setLidarFlowMode(bool image_ref, int patch);
   void setLidarImage(const cv::Mat& refl_norm);  // CV_32FC1, reflectivity/scale
   // Linear spherical model: col = (atan2(Y,X) - az_b)/az_a, row = (elev - el_b)/el_a.
   void setLidarProjection(float az_a, float az_b, float el_a, float el_b);
@@ -375,6 +394,11 @@ public:
   void setSaliencyWeighting(bool enabled, float boost);
   float lastLidarMapRms() const;
   int lastLidarMapCount() const;
+  // Frame-to-frame LiDAR flow diagnostics from the last align(): residual count
+  // (points, patch-invariant) and per-point RMS. 0/0 when the term is off or
+  // its guards no-oped -- distinguishes "term off" from "term on but starved".
+  float lastLidarFlowRms() const;
+  int lastLidarFlowCount() const;
 
   // RMS of the (normalized) visual residual and number of points used in the
   // last align() (for diagnostics).
@@ -634,12 +658,15 @@ protected:
 
   // --- COIN-LIO LiDAR intensity-image term state ---
   float lidar_map_weight_;
+  std::shared_ptr<const std::vector<float>> target_lidar_refs_;  // per-target keyframe-image brightness (/scale); <0 invalid
   cv::Mat lidar_image_;               // current reflectivity image, CV_32FC1, /scale
   float lidar_az_a_, lidar_az_b_;     // col = (atan2(Y,X) - az_b) / az_a
   float lidar_el_a_, lidar_el_b_;     // row = (elev - el_b) / el_a (fallback)
   std::vector<float> lidar_el_lut_;   // per-row elevation [rad]; supersedes el_a/el_b when non-empty
   Eigen::Isometry3f T_lw_cur_;        // world -> lidar from the prior pose
   float lidar_flow_weight_;            // frame-to-frame flow term weight; 0 = off (bit-identical)
+  bool lidar_flow_image_ref_;         // reference = current image sample (true) or source .reflectivity (false)
+  int lidar_flow_patch_;              // patch half-width in [0,3]; 0 = single pixel
   cv::Mat lidar_flow_prev_img_;       // PREVIOUS scan's image (owned deep copy), CV_32FC1, /scale
   Eigen::Isometry3f T_lw_prev_flow_;  // world -> previous lidar (previous scan's corrected pose)
   int last_lidar_flow_count_;         // diagnostics: flow residuals last scan

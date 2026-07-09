@@ -24,6 +24,14 @@
   ros__parameters:
     odom/lidar_image/enabled: true
 
+    # Keyframe-image references (2026-07-09, doc/INTENSITY_AUDIT_2026-07-09.md):
+    # the map term's reference was the target point's VOXEL-AVERAGED (0.25m leaf)
+    # reflectivity -- the 5-30cm graffiti strokes this term is supposed to key on
+    # are blurred away before the residual sees them. imageRefs samples each
+    # keyframe's FULL-RES image per point at keyframe creation instead, so the
+    # reference carries the texture. Set false to A/B the old field reference.
+    odom/lidar_image/imageRefs: true
+
     # 2026-06-22: DO NOT keep tuning this scalar. Instrumenting the gate showed the
     # term rescues the degenerate axis essentially NEVER (Visual Rescued Axes ≈ 0)
     # at BOTH w0.05 and w0.30 — a no-op for the tunnel degeneracy at any sane

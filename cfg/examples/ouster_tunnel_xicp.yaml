@@ -21,6 +21,11 @@
 # Overlay ON TOP of ouster_tunnel.yaml (+ ouster_06042026_extrinsics.yaml, and the
 # lidarimg/near-IR overlays if matching the validated substrate). fullRatio=0.05
 # beat 0.02 in the screen (tighter worst-case, deg never exceeded 1).
+#
+# 2026-07-09: the base ouster_tunnel.yaml changed photometricWeight 0.3 -> 0.0
+# (doc/INTENSITY_AUDIT_2026-07-09.md). This MATCHES the validated substrate:
+# the n=24 runs above were on the near-IR stack, whose overlay already forced
+# photometricWeight 0 — so the validation numbers carry over unchanged.
 
 /**:
   ros__parameters:

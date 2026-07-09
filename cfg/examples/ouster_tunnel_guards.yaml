@@ -1,0 +1,54 @@
+# EXAMPLE: RUNTIME GUARDS — the anti-takeoff / anti-corkscrew defensive stack
+# (2026-07-09, doc/RUNTIME_GUARDS.md). Default-off elsewhere.
+#
+# Motivation (doc/FINDINGS_2026-07-09_07052026_rviz.md): on 07052026_4_an the
+# estimator produced a 3.3e7 m takeoff (leg 1) and SLOSH_HI with 58 reversals
+# (leg 3) — and the existing prevention levers (gate, X-ICP, governor) either
+# missed or only bounded per held axis. These guards act on the OUTPUT and the
+# VELOCITY state, independent of whether the gate flagged the right axis:
+#
+#  1. PHYSICS FUSE — total per-scan output step clamped to a physical bound in
+#     ANY direction, prior divergence included. maxStepTrans 1.0 at 10 Hz means
+#     the published pose can never exceed 10 m/s: a takeoff is impossible at
+#     the output level by construction. Trips are loud (/diagnostics
+#     "Physics Fuse Trips", ERROR log, keyframe veto).
+#  2. SLOSH GUARD — the harness's reversal verdict (analyze_traj.py `revs`)
+#     online: engages when the output step along the weak axis alternates sign,
+#     then damps the velocity flywheel along that axis and vetoes keyframes
+#     until the oscillation subsides.
+#  3. degenVelDamp — the standing flywheel kill: while the gate holds an axis,
+#     the along-axis velocity decays instead of free-integrating IMU error.
+#     0.3/scan at 10 Hz ≈ 97% decay per second: bounded coast, not runaway.
+#
+# What these do NOT do: fix the estimate. They bound the damage, keep the
+# trajectory physically plausible for downstream consumers (r_l EKF, planners),
+# and keep a bad pose out of the map. Composes with (does not replace) the
+# X-ICP ternary gate, the governor, and the keyframe degenGate.
+#
+# Overlay ON TOP of ouster_tunnel.yaml (+ extrinsics + xicp/governor overlays).
+# All three mechanisms are independent — A/B them separately by zeroing the
+# others (fuse: maxStep* 0; slosh: enabled false; flywheel: degenVelDamp 0).
+#
+# NOT bag-validated: first-cut values sized from platform physics (crawler
+# ≤ 2 m/s, 10 Hz scans). Smoke-test on 06042026 (must be a no-op on clean runs:
+# watch "Physics Fuse Trips" == 0 and "Slosh Guard Activations" == 0 there),
+# then A/B on 07052026_4_an where all three failure modes reproduce.
+
+/**:
+  ros__parameters:
+    # 1. Physics fuse: 1.0 m/scan @ 10 Hz = 10 m/s ceiling (crawler does ~2).
+    odom/fuse/maxStepTrans: 1.0     # [m]
+    odom/fuse/maxStepRot: 0.5       # [rad]
+
+    # 2. Slosh guard: defaults from params.yaml, enabled.
+    odom/slosh/enabled: true
+    odom/slosh/window: 20
+    odom/slosh/deadband: 0.02       # [m]
+    odom/slosh/engageFrac: 0.5
+    odom/slosh/disengageFrac: 0.25
+    odom/slosh/minActive: 8
+    odom/slosh/velDamp: 0.5
+
+    # 3. Flywheel kill while an axis is held (composes with the LODESTAR
+    # observer gain; that scales the CORRECTION, this decays the VELOCITY).
+    odom/geo/degenVelDamp: 0.3

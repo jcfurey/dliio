@@ -14,6 +14,7 @@
 #include "dlio/utils.h"
 #include "dlio/degeneracy_governor.h"
 #include "dlio/degeneracy_observer.h"
+#include "dlio/physics_fuse.h"
 #include <set>
 #include <unordered_map>
 #include <limits>
@@ -290,6 +291,44 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Variance added to /odom pose cov along a held-degenerate position axis [m^2] (0 = none)", 0.0, 1e6);
   dlio::declare_param(this, "odom/degenGov/covRotVar", this->degen_gov_cov_rot_var_, 0.0,
       "Variance added to /odom pose cov along a held-degenerate rotation axis [rad^2] (0 = none)", 0.0, 1e6);
+
+  // PHYSICS FUSE (physics_fuse.h, doc/RUNTIME_GUARDS.md): clamp the TOTAL
+  // per-scan output step in ANY direction to a physical bound. The governor
+  // only acts along axes the gate flagged; the fuse catches everything else --
+  // gate misses, runaway on an unflagged axis, and a diverging IMU prior (the
+  // 2026-07-09 leg-1 takeoff reached 3.3e7 m). A tripped scan is flagged
+  // (diagnostics + keyframe veto). 0 = off, bit-identical.
+  dlio::declare_param(this, "odom/fuse/maxStepTrans", this->fuse_max_step_trans_, 0.0,
+      "Max per-scan output translation in any direction [m] (~max speed/scan rate; 0 disables)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/fuse/maxStepRot", this->fuse_max_step_rot_, 0.0,
+      "Max per-scan output rotation [rad] (0 disables)", 0.0, 3.1416);
+
+  // SLOSH GUARD (slosh_guard.h, doc/RUNTIME_GUARDS.md): online detector for
+  // the corkscrew/back-and-forth oscillation (the harness's `revs` verdict,
+  // moved into the estimator). Tracks the signed output step along the weak
+  // (held) translation axis; a high sign-flip fraction over the window engages
+  // extra velocity damping along that axis (the oscillation's flywheel) and a
+  // keyframe veto until it subsides. Off (default) = bit-identical.
+  dlio::declare_param(this, "odom/slosh/enabled", this->slosh_enabled_, false,
+      "Enable the online slosh (oscillation) detector + damping response");
+  int slosh_window = 20, slosh_min_active = 8;
+  double slosh_engage = 0.5, slosh_disengage = 0.25;
+  dlio::declare_param(this, "odom/slosh/window", slosh_window, 20,
+      "Sliding window of active (above-deadband) steps considered");
+  dlio::declare_param(this, "odom/slosh/deadband", this->slosh_deadband_, 0.02,
+      "Ignore per-scan steps below this magnitude [m] (stationary noise)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/slosh/engageFrac", slosh_engage, 0.5,
+      "Sign-flip fraction at/above which the guard engages", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/disengageFrac", slosh_disengage, 0.25,
+      "Sign-flip fraction at/below which the guard disengages (hysteresis)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/minActive", slosh_min_active, 8,
+      "Minimum active samples before the guard may engage");
+  dlio::declare_param(this, "odom/slosh/velDamp", this->slosh_vel_damp_, 0.5,
+      "Per-scan velocity damping along the tracked axis while engaged (0..1)", 0.0, 1.0);
+  this->slosh_guard_ = dlio::SloshGuard(slosh_window,
+      static_cast<float>(this->slosh_deadband_),
+      static_cast<float>(slosh_engage), static_cast<float>(slosh_disengage),
+      slosh_min_active);
 
   // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
   // nominal residual count so its weight is independent of how many points are
@@ -756,6 +795,15 @@ void dlio::OdomNode::getParams() {
       "Enable the COIN-LIO LiDAR intensity-image frame-to-map term (organized scan + reflectivity)");
   dlio::declare_param(this, "odom/lidar_image/weight", this->lidar_image_weight_, 0.0,
       "Weight of the LiDAR intensity-image residual relative to the geometric GICP term");
+  // Keyframe-image references (doc/INTENSITY_AUDIT_2026-07-09.md): the map term's
+  // reference brightness normally comes from the target point's .reflectivity
+  // field, which is VOXEL-AVERAGED (0.25m leaf) -- the graffiti-scale texture the
+  // residual keys on is blurred away before the term ever sees it. When enabled,
+  // each keyframe samples per-point brightness from its FULL-RESOLUTION
+  // reflectivity image at creation and the submap hands those to the gicp.
+  // Off (default) = field reference, bit-identical.
+  dlio::declare_param(this, "odom/lidar_image/imageRefs", this->lidar_image_refs_enabled_, false,
+      "Map-term reference from each keyframe's full-res image (true) vs the voxel-averaged field (false)");
   dlio::declare_param(this, "odom/lidar_image/rangeAbsTol", this->lidar_range_abs_tol_, 0.5,
       "Occlusion check: absolute range tolerance [m] for accepting a projected map point");
   dlio::declare_param(this, "odom/lidar_image/rangeRelTol", this->lidar_range_rel_tol_, 0.1,
@@ -784,6 +832,16 @@ void dlio::OdomNode::getParams() {
       "Enable the frame-to-frame LiDAR flow term (registers against the previous scan's image)");
   dlio::declare_param(this, "odom/lidar_image/flow/weight", this->lidar_flow_weight_, 0.0,
       "Weight of the frame-to-frame LiDAR flow residual (count-normalized; 0 = off)", 0.0, 1e6);
+  // Flow reference mode (doc/INTENSITY_AUDIT_2026-07-09.md): imageRef samples the
+  // reference brightness from the CURRENT scan's full-resolution image, so both
+  // sides of the residual carry pre-voxel texture (graffiti); false = legacy
+  // voxel-averaged .reflectivity reference (bit-identical to the original term).
+  // patch compares a zero-mean (2P+1)^2 window per point (COIN-LIO-style patches;
+  // 0 = single pixel).
+  dlio::declare_param(this, "odom/lidar_image/flow/imageRef", this->lidar_flow_image_ref_, true,
+      "Flow reference from the current full-res image (true) vs the voxel-averaged point field (false)");
+  dlio::declare_param(this, "odom/lidar_image/flow/patch", this->lidar_flow_patch_, 0,
+      "Flow patch half-width in pixels (0 = single pixel; clamped to [0,3] by the gicp)");
   // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
   // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
   // mix an isotropic point-to-point metric into the GICP cost to regularize the
@@ -921,6 +979,14 @@ void dlio::OdomNode::getParams() {
   // prior). Reads the gate's held world-frame dirs; 1.0 (default) -> bit-identical.
   dlio::declare_param(this, "odom/geo/degenObsGain", this->geo_degen_obs_gain_, 1.0,
       "Observer correction gain on held-degenerate axes (1 = off, 0 = freeze to IMU prior)", 0.0, 1.0);
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): while the gate holds axes,
+  // the observer's velocity state keeps integrating IMU/accel error along them
+  // and powers both the dead-reckon runaway and the slosh limit cycle (the
+  // reason dliio twist is not fused downstream, doc/FUSION_ARCHITECTURE.md).
+  // Damp the velocity component along each held axis by this factor per scan:
+  // v_along *= (1 - damp). 0 (default) = off, bit-identical; 1 = zero it.
+  dlio::declare_param(this, "odom/geo/degenVelDamp", this->geo_degen_vel_damp_, 0.0,
+      "Per-scan velocity damping along held-degenerate axes (0 = off, 1 = zero the component)", 0.0, 1.0);
   dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0, "Accel-bias clamp [m/s^2] (live-tunable)", 0.0, 50.0);
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0, "Gyro-bias clamp [rad/s] (live-tunable)", 0.0, 10.0);
 }
@@ -1450,7 +1516,8 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // Done before NaN removal so indices still line up 1:1 with the message.
   // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
   // 3D-spatial reflectivity photometric term).
-  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_) {
+  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_ ||
+      this->lidar_flow_enabled_) {
     // Which cloud field feeds the per-point image slot (point.reflectivity).
     // Default 'reflectivity' -> bit-identical. The COIN-LIO image term may select
     // a higher-texture channel (odom/lidar_image/channel = intensity|ambient);
@@ -1509,9 +1576,11 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   }
 
   // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
-  // removal flattens it. No-op if the cloud isn't organized.
+  // removal flattens it. No-op if the cloud isn't organized. The flow term
+  // consumes the same image, so a flow-only config also builds it (previously
+  // it silently no-oped without the map term).
   this->lidar_img_ready_ = false;
-  if (this->lidar_image_enabled_ && pc->height > 1 &&
+  if ((this->lidar_image_enabled_ || this->lidar_flow_enabled_) && pc->height > 1 &&
       original_scan_->height == pc->height && original_scan_->width == pc->width) {
     this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
   }
@@ -1848,6 +1917,15 @@ void dlio::OdomNode::initializeInputTarget() {
     Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
     cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
     this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+  }
+  // Keyframe-image LiDAR refs (INTENSITY_AUDIT_2026-07-09): same prior-pose
+  // convention as the visual refs -- current_scan is prior-frame world, and the
+  // scalar brightness survives the later T_corr re-transform.
+  if (this->lidar_image_refs_enabled_) {
+    Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+    Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+    cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+    this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
   }
 
 }
@@ -2356,6 +2434,63 @@ dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::Const
   return refs;
 }
 
+std::shared_ptr<const std::vector<float>>
+dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                                        const Eigen::Isometry3f& T_lw, const cv::Mat& img) {
+  // Per-point brightness from this keyframe's FULL-RES reflectivity image
+  // (INTENSITY_AUDIT_2026-07-09): the reference the map term keys on, sampled
+  // BEFORE the voxel average blurs the texture away. Always returns a list sized
+  // cloud->size() (-1 = invalid) so it stays index-aligned with the keyframe
+  // cloud through submap assembly. The scalar is pose-independent, so it
+  // survives buildKeyframesAndSubmap's later T_corr re-transform untouched.
+  auto refs = std::make_shared<std::vector<float>>(cloud->size(), -1.f);
+  if (img.empty() || img.type() != CV_32FC1 || !this->lidar_proj_ready_) {
+    return refs;
+  }
+  const Eigen::Matrix3f R = T_lw.linear();
+  const Eigen::Vector3f t = T_lw.translation();
+  const float inv_az_a = 1.f / this->lidar_az_a_;
+  const float inv_el_a = 1.f / this->lidar_el_a_;
+  const bool use_lut = (static_cast<int>(this->lidar_el_lut_.size()) == img.rows
+                        && !this->lidar_el_lut_.empty());
+  const float bw = 2.f;
+  const float umax = static_cast<float>(img.cols) - 1.f - bw;
+  const float vmax = static_cast<float>(img.rows) - 1.f - bw;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    const auto& p = cloud->at(i);
+    const Eigen::Vector3f Pl = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+    const float rxy2 = Pl.x() * Pl.x() + Pl.y() * Pl.y();
+    if (rxy2 < 1e-6f) { continue; }
+    const float az = std::atan2(Pl.y(), Pl.x());
+    const float el = std::atan2(Pl.z(), std::sqrt(rxy2));
+    const float u = (az - this->lidar_az_b_) * inv_az_a;
+    float v;
+    if (use_lut) {
+      // Invert the monotonic per-row elevation LUT (non-uniform OS beams);
+      // outside its coverage -> invalid.
+      const auto& lut = this->lidar_el_lut_;
+      const int n = static_cast<int>(lut.size());
+      const bool inc = lut[n - 1] >= lut[0];
+      bool found = false;
+      for (int k = 0; k < n - 1; ++k) {
+        const float a = lut[k], b = lut[k + 1];
+        const float lo = inc ? a : b, hi = inc ? b : a;
+        if (el >= lo && el <= hi && std::abs(b - a) > 1e-9f) {
+          v = static_cast<float>(k) + (el - a) / (b - a);
+          found = true;
+          break;
+        }
+      }
+      if (!found) { continue; }
+    } else {
+      v = (el - this->lidar_el_b_) * inv_el_a;
+    }
+    if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }  // NaN-safe
+    (*refs)[i] = bilinearF(img, u, v);   // image is already /scale normalized
+  }
+  return refs;
+}
+
 void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::Ptr& organized,
                                              int width, int height, int kernel) {
   if (kernel <= 1) { return; }
@@ -2421,6 +2556,27 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
   this->lidar_refl_img_ = img;
   this->lidar_range_img_ = rng;
   this->lidar_img_ready_ = true;
+
+  // Azimuth-gradient energy (INTENSITY_AUDIT_2026-07-09 instrumentation): mean
+  // |dI/dcol| over valid pixel pairs, in /scale units. The column axis is
+  // azimuth ~ the along-tunnel direction on the walls, so this measures how
+  // much full-resolution texture (graffiti strokes) the image actually carries
+  // for the image-domain terms -- the signal the 0.25m voxel average destroys
+  // before the 3D photometric term sees it. Cheap (one pass, already-hot rows).
+  {
+    double e = 0.0; long n = 0;
+    for (int row = 0; row < height; ++row) {
+      const float* src = img.ptr<float>(row);
+      const float* r = rng.ptr<float>(row);
+      for (int col = 0; col + 1 < width; ++col) {
+        if (r[col] > 0.f && r[col + 1] > 0.f) {   // both real returns
+          e += std::abs(src[col + 1] - src[col]);
+          ++n;
+        }
+      }
+    }
+    this->lidar_img_az_grad_energy_ = (n > 0) ? static_cast<float>(e / n) : 0.f;
+  }
 
   // Self-calibrate the spherical model once (sensor geometry is fixed):
   //   el(row) ~ el_a*row + el_b   (least-squares over per-row mean elevation)
@@ -2501,6 +2657,9 @@ void dlio::OdomNode::getNextPose() {
     if (this->visual_map_enabled_) {
       this->gicp.setTargetVisualRefs(this->submap_visual_refs);
     }
+    if (this->lidar_image_refs_enabled_) {
+      this->gicp.setTargetLidarRefs(this->submap_lidar_refs);
+    }
 
     this->submap_hasChanged = false;
   }
@@ -2545,6 +2704,7 @@ void dlio::OdomNode::getNextPose() {
     // scan) -> off this scan.
     if (lidar_flow_active && this->lidar_flow_prev_valid_) {
       this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_);
+      this->gicp.setLidarFlowMode(this->lidar_flow_image_ref_, this->lidar_flow_patch_);
       this->gicp.setLidarFlowWeight(static_cast<float>(this->lidar_flow_weight_));
     } else {
       this->gicp.setLidarFlowWeight(0.f);
@@ -2608,6 +2768,62 @@ void dlio::OdomNode::getNextPose() {
       // keep the correction consistent with the governed pose (publish cloud,
       // keyframe transforms downstream both use T_corr).
       this->T_corr = this->T * this->T_prior.inverse();
+    }
+  }
+
+  // PHYSICS FUSE: clamp the TOTAL per-scan output step (any direction) to a
+  // physical bound -- the last line against takeoffs the governor's held-axis
+  // scope can't see (gate misses, unflagged axes, a diverging IMU prior). A
+  // tripped scan is physically implausible: flag it (diagnostics) and veto
+  // keyframing on it in updateKeyframes(). Same T/T_corr recompute mechanics
+  // as the governor, so downstream stays consistent. 0 caps = bit-identical.
+  this->fuse_tripped_scan_ = false;
+  if (this->fuse_max_step_trans_ > 0.0 || this->fuse_max_step_rot_ > 0.0) {
+    bool tripped = false;
+    const Eigen::Matrix4f T_fused = dlio::fusePose(
+        T_prev_governed, this->T,
+        static_cast<float>(this->fuse_max_step_trans_),
+        static_cast<float>(this->fuse_max_step_rot_), &tripped);
+    if (tripped) {
+      this->T = T_fused;
+      this->T_corr = this->T * this->T_prior.inverse();
+      this->fuse_tripped_scan_ = true;
+      ++this->fuse_trips_;
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "PHYSICS FUSE: per-scan output step exceeded the physical bound "
+          "(%ld trips total) -- estimate untrustworthy, step clamped, keyframe vetoed",
+          this->fuse_trips_);
+    }
+  }
+
+  // SLOSH GUARD: feed the signed output step along the tracked weak axis to
+  // the oscillation detector. The axis is the gate's dominant held translation
+  // direction, sign-aligned scan-to-scan for a stable identity, and PERSISTS
+  // across scans the gate misses (the oscillation does too -- gate chatter is
+  // part of the loop). Engagement drives extra velocity damping in
+  // updateState() and a keyframe veto in updateKeyframes().
+  if (this->slosh_enabled_) {
+    const auto& weak_dirs = this->gicp.lastDegenTransDirs();
+    if (!weak_dirs.empty()) {
+      Eigen::Vector3f a = weak_dirs.front().cast<float>();
+      const float n = a.norm();
+      if (n > 1e-6f) {
+        a /= n;
+        if (this->slosh_axis_valid_ && a.dot(this->slosh_axis_) < 0.f) { a = -a; }
+        this->slosh_axis_ = a;
+        this->slosh_axis_valid_ = true;
+      }
+    }
+    const Eigen::Vector3f step =
+        this->T.block<3, 1>(0, 3) - T_prev_governed.block<3, 1>(0, 3);
+    this->slosh_guard_.update(
+        this->slosh_axis_valid_ ? this->slosh_axis_.dot(step) : 0.f,
+        this->slosh_axis_valid_);
+    if (this->slosh_guard_.engaged()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "SLOSH GUARD engaged: oscillation along the weak axis "
+          "(flip fraction %.2f over %d steps) -- damping velocity, vetoing keyframes",
+          this->slosh_guard_.reversalFraction(), this->slosh_guard_.activeSamples());
     }
   }
 
@@ -2998,6 +3214,26 @@ void dlio::OdomNode::updateState() {
   this->state.p += dt * this->geo_Kp_ * err;
   this->state.v.lin.w += dt * this->geo_Kv_ * err;
 
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): along a held axis the
+  // registration supplies no correction, so the velocity state free-integrates
+  // IMU error and powers the dead-reckon runaway / sustains the slosh limit
+  // cycle. Damp the along-axis component while the axis is held (attenuate to
+  // (1-damp) per scan); cross-axis velocity untouched. 0 (default) = off.
+  if (this->geo_degen_vel_damp_ > 0.0) {
+    this->state.v.lin.w = dlio::attenuateAlongHeldAxes(
+        this->state.v.lin.w, this->gicp.lastDegenTransDirs(),
+        1.f - static_cast<float>(this->geo_degen_vel_damp_));
+  }
+  // Slosh-guard response: while the detector is engaged, damp the velocity
+  // along the TRACKED axis (persists across gate misses) -- the oscillation's
+  // energy store -- independent of whether this particular scan held it.
+  if (this->slosh_enabled_ && this->slosh_vel_damp_ > 0.0 &&
+      this->slosh_guard_.engaged() && this->slosh_axis_valid_) {
+    const float along = this->slosh_axis_.dot(this->state.v.lin.w);
+    this->state.v.lin.w -=
+        this->slosh_axis_ * (along * static_cast<float>(this->slosh_vel_damp_));
+  }
+
   this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
   this->state.q.x() += dt * this->geo_Kq_ * qcorr.x();
   this->state.q.y() += dt * this->geo_Kq_ * qcorr.y();
@@ -3307,6 +3543,15 @@ void dlio::OdomNode::updateKeyframes() {
     newKeyframe = false;
   }
 
+  // Runtime-guard vetoes (doc/RUNTIME_GUARDS.md): a fuse-tripped scan is
+  // physically implausible and must never be planted in the map; a scan taken
+  // while the slosh guard is engaged is mid-oscillation (the map-contamination
+  // loop the degenGate above targets, caught by the output-domain detector).
+  if (newKeyframe && (this->fuse_tripped_scan_ ||
+      (this->slosh_enabled_ && this->slosh_guard_.engaged()))) {
+    newKeyframe = false;
+  }
+
   if (newKeyframe) {
 
     // update keyframe vector
@@ -3320,6 +3565,12 @@ void dlio::OdomNode::updateKeyframes() {
       Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
       cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
       this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+    }
+    if (this->lidar_image_refs_enabled_) {
+      Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+      Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+      cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+      this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
     }
     lock.unlock();
 
@@ -3367,6 +3618,9 @@ void dlio::OdomNode::pruneKeyframes() {
     this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
     if (this->visual_map_enabled_ && prune_idx < (int)this->keyframe_visual_refs.size()) {
       this->keyframe_visual_refs.erase(this->keyframe_visual_refs.begin() + prune_idx);
+    }
+    if (this->lidar_image_refs_enabled_ && prune_idx < (int)this->keyframe_lidar_refs.size()) {
+      this->keyframe_lidar_refs.erase(this->keyframe_lidar_refs.begin() + prune_idx);
     }
     --this->num_processed_keyframes;
   }
@@ -3500,10 +3754,24 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // Concatenate the per-point visual refs in the SAME order as the cloud so
     // indices line up with the target points (only when the map term is on and
     // the refs are index-aligned with the keyframes).
+    //
+    // Locked: keyframes.size()/keyframe_{visual,lidar}_refs.size() read here
+    // race updateKeyframes()'s locked push_back on these same vectors on the
+    // main thread (2026-07-09 crash hunt, dliio lidar_image std::out_of_range
+    // combo crash) -- a push_back-triggered reallocation mid-read can produce
+    // a torn/garbage size compare, silently flipping build_lidar_refs or
+    // desyncing it from the keyframe count the per-`k` loop below later reads
+    // under its own lock. Cheap (two size() calls), so lock just for this.
+    lock.lock();
     const bool build_visual_refs = this->visual_map_enabled_
         && this->keyframe_visual_refs.size() == this->keyframes.size();
+    const bool build_lidar_refs = this->lidar_image_refs_enabled_
+        && this->keyframe_lidar_refs.size() == this->keyframes.size();
+    lock.unlock();
     std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
         build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
+    std::shared_ptr<std::vector<float>> submap_lidar_refs_ =
+        build_lidar_refs ? std::make_shared<std::vector<float>>() : nullptr;
 
     for (auto k : this->submap_kf_idx_curr) {
 
@@ -3516,7 +3784,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
       pcl::PointCloud<PointType>::ConstPtr kf_cloud = this->keyframes[k].second;
       std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
       std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
-          build_visual_refs ? this->keyframe_visual_refs[k] : nullptr;
+          build_visual_refs ? this->keyframe_visual_refs.at(k) : nullptr;
+      // .at(), not [k]: fail loud with a precise (small, sane) index/size pair
+      // right here if build_lidar_refs's earlier size compare was ever wrong,
+      // instead of silently reading past the end and propagating a garbage
+      // shared_ptr downstream (2026-07-09 crash hunt).
+      std::shared_ptr<const std::vector<float>> kf_lrefs =
+          build_lidar_refs ? this->keyframe_lidar_refs.at(k) : nullptr;
       lock.unlock();
 
       *submap_cloud_ += *kf_cloud;
@@ -3526,11 +3800,16 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
         submap_visual_refs_->insert( std::end(*submap_visual_refs_),
             std::begin(*kf_refs), std::end(*kf_refs) );
       }
+      if (build_lidar_refs && kf_lrefs) {
+        submap_lidar_refs_->insert( std::end(*submap_lidar_refs_),
+            std::begin(*kf_lrefs), std::end(*kf_lrefs) );
+      }
     }
 
     this->submap_cloud = submap_cloud_;
     this->submap_normals = submap_normals_;
     this->submap_visual_refs = submap_visual_refs_;
+    this->submap_lidar_refs = submap_lidar_refs_;
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
@@ -3731,6 +4010,20 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Lidar Map Active", (this->lidar_image_enabled_ && this->gicp.lastLidarMapCount() > 0) ? "1" : "0");
   kv("Lidar Map Points", std::to_string(this->gicp.lastLidarMapCount()));
   kv("Lidar Map RMS", fnum(this->gicp.lastLidarMapRms(), 4));
+  // Intensity-channel instrumentation (INTENSITY_AUDIT_2026-07-09): is the flow
+  // term actually engaging, and does the full-res image carry texture? Az-grad
+  // energy ~0 = channel information-poor at full res (image terms can't help);
+  // healthy graffiti walls give O(0.01-0.1) in /scale units.
+  kv("Lidar Flow Active", (this->lidar_flow_enabled_ && this->gicp.lastLidarFlowCount() > 0) ? "1" : "0");
+  kv("Lidar Flow Points", std::to_string(this->gicp.lastLidarFlowCount()));
+  kv("Lidar Flow RMS", fnum(this->gicp.lastLidarFlowRms(), 4));
+  kv("Lidar Image Az-Grad Energy", fnum(this->lidar_img_az_grad_energy_, 5));
+  // Runtime guards (doc/RUNTIME_GUARDS.md): trips/engagement are the operator's
+  // signal that the estimate is being actively bounded rather than trusted.
+  kv("Physics Fuse Trips (cumulative)", std::to_string(this->fuse_trips_));
+  kv("Slosh Guard Engaged", (this->slosh_enabled_ && this->slosh_guard_.engaged()) ? "1" : "0");
+  kv("Slosh Reversal Fraction", fnum(this->slosh_guard_.reversalFraction(), 3));
+  kv("Slosh Guard Activations (cumulative)", std::to_string(this->slosh_guard_.activations()));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);

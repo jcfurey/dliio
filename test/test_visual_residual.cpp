@@ -543,6 +543,87 @@ TEST(LidarMapResidual, ImageScaleRetargetsReference) {
   EXPECT_GT(cost_mis, 0.1);
 }
 
+// Keyframe-image references (INTENSITY_AUDIT_2026-07-09): when a size-matched
+// refs list is set, the reference brightness comes from it -- NOT from the
+// target's .reflectivity field. Field deliberately garbage; refs = the image
+// value at each point's own projection, so cost is 0 iff the refs are used.
+TEST(LidarMapResidual, KeyframeRefsReplaceFieldReference) {
+  TestableGICP gicp;
+  gicp.setLidarMapWeight(1.0f);
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  gicp.setLidarImage(img);
+
+  auto target = makeLidarTarget();
+  auto refs = std::make_shared<std::vector<float>>(target->size(), -1.f);
+  for (size_t i = 0; i < target->size(); ++i) {
+    auto& p = target->points[i];
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    (*refs)[i] = bilinearSampleRamp(img, u, v);   // already /scale units
+    p.reflectivity = 12345.f;                     // garbage: must be ignored
+  }
+  gicp.setInputTarget(target);
+  gicp.setTargetLidarRefs(refs);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  double cost = gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(gicp.lastLidarMapCount(), 20);
+  EXPECT_NEAR(cost, 0.0, 1e-9);                   // refs used, field ignored
+}
+
+// A refs list whose size doesn't match the target must be IGNORED (stale refs
+// after a submap swap): the term falls back to the field reference.
+TEST(LidarMapResidual, KeyframeRefsSizeMismatchFallsBackToField) {
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto setup = [&](TestableGICP& g) {
+    g.setLidarMapWeight(1.0f);
+    g.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+    g.setLidarFrame(Eigen::Isometry3f::Identity());
+    g.setLidarImage(img);
+    auto target = makeLidarTarget();
+    for (auto& p : target->points) {
+      float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+      p.reflectivity = bilinearSampleRamp(img, u, v) * 255.f;   // exact field ref
+    }
+    g.setInputTarget(target);
+    return target;
+  };
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+
+  TestableGICP base; setup(base);
+  const double cost_base = base.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  const int count_base = base.lastLidarMapCount();
+
+  TestableGICP stale;
+  auto target = setup(stale);
+  auto bad = std::make_shared<std::vector<float>>(target->size() + 7, 0.9f);  // wrong size
+  stale.setTargetLidarRefs(bad);
+  const double cost_stale = stale.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_EQ(stale.lastLidarMapCount(), count_base);
+  EXPECT_NEAR(cost_stale, cost_base, 1e-12);      // bit-identical fallback
+}
+
+// Invalid entries (< 0: the point didn't project into its keyframe's image)
+// are skipped, not fed to the residual as garbage.
+TEST(LidarMapResidual, KeyframeRefsInvalidEntriesSkipped) {
+  TestableGICP gicp;
+  gicp.setLidarMapWeight(1.0f);
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  gicp.setLidarImage(img);
+  auto target = makeLidarTarget();
+  gicp.setInputTarget(target);
+  auto refs = std::make_shared<std::vector<float>>(target->size(), -1.f);  // ALL invalid
+  gicp.setTargetLidarRefs(refs);
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  double cost = gicp.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_EQ(gicp.lastLidarMapCount(), 0);
+  EXPECT_NEAR(cost, 0.0, 1e-12);
+  EXPECT_LT(b.norm(), 1e-12);
+}
+
 TEST(LidarMapResidual, AnalyticJacobianMatchesFiniteDifference) {
   TestableGICP gicp;
   gicp.setLidarMapWeight(1.0f);

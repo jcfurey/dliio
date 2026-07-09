@@ -25,6 +25,18 @@ in-tree terms):
 Controls: `setLidarFlowWeight`, `setLidarFlowPrev(prev_img, T_lw_prev)`; params
 `odom/lidar_image/flow/{enabled, weight}`.
 
+**2026-07-09 retrofit** (`doc/INTENSITY_AUDIT_2026-07-09.md`): the original
+reference (`point's own brightness` = the source point's `.reflectivity`) is
+VOXEL-AVERAGED, so the term compared full-res texture against a blurred
+reference. `odom/lidar_image/flow/imageRef` (default true) samples the
+reference from the CURRENT scan's full-res image at the point's prior-pose
+projection instead (image-to-image, both sides pre-voxel), and
+`odom/lidar_image/flow/patch` (default 0, max 3) compares a zero-mean
+(2P+1)² window per point (COIN-LIO-style patches; per-point weight divided by
+the pixel count, so total influence is patch-size invariant). `imageRef:
+false, patch: 0` reproduces the original term bit-identically. Diagnostics:
+`Lidar Flow Active/Points/RMS` in `/diagnostics`.
+
 ## Threading safety (the part that warranted its own PR)
 
 The term needs **cross-scan state** (the previous image + pose) read inside an
