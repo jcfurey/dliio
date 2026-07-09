@@ -64,4 +64,23 @@ inline double xicpPartialScale(double eigval, double kappa_partial,
   return (eigval - kappa_partial) / (kappa_full - kappa_partial);
 }
 
+// Budgeted partial-band admission (2026-07-08 runaway fix). The partial band
+// admits keep*comp of the data update along a marginal eigen-direction; unlike
+// the visual-rescue path (budgeted since inception) this admission was uncapped
+// -- fail-OPEN when the marginal-band signal is dishonest (aliased photometric
+// drive both lifts the weak axis into the band and supplies the pull). Returns
+// keep*comp clamped so the cumulative admitted magnitude (*used, per scan)
+// never exceeds cap; cap <= 0 returns the raw keep*comp (unbudgeted,
+// bit-identical). Matches Tuna et al.'s CONTROLLED partial update semantics.
+inline double xicpBudgetedAdmit(double comp, double keep, double cap, double* used) {
+  double admit = comp * keep;
+  if (cap > 0.0 && used != nullptr) {
+    const double remaining = (cap - *used > 0.0) ? (cap - *used) : 0.0;
+    if (admit >  remaining) { admit =  remaining; }
+    if (admit < -remaining) { admit = -remaining; }
+    *used += (admit < 0.0) ? -admit : admit;
+  }
+  return admit;
+}
+
 }  // namespace nano_gicp

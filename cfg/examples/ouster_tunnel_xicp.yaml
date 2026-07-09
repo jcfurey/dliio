@@ -26,3 +26,10 @@
   ros__parameters:
     odom/xicp/ternaryEnabled: true
     odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); n=24-validated
+    # Fail-bounded partial band (2026-07-08 runaway fix): budget the per-scan
+    # partial-band admissions to the governor's physical caps. Set to 0.0 to
+    # reproduce the pre-budget (fail-open) behavior for A/B.
+    odom/xicp/partialBudgetTrans: 0.15   # [m]  per scan
+    odom/xicp/partialBudgetRot: 0.05     # [rad] per scan
+    # Anti map-contamination (tunnel-slosh fix): don't keyframe a sloshing pose.
+    odom/keyframe/degenGate: true

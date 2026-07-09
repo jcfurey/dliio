@@ -1,0 +1,90 @@
+# robot_localization EKF fusing dliio with a second odometry source
+# (doc/FUSION_ARCHITECTURE.md). Requires: ros-<distro>-robot-localization.
+#
+# Architecture (the CompSLAM/SuperLoc lesson — redundancy over perfection):
+#   dliio            -> 6-DOF pose, DIFFERENTIAL (pose deltas), with the
+#                       degeneracy governor's per-axis covariance inflation ON
+#                       (cfg/examples/ouster_tunnel_rl.yaml) so the held/sloshing
+#                       tunnel axis arrives honestly de-weighted;
+#   rig kinematic    -> body-frame forward velocity (wheel/track odometry) — the
+#                       along-tunnel information LiDAR cannot observe;
+#   IMU              -> angular velocity.
+# The EKF owns odom->base_link (dliio runs with odom/publishTf: false).
+#
+# GIGO caveat: this layer SMOOTHS the output and carries the degenerate axis on
+# the kinematic source; it does NOT stop dliio's internal submap contamination —
+# pair with odom/keyframe/degenGate + the X-ICP partial budget (same overlay).
+ekf_filter_node:
+  ros__parameters:
+    use_sim_time: true          # bag replay; set false live
+    frequency: 50.0
+    sensor_timeout: 0.2
+    two_d_mode: false
+    publish_tf: true            # EKF owns odom->base_link
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # --- dliio odometry (remapped in the launch to dlio_odom_node's `odom`) ---
+    odom0: dlio/odom
+    # x y z | r p y | vx vy vz | vr vp vy | ax ay az
+    odom0_config: [true,  true,  true,
+                   true,  true,  true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    # DIFFERENTIAL: fuse pose *deltas*, weighted by dliio's reported covariance.
+    # With the governor's rank-1 inflation on held axes, slosh increments along
+    # the tunnel axis arrive with ~covPosVar variance and are largely ignored,
+    # while the five observable axes pass at full weight.
+    odom0_differential: true
+    odom0_relative: false
+    odom0_queue_size: 5
+    # Reject residual map-lock jumps that survive the covariance de-weighting.
+    odom0_pose_rejection_threshold: 3.0     # Mahalanobis
+    # dliio twist is NOT fused: during slosh its velocity state is the
+    # oscillation's flywheel (doc/FUSION_ARCHITECTURE.md).
+
+    # --- rig kinematic odometry (wheel/track; remap in the launch) ---
+    # Body-frame forward velocity is the one signal that observes along-tunnel
+    # motion. Enable vy too for omnidirectional platforms.
+    odom1: rig/odom
+    odom1_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,
+                   false, false, true,
+                   false, false, false]
+    odom1_differential: false
+    odom1_queue_size: 10
+    odom1_twist_rejection_threshold: 5.0
+
+    # --- IMU: angular velocity only. dliio already integrates the IMU tightly;
+    # re-fusing orientation/accel here (no bias states in r_l) adds drift. ---
+    imu0: imu/data
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  true,  true,  true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_remove_gravitational_acceleration: true
+    imu0_queue_size: 50
+
+    # Along-axis process noise slightly raised so the kinematic source, not the
+    # motion model, dominates x between updates.
+    process_noise_covariance: [0.05, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.03, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.02, 0.0,  0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,  0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01, 0.0,
+                               0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.01]

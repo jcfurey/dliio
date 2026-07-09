@@ -368,6 +368,8 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->current_genz_alpha_ = 1.0f;  // pure point-to-plane until a scan sets it
   this->xicp_ternary_enabled_ = false;  // X-ICP ternary gate OFF -> existing gate (bit-identical)
   this->xicp_full_ratio_ = 0.05f;        // localizable bar; > degeneracy_thresh_ratio_ (0.005 default)
+  this->xicp_partial_budget_trans_ = 0.f;  // per-scan partial-band admission cap [m]; 0 = unbudgeted
+  this->xicp_partial_budget_rot_ = 0.f;    // per-scan partial-band admission cap [rad]; 0 = unbudgeted
   this->saliency_enabled_ = false;       // anti-dilution saliency weighting OFF -> unit weights (bit-identical)
   this->saliency_boost_ = 1.0f;          // weight of a maximally-salient point (1 = off)
   this->last_lidar_map_rms_ = 0.0f;
@@ -654,6 +656,12 @@ template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setXicpTernary(bool enabled, float full_ratio) {
     this->xicp_ternary_enabled_ = enabled;
     this->xicp_full_ratio_ = (full_ratio > 0.f) ? full_ratio : 0.f;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setXicpPartialBudget(float max_trans, float max_rot) {
+    this->xicp_partial_budget_trans_ = (max_trans > 0.f) ? max_trans : 0.f;
+    this->xicp_partial_budget_rot_ = (max_rot > 0.f) ? max_rot : 0.f;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -1001,6 +1009,15 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // still letting vision refine the prior.
     double rescued_t_used = 0.0;  // [m]   translation budget consumed this scan
     double rescued_r_used = 0.0;  // [rad] rotation budget consumed this scan
+    // X-ICP partial-band admission budgets (FINDINGS_2026-07-08 runaway fix):
+    // the partial band ADMITS keep*comp along a marginal axis with, previously,
+    // no cap -- fail-open when the marginal-band signal is dishonest (aliased
+    // photometric drive / contaminated map locks). Budgeting the cumulative
+    // admitted motion per scan makes X-ICP fail-BOUNDED, matching the rescue
+    // path's budget and Tuna et al.'s controlled partial update. 0 = unbudgeted
+    // (bit-identical to the pre-budget behavior).
+    double xicp_partial_t_used = 0.0;  // [m]
+    double xicp_partial_r_used = 0.0;  // [rad]
 
     for (int i = 0; i < this->max_iterations_; ++i) {
         update_correspondences(trans);
@@ -1217,7 +1234,13 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                             (this->prob_noise_floor_rot_ > 0.f) ? this->prob_noise_floor_rot_ : rr_thresh,
                             this->prob_confidence_s_, this->prob_spread_)
                         : softGateKeepFraction(lam, rr_thresh, this->degeneracy_softness_));
-                dx.head<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
+                double admit = comp * keep;
+                if (this->xicp_ternary_enabled_ && keep > 0.0 && keep < 1.0) {
+                    // budget the partial-band admission (0 cap = unbudgeted)
+                    admit = xicpBudgetedAdmit(comp, keep,
+                        static_cast<double>(this->xicp_partial_budget_rot_), &xicp_partial_r_used);
+                }
+                dx.head<3>() -= v * (comp - admit);   // hold everything except the (budgeted) admission
                 // Belt-and-suspenders for the X-ICP ternary gate: a PARTIAL-admit
                 // band axis (rr_thresh < lam < rr_full, 0 < keep < 1) takes a
                 // partial update but is not hard-degenerate, so the block above did
@@ -1262,7 +1285,12 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                             (this->prob_noise_floor_trans_ > 0.f) ? this->prob_noise_floor_trans_ : tt_thresh,
                             this->prob_confidence_s_, this->prob_spread_)
                         : softGateKeepFraction(lam, tt_thresh, this->degeneracy_softness_));
-                dx.tail<3>() -= v * comp * (1.0 - keep);   // hold (1 - keep) of the prior
+                double admit = comp * keep;
+                if (this->xicp_ternary_enabled_ && keep > 0.0 && keep < 1.0) {
+                    admit = xicpBudgetedAdmit(comp, keep,
+                        static_cast<double>(this->xicp_partial_budget_trans_), &xicp_partial_t_used);
+                }
+                dx.tail<3>() -= v * (comp - admit);   // hold everything except the (budgeted) admission
                 // Belt-and-suspenders (see the rotation block): record an X-ICP
                 // PARTIAL-admit-band translation axis (tt_thresh < lam < tt_full)
                 // for the governor too, so its per-scan cap also bounds a runaway

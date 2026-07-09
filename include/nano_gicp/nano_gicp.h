@@ -119,6 +119,7 @@ void directionSeparateTerm(const Eigen::Matrix<double, 6, 6>& H_geo, double rati
                            Eigen::Matrix<double, 6, 6>* H_term,
                            Eigen::Matrix<double, 6, 1>* b_term);
 
+
 // Margin-adaptive clamp scale: shrinks the IMU-consistency clamp cap as the
 // geometric trust margin degrades, so the correction is bounded harder toward the
 // IMU prior exactly where observability collapses (e.g. a specular floor dropout
@@ -359,6 +360,12 @@ public:
   // should exceed degeneracyThreshRatio. When enabled this REPLACES the soft/prob
   // keep-fraction; enabled = false (default) -> the existing gate, bit-identical.
   void setXicpTernary(bool enabled, float full_ratio);
+  // Per-scan budget on the ternary gate's PARTIAL-band admissions [m]/[rad]
+  // (xicpBudgetedAdmit): caps the cumulative motion admitted along marginal
+  // directions each scan, making X-ICP fail-bounded instead of fail-open.
+  // 0 (default) = unbudgeted, bit-identical. Pair with the governor's
+  // maxStep caps (e.g. 0.15 m / 0.05 rad).
+  void setXicpPartialBudget(float max_trans, float max_rot);
   // Saliency-weighted point selection (saliency_weight.h, anti-dilution). Up-weight
   // rare salient source points (edges/ribs/corners, from the local covariance
   // shape) by up to `boost` so the abundant planar walls do not swamp the weak
@@ -652,6 +659,8 @@ protected:
   float current_genz_alpha_;          // alpha in effect this iteration (lagged); 1 = pure point-to-plane
   bool  xicp_ternary_enabled_;        // X-ICP ternary localizability gate; off = existing binary/soft gate
   float xicp_full_ratio_;             // upper (localizable) bar as a fraction of lambda_max (partial bar = degeneracy_thresh_ratio_)
+  float xicp_partial_budget_trans_;   // per-scan partial-band admission cap [m]; 0 = unbudgeted
+  float xicp_partial_budget_rot_;     // per-scan partial-band admission cap [rad]; 0 = unbudgeted
   bool  saliency_enabled_;            // anti-dilution saliency weighting of the geometric term; off = unit weights
   float saliency_boost_;              // weight of a maximally-salient source point (1 = off)
   std::vector<float> source_saliency_; // per-source-point saliency in [0,1] (filled only when saliency_enabled_)

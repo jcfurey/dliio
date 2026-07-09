@@ -53,6 +53,45 @@ TEST(XIcpLocalizability, MisorderedThresholdsAreSafe) {
   EXPECT_DOUBLE_EQ(xicpPartialScale(1.0, 5.0, 2.0), 0.0);
 }
 
+// --- Budgeted partial-band admission (xicpBudgetedAdmit, 2026-07-08 fix) ---
+
+// cap <= 0 -> unbudgeted: the raw keep*comp passes through and `used` is
+// untouched (bit-identical to the pre-budget behavior).
+TEST(XIcpBudget, UnbudgetedIsRawAdmit) {
+  double used = 0.0;
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(0.4, 0.5, 0.0, &used), 0.2);
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(-0.4, 0.5, -1.0, &used), -0.2);
+  EXPECT_DOUBLE_EQ(used, 0.0);
+}
+
+// Admission under the cap passes through and accrues into `used`.
+TEST(XIcpBudget, UnderCapPassesAndAccrues) {
+  double used = 0.0;
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(0.10, 0.5, 0.15, &used), 0.05);
+  EXPECT_DOUBLE_EQ(used, 0.05);
+}
+
+// A large marginal pull is clamped to the remaining budget -- the fail-open
+// path of the 2026-07-08 runaway (uncapped keep*comp) is closed.
+TEST(XIcpBudget, ClampsToRemainingBudget) {
+  double used = 0.0;
+  // wants 0.5*2.0 = 1.0 m; only 0.15 available.
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(2.0, 0.5, 0.15, &used), 0.15);
+  EXPECT_DOUBLE_EQ(used, 0.15);
+  // budget exhausted: nothing more admitted this scan.
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(2.0, 0.5, 0.15, &used), 0.0);
+  EXPECT_DOUBLE_EQ(used, 0.15);
+}
+
+// Accumulation across calls (multiple marginal axes / LM iterations): the cap
+// bounds the CUMULATIVE admitted magnitude, sign-independent.
+TEST(XIcpBudget, AccumulatesAcrossCallsSignIndependent) {
+  double used = 0.0;
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit( 0.16, 0.5, 0.15, &used),  0.08);
+  EXPECT_DOUBLE_EQ(nano_gicp::xicpBudgetedAdmit(-0.16, 0.5, 0.15, &used), -0.07);  // clamped to remaining
+  EXPECT_DOUBLE_EQ(used, 0.15);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
