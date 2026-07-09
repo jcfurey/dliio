@@ -605,8 +605,20 @@ private:
   // --- COIN-LIO LiDAR intensity-image term ---
   bool lidar_image_enabled_;
   double lidar_image_weight_;
+  // Keyframe-image references for the map term (INTENSITY_AUDIT_2026-07-09):
+  // per-point brightness sampled from each keyframe's FULL-RES reflectivity
+  // image at creation (index-aligned with `keyframes`, /scale, < 0 invalid);
+  // concatenated into submap_lidar_refs in buildSubmap and handed to the gicp
+  // so the map term's reference carries pre-voxel texture.
+  bool lidar_image_refs_enabled_ = false;
+  std::vector<std::shared_ptr<const std::vector<float>>> keyframe_lidar_refs;
+  std::shared_ptr<const std::vector<float>> submap_lidar_refs;
+  std::shared_ptr<const std::vector<float>>
+  sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                          const Eigen::Isometry3f& T_lw, const cv::Mat& img);
   cv::Mat lidar_refl_img_;             // current scan reflectivity image (/scale), CV_32FC1
   cv::Mat lidar_range_img_;            // current scan range image [m], CV_32FC1 (occlusion check)
+  float lidar_img_az_grad_energy_ = 0.f;  // mean |dI/dcol| over valid pairs (/scale units): full-res texture present?
   float lidar_az_a_, lidar_az_b_, lidar_el_a_, lidar_el_b_;  // self-calibrated spherical model
   std::vector<float> lidar_el_lut_;    // per-row mean elevation [rad] (non-uniform beams)
   double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
@@ -615,6 +627,8 @@ private:
   bool lidar_dir_separated_enabled_ = false;  // restrict the lidar term to the weak subspace (LOFF)
   bool lidar_flow_enabled_ = false;    // frame-to-frame LiDAR flow term (EXPLORATION #2)
   double lidar_flow_weight_ = 0.0;     // flow term weight (count-normalized); 0 = off
+  bool lidar_flow_image_ref_ = true;   // reference = current full-res image (true) vs voxel-averaged field (false)
+  int lidar_flow_patch_ = 0;           // patch half-width [0,3]; 0 = single pixel (INTENSITY_AUDIT_2026-07-09)
   cv::Mat lidar_flow_prev_img_;        // previous scan's image, stashed for the flow term
   Eigen::Isometry3f lidar_flow_T_lw_prev_ = Eigen::Isometry3f::Identity();  // prev scan corrected world->lidar
   bool lidar_flow_prev_valid_ = false; // a previous image has been stashed

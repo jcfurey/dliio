@@ -1234,23 +1234,28 @@ TEST(NanoGICP, LidarFlowNoPrevIsSafe) {
   EXPECT_LT((g.getFinalTransformation().block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm(), 0.03f);
 }
 
-// Exercise the flow accumulator's PARALLEL loop end-to-end (a previous image +
-// spherical model are set, weight > 0): this is the ASan/UBSan/TSan coverage of
-// the new photometric loop + bilinearSample reads + cross-scan state. Assertions
+// Exercise the flow accumulator's PARALLEL loop end-to-end in the DEFAULT
+// image-to-image mode with a patch (prev + current images + spherical model set,
+// weight > 0): ASan/UBSan/TSan coverage of the photometric loop, patch-window
+// bilinearSample reads (both images), and the stack patch buffers. Assertions
 // are loose (finite, bounded) -- correctness on real data is a bag question.
 TEST(NanoGICP, LidarFlowAccumulatorRunsUnderSanitizers) {
   auto target = makeCorner(1.0f, 0.02f);
   auto source = makeCorner(1.0f, 0.02f);
   auto g = makeGICP();
   const int rows = 64, cols = 512;
-  cv::Mat prev(rows, cols, CV_32FC1);
+  cv::Mat prev(rows, cols, CV_32FC1), cur(rows, cols, CV_32FC1);
   for (int r = 0; r < rows; ++r)
-    for (int c = 0; c < cols; ++c)
+    for (int c = 0; c < cols; ++c) {
       prev.at<float>(r, c) = 0.001f * static_cast<float>((c * 7 + r * 3) % 97);  // textured
+      cur.at<float>(r, c)  = 0.001f * static_cast<float>((c * 5 + r * 11) % 89);
+    }
   const float az_a = 2.f * static_cast<float>(M_PI) / cols, az_b = -static_cast<float>(M_PI);
   const float el_a = 0.6f / rows, el_b = -0.3f;
   g.setLidarProjection(az_a, az_b, el_a, el_b);
+  g.setLidarImage(cur);                              // reference image (image_ref mode)
   g.setLidarFlowPrev(prev, Eigen::Isometry3f::Identity());
+  g.setLidarFlowMode(true, 2);                       // image-to-image, 5x5 patch
   g.setLidarFlowWeight(0.01f);
   g.setInputTarget(target);
   g.setInputSource(source);
@@ -1259,6 +1264,55 @@ TEST(NanoGICP, LidarFlowAccumulatorRunsUnderSanitizers) {
   const float tnorm = T.block<3, 1>(0, 3).norm();  // hoisted: comma in <3,1> breaks the macro
   EXPECT_TRUE(T.allFinite());                    // accumulator ran without NaN / crash
   EXPECT_LT(tnorm, 5.0f);                         // bounded
+}
+
+// Legacy point-field reference mode (imageRef false, patch 0): the ORIGINAL
+// term's path -- reference = the source point's own .reflectivity -- must still
+// run (no current image required) and stay finite. Guards the bit-identical
+// fallback the imageRef param promises.
+TEST(NanoGICP, LidarFlowLegacyFieldRefStillRuns) {
+  auto target = makeCorner(1.0f, 0.02f);
+  auto source = makeCorner(1.0f, 0.02f);
+  auto g = makeGICP();
+  const int rows = 64, cols = 512;
+  cv::Mat prev(rows, cols, CV_32FC1);
+  for (int r = 0; r < rows; ++r)
+    for (int c = 0; c < cols; ++c)
+      prev.at<float>(r, c) = 0.001f * static_cast<float>((c * 7 + r * 3) % 97);
+  const float az_a = 2.f * static_cast<float>(M_PI) / cols, az_b = -static_cast<float>(M_PI);
+  const float el_a = 0.6f / rows, el_b = -0.3f;
+  g.setLidarProjection(az_a, az_b, el_a, el_b);
+  g.setLidarFlowPrev(prev, Eigen::Isometry3f::Identity());
+  g.setLidarFlowMode(false, 0);                      // legacy: point-field reference
+  g.setLidarFlowWeight(0.01f);
+  g.setInputTarget(target);
+  g.setInputSource(source);
+  Cloud a; g.align(a);
+  const Eigen::Matrix4f T = g.getFinalTransformation();
+  const float tnorm = T.block<3, 1>(0, 3).norm();
+  EXPECT_TRUE(T.allFinite());
+  EXPECT_LT(tnorm, 5.0f);
+}
+
+// Image-ref mode with NO current image set must no-op (the guard), not crash:
+// a well-conditioned solve is unaffected.
+TEST(NanoGICP, LidarFlowImageRefWithoutImageIsSafe) {
+  auto target = makeCorner(1.0f, 0.05f);
+  Eigen::Matrix4f T_true = Eigen::Matrix4f::Identity();
+  T_true.block<3, 1>(0, 3) = Eigen::Vector3f(0.03f, -0.02f, 0.04f);
+  auto source = transformCloud(target, T_true.inverse());
+  auto g = makeGICP();
+  const int rows = 32, cols = 256;
+  cv::Mat prev(rows, cols, CV_32FC1, cv::Scalar(0.5f));
+  g.setLidarProjection(2.f * static_cast<float>(M_PI) / cols, -static_cast<float>(M_PI),
+                       0.6f / rows, -0.3f);
+  g.setLidarFlowPrev(prev, Eigen::Isometry3f::Identity());
+  g.setLidarFlowMode(true, 1);   // image_ref, but setLidarImage never called
+  g.setLidarFlowWeight(1.0f);
+  g.setInputTarget(target); g.setInputSource(source);
+  Cloud a; g.align(a);
+  ASSERT_TRUE(g.hasConverged());
+  EXPECT_LT((g.getFinalTransformation().block<3, 1>(0, 3) - T_true.block<3, 1>(0, 3)).norm(), 0.03f);
 }
 
 // A non-finite pose guess (the diverged deg=6 case that fed NaN queries to the

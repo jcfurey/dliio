@@ -337,6 +337,13 @@
     # absolute-anchor gate budget above). Needs an organized scan. OFF by default.
     odom/lidar_image/enabled: false
     odom/lidar_image/weight: 0.0
+    # Keyframe-image references (doc/INTENSITY_AUDIT_2026-07-09.md): the map
+    # term's reference normally comes from the target point's .reflectivity
+    # field, which is voxel-AVERAGED (0.25m leaf) -- graffiti-scale texture is
+    # blurred away before the residual sees it. imageRefs samples each
+    # keyframe's FULL-RES image per point at keyframe creation instead.
+    # false (default) = field reference, bit-identical.
+    odom/lidar_image/imageRefs: false
     odom/lidar_image/rangeAbsTol: 0.5   # occlusion: absolute range tol [m] for a projected map point
     odom/lidar_image/rangeRelTol: 0.1   # occlusion: relative range tol (fraction of pixel range)
 
@@ -369,6 +376,16 @@
     # off / bit-identical.
     odom/lidar_image/flow/enabled: false
     odom/lidar_image/flow/weight: 0.0   # count-normalized; comparable to lidar_image/weight
+    # Flow reference mode (doc/INTENSITY_AUDIT_2026-07-09.md). imageRef true
+    # (default): the reference brightness is sampled from the CURRENT scan's
+    # full-resolution image at the point's prior-pose projection, so BOTH sides of
+    # the residual carry pre-voxel texture (the 0.25m voxel average destroys
+    # graffiti-scale strokes; the point's .reflectivity field is post-voxel).
+    # false = legacy point-field reference (bit-identical to the original term).
+    # patch: half-width of the zero-mean (2P+1)^2 window compared per point
+    # (COIN-LIO-style patches; 0 = single pixel; clamped to [0,3]).
+    odom/lidar_image/flow/imageRef: true
+    odom/lidar_image/flow/patch: 0
 
     # GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L
     # 2025). On an ill-conditioned scan (geometric translation lambda_min/lambda_max

@@ -756,6 +756,15 @@ void dlio::OdomNode::getParams() {
       "Enable the COIN-LIO LiDAR intensity-image frame-to-map term (organized scan + reflectivity)");
   dlio::declare_param(this, "odom/lidar_image/weight", this->lidar_image_weight_, 0.0,
       "Weight of the LiDAR intensity-image residual relative to the geometric GICP term");
+  // Keyframe-image references (doc/INTENSITY_AUDIT_2026-07-09.md): the map term's
+  // reference brightness normally comes from the target point's .reflectivity
+  // field, which is VOXEL-AVERAGED (0.25m leaf) -- the graffiti-scale texture the
+  // residual keys on is blurred away before the term ever sees it. When enabled,
+  // each keyframe samples per-point brightness from its FULL-RESOLUTION
+  // reflectivity image at creation and the submap hands those to the gicp.
+  // Off (default) = field reference, bit-identical.
+  dlio::declare_param(this, "odom/lidar_image/imageRefs", this->lidar_image_refs_enabled_, false,
+      "Map-term reference from each keyframe's full-res image (true) vs the voxel-averaged field (false)");
   dlio::declare_param(this, "odom/lidar_image/rangeAbsTol", this->lidar_range_abs_tol_, 0.5,
       "Occlusion check: absolute range tolerance [m] for accepting a projected map point");
   dlio::declare_param(this, "odom/lidar_image/rangeRelTol", this->lidar_range_rel_tol_, 0.1,
@@ -784,6 +793,16 @@ void dlio::OdomNode::getParams() {
       "Enable the frame-to-frame LiDAR flow term (registers against the previous scan's image)");
   dlio::declare_param(this, "odom/lidar_image/flow/weight", this->lidar_flow_weight_, 0.0,
       "Weight of the frame-to-frame LiDAR flow residual (count-normalized; 0 = off)", 0.0, 1e6);
+  // Flow reference mode (doc/INTENSITY_AUDIT_2026-07-09.md): imageRef samples the
+  // reference brightness from the CURRENT scan's full-resolution image, so both
+  // sides of the residual carry pre-voxel texture (graffiti); false = legacy
+  // voxel-averaged .reflectivity reference (bit-identical to the original term).
+  // patch compares a zero-mean (2P+1)^2 window per point (COIN-LIO-style patches;
+  // 0 = single pixel).
+  dlio::declare_param(this, "odom/lidar_image/flow/imageRef", this->lidar_flow_image_ref_, true,
+      "Flow reference from the current full-res image (true) vs the voxel-averaged point field (false)");
+  dlio::declare_param(this, "odom/lidar_image/flow/patch", this->lidar_flow_patch_, 0,
+      "Flow patch half-width in pixels (0 = single pixel; clamped to [0,3] by the gicp)");
   // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
   // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
   // mix an isotropic point-to-point metric into the GICP cost to regularize the
@@ -1450,7 +1469,8 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   // Done before NaN removal so indices still line up 1:1 with the message.
   // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
   // 3D-spatial reflectivity photometric term).
-  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_) {
+  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_ ||
+      this->lidar_flow_enabled_) {
     // Which cloud field feeds the per-point image slot (point.reflectivity).
     // Default 'reflectivity' -> bit-identical. The COIN-LIO image term may select
     // a higher-texture channel (odom/lidar_image/channel = intensity|ambient);
@@ -1509,9 +1529,11 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
   }
 
   // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
-  // removal flattens it. No-op if the cloud isn't organized.
+  // removal flattens it. No-op if the cloud isn't organized. The flow term
+  // consumes the same image, so a flow-only config also builds it (previously
+  // it silently no-oped without the map term).
   this->lidar_img_ready_ = false;
-  if (this->lidar_image_enabled_ && pc->height > 1 &&
+  if ((this->lidar_image_enabled_ || this->lidar_flow_enabled_) && pc->height > 1 &&
       original_scan_->height == pc->height && original_scan_->width == pc->width) {
     this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
   }
@@ -1848,6 +1870,15 @@ void dlio::OdomNode::initializeInputTarget() {
     Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
     cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
     this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+  }
+  // Keyframe-image LiDAR refs (INTENSITY_AUDIT_2026-07-09): same prior-pose
+  // convention as the visual refs -- current_scan is prior-frame world, and the
+  // scalar brightness survives the later T_corr re-transform.
+  if (this->lidar_image_refs_enabled_) {
+    Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+    Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+    cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+    this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
   }
 
 }
@@ -2356,6 +2387,63 @@ dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::Const
   return refs;
 }
 
+std::shared_ptr<const std::vector<float>>
+dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                                        const Eigen::Isometry3f& T_lw, const cv::Mat& img) {
+  // Per-point brightness from this keyframe's FULL-RES reflectivity image
+  // (INTENSITY_AUDIT_2026-07-09): the reference the map term keys on, sampled
+  // BEFORE the voxel average blurs the texture away. Always returns a list sized
+  // cloud->size() (-1 = invalid) so it stays index-aligned with the keyframe
+  // cloud through submap assembly. The scalar is pose-independent, so it
+  // survives buildKeyframesAndSubmap's later T_corr re-transform untouched.
+  auto refs = std::make_shared<std::vector<float>>(cloud->size(), -1.f);
+  if (img.empty() || img.type() != CV_32FC1 || !this->lidar_proj_ready_) {
+    return refs;
+  }
+  const Eigen::Matrix3f R = T_lw.linear();
+  const Eigen::Vector3f t = T_lw.translation();
+  const float inv_az_a = 1.f / this->lidar_az_a_;
+  const float inv_el_a = 1.f / this->lidar_el_a_;
+  const bool use_lut = (static_cast<int>(this->lidar_el_lut_.size()) == img.rows
+                        && !this->lidar_el_lut_.empty());
+  const float bw = 2.f;
+  const float umax = static_cast<float>(img.cols) - 1.f - bw;
+  const float vmax = static_cast<float>(img.rows) - 1.f - bw;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    const auto& p = cloud->at(i);
+    const Eigen::Vector3f Pl = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+    const float rxy2 = Pl.x() * Pl.x() + Pl.y() * Pl.y();
+    if (rxy2 < 1e-6f) { continue; }
+    const float az = std::atan2(Pl.y(), Pl.x());
+    const float el = std::atan2(Pl.z(), std::sqrt(rxy2));
+    const float u = (az - this->lidar_az_b_) * inv_az_a;
+    float v;
+    if (use_lut) {
+      // Invert the monotonic per-row elevation LUT (non-uniform OS beams);
+      // outside its coverage -> invalid.
+      const auto& lut = this->lidar_el_lut_;
+      const int n = static_cast<int>(lut.size());
+      const bool inc = lut[n - 1] >= lut[0];
+      bool found = false;
+      for (int k = 0; k < n - 1; ++k) {
+        const float a = lut[k], b = lut[k + 1];
+        const float lo = inc ? a : b, hi = inc ? b : a;
+        if (el >= lo && el <= hi && std::abs(b - a) > 1e-9f) {
+          v = static_cast<float>(k) + (el - a) / (b - a);
+          found = true;
+          break;
+        }
+      }
+      if (!found) { continue; }
+    } else {
+      v = (el - this->lidar_el_b_) * inv_el_a;
+    }
+    if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }  // NaN-safe
+    (*refs)[i] = bilinearF(img, u, v);   // image is already /scale normalized
+  }
+  return refs;
+}
+
 void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::Ptr& organized,
                                              int width, int height, int kernel) {
   if (kernel <= 1) { return; }
@@ -2421,6 +2509,27 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
   this->lidar_refl_img_ = img;
   this->lidar_range_img_ = rng;
   this->lidar_img_ready_ = true;
+
+  // Azimuth-gradient energy (INTENSITY_AUDIT_2026-07-09 instrumentation): mean
+  // |dI/dcol| over valid pixel pairs, in /scale units. The column axis is
+  // azimuth ~ the along-tunnel direction on the walls, so this measures how
+  // much full-resolution texture (graffiti strokes) the image actually carries
+  // for the image-domain terms -- the signal the 0.25m voxel average destroys
+  // before the 3D photometric term sees it. Cheap (one pass, already-hot rows).
+  {
+    double e = 0.0; long n = 0;
+    for (int row = 0; row < height; ++row) {
+      const float* src = img.ptr<float>(row);
+      const float* r = rng.ptr<float>(row);
+      for (int col = 0; col + 1 < width; ++col) {
+        if (r[col] > 0.f && r[col + 1] > 0.f) {   // both real returns
+          e += std::abs(src[col + 1] - src[col]);
+          ++n;
+        }
+      }
+    }
+    this->lidar_img_az_grad_energy_ = (n > 0) ? static_cast<float>(e / n) : 0.f;
+  }
 
   // Self-calibrate the spherical model once (sensor geometry is fixed):
   //   el(row) ~ el_a*row + el_b   (least-squares over per-row mean elevation)
@@ -2501,6 +2610,9 @@ void dlio::OdomNode::getNextPose() {
     if (this->visual_map_enabled_) {
       this->gicp.setTargetVisualRefs(this->submap_visual_refs);
     }
+    if (this->lidar_image_refs_enabled_) {
+      this->gicp.setTargetLidarRefs(this->submap_lidar_refs);
+    }
 
     this->submap_hasChanged = false;
   }
@@ -2545,6 +2657,7 @@ void dlio::OdomNode::getNextPose() {
     // scan) -> off this scan.
     if (lidar_flow_active && this->lidar_flow_prev_valid_) {
       this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_);
+      this->gicp.setLidarFlowMode(this->lidar_flow_image_ref_, this->lidar_flow_patch_);
       this->gicp.setLidarFlowWeight(static_cast<float>(this->lidar_flow_weight_));
     } else {
       this->gicp.setLidarFlowWeight(0.f);
@@ -3321,6 +3434,12 @@ void dlio::OdomNode::updateKeyframes() {
       cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
       this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
     }
+    if (this->lidar_image_refs_enabled_) {
+      Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+      Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+      cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+      this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
+    }
     lock.unlock();
 
   }
@@ -3367,6 +3486,9 @@ void dlio::OdomNode::pruneKeyframes() {
     this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
     if (this->visual_map_enabled_ && prune_idx < (int)this->keyframe_visual_refs.size()) {
       this->keyframe_visual_refs.erase(this->keyframe_visual_refs.begin() + prune_idx);
+    }
+    if (this->lidar_image_refs_enabled_ && prune_idx < (int)this->keyframe_lidar_refs.size()) {
+      this->keyframe_lidar_refs.erase(this->keyframe_lidar_refs.begin() + prune_idx);
     }
     --this->num_processed_keyframes;
   }
@@ -3504,6 +3626,11 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
         && this->keyframe_visual_refs.size() == this->keyframes.size();
     std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
         build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
+    // Same index-alignment contract for the keyframe-image LiDAR refs.
+    const bool build_lidar_refs = this->lidar_image_refs_enabled_
+        && this->keyframe_lidar_refs.size() == this->keyframes.size();
+    std::shared_ptr<std::vector<float>> submap_lidar_refs_ =
+        build_lidar_refs ? std::make_shared<std::vector<float>>() : nullptr;
 
     for (auto k : this->submap_kf_idx_curr) {
 
@@ -3517,6 +3644,8 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
       std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
       std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
           build_visual_refs ? this->keyframe_visual_refs[k] : nullptr;
+      std::shared_ptr<const std::vector<float>> kf_lrefs =
+          build_lidar_refs ? this->keyframe_lidar_refs[k] : nullptr;
       lock.unlock();
 
       *submap_cloud_ += *kf_cloud;
@@ -3526,11 +3655,16 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
         submap_visual_refs_->insert( std::end(*submap_visual_refs_),
             std::begin(*kf_refs), std::end(*kf_refs) );
       }
+      if (build_lidar_refs && kf_lrefs) {
+        submap_lidar_refs_->insert( std::end(*submap_lidar_refs_),
+            std::begin(*kf_lrefs), std::end(*kf_lrefs) );
+      }
     }
 
     this->submap_cloud = submap_cloud_;
     this->submap_normals = submap_normals_;
     this->submap_visual_refs = submap_visual_refs_;
+    this->submap_lidar_refs = submap_lidar_refs_;
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
@@ -3731,6 +3865,14 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Lidar Map Active", (this->lidar_image_enabled_ && this->gicp.lastLidarMapCount() > 0) ? "1" : "0");
   kv("Lidar Map Points", std::to_string(this->gicp.lastLidarMapCount()));
   kv("Lidar Map RMS", fnum(this->gicp.lastLidarMapRms(), 4));
+  // Intensity-channel instrumentation (INTENSITY_AUDIT_2026-07-09): is the flow
+  // term actually engaging, and does the full-res image carry texture? Az-grad
+  // energy ~0 = channel information-poor at full res (image terms can't help);
+  // healthy graffiti walls give O(0.01-0.1) in /scale units.
+  kv("Lidar Flow Active", (this->lidar_flow_enabled_ && this->gicp.lastLidarFlowCount() > 0) ? "1" : "0");
+  kv("Lidar Flow Points", std::to_string(this->gicp.lastLidarFlowCount()));
+  kv("Lidar Flow RMS", fnum(this->gicp.lastLidarFlowRms(), 4));
+  kv("Lidar Image Az-Grad Energy", fnum(this->lidar_img_az_grad_energy_, 5));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);
