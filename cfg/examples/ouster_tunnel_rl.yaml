@@ -1,0 +1,27 @@
+# dliio-side overlay for the robot_localization fusion architecture
+# (doc/FUSION_ARCHITECTURE.md). Stack ON TOP of ouster_tunnel(+_xicp) +
+# extrinsics; pair with cfg/robot_localization_ekf.yaml on the EKF side.
+#
+# Three things make dliio a well-behaved EKF input:
+#  1. HONEST per-axis covariance: the governor's rank-1 inflation marks the
+#     held/sloshing axes untrusted, so the EKF's differential fusion de-weights
+#     exactly the tunnel axis and trusts the five observable axes.
+#  2. TF ownership: the EKF publishes odom->base_link; dliio contributes
+#     odometry messages only.
+#  3. The estimator-internal fixes stay on so dliio doesn't eat its own map
+#     while the EKF smooths the output (keyframe gate; X-ICP budget lives in
+#     ouster_tunnel_xicp.yaml).
+/**:
+  ros__parameters:
+    # Governor + covariance inflation (n=24-validated caps).
+    odom/degenGov/enabled: true
+    odom/degenGov/maxStepTrans: 0.15   # [m]
+    odom/degenGov/maxStepRot: 0.05     # [rad]
+    odom/degenGov/covPosVar: 100.0     # [m^2]   ~10 m std on a held position axis
+    odom/degenGov/covRotVar: 1.0       # [rad^2] held rotation axis untrusted
+
+    # The EKF owns odom->base_link.
+    odom/publishTf: false
+
+    # Anti map-contamination while sloshing (tunnel-slosh fix).
+    odom/keyframe/degenGate: true
