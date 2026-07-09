@@ -26,6 +26,17 @@
 #
 # A/B baseline = the same stack WITHOUT this file but WITH photometricWeight:=0.0
 # (reflectivity LiDAR-image term, 3D photometric off) — see the session note.
+#
+# 2026-07-09 (doc/INTENSITY_AUDIT_2026-07-09.md): two updates to the header's
+# premises. (a) The base ouster_tunnel.yaml now sets photometricWeight 0 itself,
+# so the isolation line below is redundant-but-harmless (kept: this file must
+# stay correct if layered on an older base). (b) The "reflectivity is a no-op at
+# any weight" verdict (Parts 2-3) was measured with the VOXEL-AVERAGED field
+# reference — part of that no-op was the reference blur, not the channel. The
+# inherited odom/lidar_image/imageRefs: true (from ouster_tunnel_lidarimg.yaml)
+# applies to the ambient channel too: keyframe refs are sampled from the same
+# full-res image this overlay selects, so the near-IR A/B now tests the channel
+# with an un-blurred reference on both sides.
 
 /**:
   ros__parameters:
