@@ -14,6 +14,7 @@
 #include "dlio/utils.h"
 #include "dlio/degeneracy_governor.h"
 #include "dlio/degeneracy_observer.h"
+#include "dlio/physics_fuse.h"
 #include <set>
 #include <unordered_map>
 #include <limits>
@@ -290,6 +291,44 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Variance added to /odom pose cov along a held-degenerate position axis [m^2] (0 = none)", 0.0, 1e6);
   dlio::declare_param(this, "odom/degenGov/covRotVar", this->degen_gov_cov_rot_var_, 0.0,
       "Variance added to /odom pose cov along a held-degenerate rotation axis [rad^2] (0 = none)", 0.0, 1e6);
+
+  // PHYSICS FUSE (physics_fuse.h, doc/RUNTIME_GUARDS.md): clamp the TOTAL
+  // per-scan output step in ANY direction to a physical bound. The governor
+  // only acts along axes the gate flagged; the fuse catches everything else --
+  // gate misses, runaway on an unflagged axis, and a diverging IMU prior (the
+  // 2026-07-09 leg-1 takeoff reached 3.3e7 m). A tripped scan is flagged
+  // (diagnostics + keyframe veto). 0 = off, bit-identical.
+  dlio::declare_param(this, "odom/fuse/maxStepTrans", this->fuse_max_step_trans_, 0.0,
+      "Max per-scan output translation in any direction [m] (~max speed/scan rate; 0 disables)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/fuse/maxStepRot", this->fuse_max_step_rot_, 0.0,
+      "Max per-scan output rotation [rad] (0 disables)", 0.0, 3.1416);
+
+  // SLOSH GUARD (slosh_guard.h, doc/RUNTIME_GUARDS.md): online detector for
+  // the corkscrew/back-and-forth oscillation (the harness's `revs` verdict,
+  // moved into the estimator). Tracks the signed output step along the weak
+  // (held) translation axis; a high sign-flip fraction over the window engages
+  // extra velocity damping along that axis (the oscillation's flywheel) and a
+  // keyframe veto until it subsides. Off (default) = bit-identical.
+  dlio::declare_param(this, "odom/slosh/enabled", this->slosh_enabled_, false,
+      "Enable the online slosh (oscillation) detector + damping response");
+  int slosh_window = 20, slosh_min_active = 8;
+  double slosh_engage = 0.5, slosh_disengage = 0.25;
+  dlio::declare_param(this, "odom/slosh/window", slosh_window, 20,
+      "Sliding window of active (above-deadband) steps considered");
+  dlio::declare_param(this, "odom/slosh/deadband", this->slosh_deadband_, 0.02,
+      "Ignore per-scan steps below this magnitude [m] (stationary noise)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/slosh/engageFrac", slosh_engage, 0.5,
+      "Sign-flip fraction at/above which the guard engages", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/disengageFrac", slosh_disengage, 0.25,
+      "Sign-flip fraction at/below which the guard disengages (hysteresis)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/minActive", slosh_min_active, 8,
+      "Minimum active samples before the guard may engage");
+  dlio::declare_param(this, "odom/slosh/velDamp", this->slosh_vel_damp_, 0.5,
+      "Per-scan velocity damping along the tracked axis while engaged (0..1)", 0.0, 1.0);
+  this->slosh_guard_ = dlio::SloshGuard(slosh_window,
+      static_cast<float>(this->slosh_deadband_),
+      static_cast<float>(slosh_engage), static_cast<float>(slosh_disengage),
+      slosh_min_active);
 
   // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
   // nominal residual count so its weight is independent of how many points are
@@ -940,6 +979,14 @@ void dlio::OdomNode::getParams() {
   // prior). Reads the gate's held world-frame dirs; 1.0 (default) -> bit-identical.
   dlio::declare_param(this, "odom/geo/degenObsGain", this->geo_degen_obs_gain_, 1.0,
       "Observer correction gain on held-degenerate axes (1 = off, 0 = freeze to IMU prior)", 0.0, 1.0);
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): while the gate holds axes,
+  // the observer's velocity state keeps integrating IMU/accel error along them
+  // and powers both the dead-reckon runaway and the slosh limit cycle (the
+  // reason dliio twist is not fused downstream, doc/FUSION_ARCHITECTURE.md).
+  // Damp the velocity component along each held axis by this factor per scan:
+  // v_along *= (1 - damp). 0 (default) = off, bit-identical; 1 = zero it.
+  dlio::declare_param(this, "odom/geo/degenVelDamp", this->geo_degen_vel_damp_, 0.0,
+      "Per-scan velocity damping along held-degenerate axes (0 = off, 1 = zero the component)", 0.0, 1.0);
   dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0, "Accel-bias clamp [m/s^2] (live-tunable)", 0.0, 50.0);
   dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0, "Gyro-bias clamp [rad/s] (live-tunable)", 0.0, 10.0);
 }
@@ -2724,6 +2771,62 @@ void dlio::OdomNode::getNextPose() {
     }
   }
 
+  // PHYSICS FUSE: clamp the TOTAL per-scan output step (any direction) to a
+  // physical bound -- the last line against takeoffs the governor's held-axis
+  // scope can't see (gate misses, unflagged axes, a diverging IMU prior). A
+  // tripped scan is physically implausible: flag it (diagnostics) and veto
+  // keyframing on it in updateKeyframes(). Same T/T_corr recompute mechanics
+  // as the governor, so downstream stays consistent. 0 caps = bit-identical.
+  this->fuse_tripped_scan_ = false;
+  if (this->fuse_max_step_trans_ > 0.0 || this->fuse_max_step_rot_ > 0.0) {
+    bool tripped = false;
+    const Eigen::Matrix4f T_fused = dlio::fusePose(
+        T_prev_governed, this->T,
+        static_cast<float>(this->fuse_max_step_trans_),
+        static_cast<float>(this->fuse_max_step_rot_), &tripped);
+    if (tripped) {
+      this->T = T_fused;
+      this->T_corr = this->T * this->T_prior.inverse();
+      this->fuse_tripped_scan_ = true;
+      ++this->fuse_trips_;
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "PHYSICS FUSE: per-scan output step exceeded the physical bound "
+          "(%ld trips total) -- estimate untrustworthy, step clamped, keyframe vetoed",
+          this->fuse_trips_);
+    }
+  }
+
+  // SLOSH GUARD: feed the signed output step along the tracked weak axis to
+  // the oscillation detector. The axis is the gate's dominant held translation
+  // direction, sign-aligned scan-to-scan for a stable identity, and PERSISTS
+  // across scans the gate misses (the oscillation does too -- gate chatter is
+  // part of the loop). Engagement drives extra velocity damping in
+  // updateState() and a keyframe veto in updateKeyframes().
+  if (this->slosh_enabled_) {
+    const auto& weak_dirs = this->gicp.lastDegenTransDirs();
+    if (!weak_dirs.empty()) {
+      Eigen::Vector3f a = weak_dirs.front().cast<float>();
+      const float n = a.norm();
+      if (n > 1e-6f) {
+        a /= n;
+        if (this->slosh_axis_valid_ && a.dot(this->slosh_axis_) < 0.f) { a = -a; }
+        this->slosh_axis_ = a;
+        this->slosh_axis_valid_ = true;
+      }
+    }
+    const Eigen::Vector3f step =
+        this->T.block<3, 1>(0, 3) - T_prev_governed.block<3, 1>(0, 3);
+    this->slosh_guard_.update(
+        this->slosh_axis_valid_ ? this->slosh_axis_.dot(step) : 0.f,
+        this->slosh_axis_valid_);
+    if (this->slosh_guard_.engaged()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "SLOSH GUARD engaged: oscillation along the weak axis "
+          "(flip fraction %.2f over %d steps) -- damping velocity, vetoing keyframes",
+          this->slosh_guard_.reversalFraction(), this->slosh_guard_.activeSamples());
+    }
+  }
+
   // Promote this scan's camera frame to "previous" for the next scan's warp,
   // using the corrected pose (world -> camera at this->T).
   if (this->visual_cur_pending_valid_) {
@@ -3111,6 +3214,26 @@ void dlio::OdomNode::updateState() {
   this->state.p += dt * this->geo_Kp_ * err;
   this->state.v.lin.w += dt * this->geo_Kv_ * err;
 
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): along a held axis the
+  // registration supplies no correction, so the velocity state free-integrates
+  // IMU error and powers the dead-reckon runaway / sustains the slosh limit
+  // cycle. Damp the along-axis component while the axis is held (attenuate to
+  // (1-damp) per scan); cross-axis velocity untouched. 0 (default) = off.
+  if (this->geo_degen_vel_damp_ > 0.0) {
+    this->state.v.lin.w = dlio::attenuateAlongHeldAxes(
+        this->state.v.lin.w, this->gicp.lastDegenTransDirs(),
+        1.f - static_cast<float>(this->geo_degen_vel_damp_));
+  }
+  // Slosh-guard response: while the detector is engaged, damp the velocity
+  // along the TRACKED axis (persists across gate misses) -- the oscillation's
+  // energy store -- independent of whether this particular scan held it.
+  if (this->slosh_enabled_ && this->slosh_vel_damp_ > 0.0 &&
+      this->slosh_guard_.engaged() && this->slosh_axis_valid_) {
+    const float along = this->slosh_axis_.dot(this->state.v.lin.w);
+    this->state.v.lin.w -=
+        this->slosh_axis_ * (along * static_cast<float>(this->slosh_vel_damp_));
+  }
+
   this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
   this->state.q.x() += dt * this->geo_Kq_ * qcorr.x();
   this->state.q.y() += dt * this->geo_Kq_ * qcorr.y();
@@ -3420,6 +3543,15 @@ void dlio::OdomNode::updateKeyframes() {
     newKeyframe = false;
   }
 
+  // Runtime-guard vetoes (doc/RUNTIME_GUARDS.md): a fuse-tripped scan is
+  // physically implausible and must never be planted in the map; a scan taken
+  // while the slosh guard is engaged is mid-oscillation (the map-contamination
+  // loop the degenGate above targets, caught by the output-domain detector).
+  if (newKeyframe && (this->fuse_tripped_scan_ ||
+      (this->slosh_enabled_ && this->slosh_guard_.engaged()))) {
+    newKeyframe = false;
+  }
+
   if (newKeyframe) {
 
     // update keyframe vector
@@ -3652,7 +3784,7 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
       pcl::PointCloud<PointType>::ConstPtr kf_cloud = this->keyframes[k].second;
       std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
       std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
-          build_visual_refs ? this->keyframe_visual_refs[k] : nullptr;
+          build_visual_refs ? this->keyframe_visual_refs.at(k) : nullptr;
       // .at(), not [k]: fail loud with a precise (small, sane) index/size pair
       // right here if build_lidar_refs's earlier size compare was ever wrong,
       // instead of silently reading past the end and propagating a garbage
@@ -3886,6 +4018,12 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Lidar Flow Points", std::to_string(this->gicp.lastLidarFlowCount()));
   kv("Lidar Flow RMS", fnum(this->gicp.lastLidarFlowRms(), 4));
   kv("Lidar Image Az-Grad Energy", fnum(this->lidar_img_az_grad_energy_, 5));
+  // Runtime guards (doc/RUNTIME_GUARDS.md): trips/engagement are the operator's
+  // signal that the estimate is being actively bounded rather than trusted.
+  kv("Physics Fuse Trips (cumulative)", std::to_string(this->fuse_trips_));
+  kv("Slosh Guard Engaged", (this->slosh_enabled_ && this->slosh_guard_.engaged()) ? "1" : "0");
+  kv("Slosh Reversal Fraction", fnum(this->slosh_guard_.reversalFraction(), 3));
+  kv("Slosh Guard Activations (cumulative)", std::to_string(this->slosh_guard_.activations()));
   kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
 
   arr.status.push_back(st);

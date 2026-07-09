@@ -203,6 +203,18 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_physics_fuse test/test_physics_fuse.cpp)
+  target_compile_definitions(test_physics_fuse PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_physics_fuse
+    dlio_components
+  )
+
+  ament_add_gtest(test_slosh_guard test/test_slosh_guard.cpp)
+  target_compile_definitions(test_slosh_guard PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_slosh_guard
+    dlio_components
+  )
+
   ament_add_gtest(test_genz_weight test/test_genz_weight.cpp)
   target_compile_definitions(test_genz_weight PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_genz_weight

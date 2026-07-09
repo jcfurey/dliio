@@ -13,6 +13,7 @@
  ***********************************************************/
 
 #include "dlio/dlio.h"
+#include "dlio/slosh_guard.h"
 
 #include <array>
 
@@ -448,6 +449,22 @@ private:
   bool degen_gov_enabled_ = false;
   float degen_gov_max_step_trans_ = 0.f;  // [m]   max per-scan motion along a held trans axis; 0 = off
   float degen_gov_max_step_rot_ = 0.f;    // [rad] max per-scan motion about a held rot axis;   0 = off
+  // PHYSICS FUSE (physics_fuse.h): clamp the TOTAL per-scan output step (any
+  // direction -- catches the runaways the governor's held-axis scope misses,
+  // including a diverging IMU prior). 0 = off (bit-identical). Scan thread only.
+  double fuse_max_step_trans_ = 0.0;      // [m]   max per-scan output translation; 0 = off
+  double fuse_max_step_rot_ = 0.0;        // [rad] max per-scan output rotation;    0 = off
+  bool fuse_tripped_scan_ = false;        // this scan clamped (vetoes keyframing)
+  long fuse_trips_ = 0;                   // cumulative trips (diagnostics)
+  // SLOSH GUARD (slosh_guard.h): online corkscrew detector on the output step
+  // along the weak axis; when engaged, extra velocity damping + keyframe veto.
+  // All accessed on the scan thread (getNextPose -> updateState -> updateKeyframes).
+  bool slosh_enabled_ = false;
+  double slosh_deadband_ = 0.02;          // [m] ignore steps below this (stationary noise)
+  double slosh_vel_damp_ = 0.5;           // per-scan velocity damping along the axis while engaged
+  dlio::SloshGuard slosh_guard_;          // detector (window/fracs set from params at startup)
+  Eigen::Vector3f slosh_axis_ = Eigen::Vector3f::Zero();  // tracked weak axis (persists across scans)
+  bool slosh_axis_valid_ = false;
   double degen_gov_cov_pos_var_ = 0.0;    // [m^2]   variance added along a held position axis; 0 = none
   double degen_gov_cov_rot_var_ = 0.0;    // [rad^2] variance added along a held rotation axis; 0 = none
   // Extra pose covariance from the inflation, world frame, written on the scan
@@ -538,6 +555,7 @@ private:
   double geo_Kab_;
   double geo_Kgb_;
   double geo_degen_obs_gain_ = 1.0;  // LODESTAR-flavored observer gain on held-degenerate axes; 1 = off
+  double geo_degen_vel_damp_ = 0.0;  // per-scan velocity damping along held axes (flywheel kill); 0 = off
   double geo_abias_max_;
   double geo_gbias_max_;
   // Intensity range correction
