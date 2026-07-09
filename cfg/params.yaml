@@ -90,6 +90,11 @@
     # With adaptive: true (dlio.yaml) threshD is scaled by spaciousness.
     odom/keyframe/threshD: 1.0
     odom/keyframe/threshR: 45.0
+    # Tunnel-slosh fix: veto keyframe creation while the degeneracy gate holds
+    # axes -- a sloshing pose plants duplicated wall structure in the submap
+    # ("map-lock" aliasing) that feeds the oscillation back (cf. DLIOM's
+    # accurate-state keyframe selection). Default off (bit-identical).
+    odom/keyframe/degenGate: false
     # Bound on the keyframe map (0 = unlimited). When exceeded, the most
     # spatially redundant keyframe is removed (the origin anchor and recent
     # keyframes are kept). Bounds long-run memory at the cost of map detail
@@ -384,6 +389,13 @@
     # (default) = the existing binary/soft gate (bit-identical).
     odom/xicp/ternaryEnabled: false
     odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); > degeneracyThreshRatio
+    # Partial-band admission budget (2026-07-08 runaway fix): per-scan cap on the
+    # cumulative motion the ternary gate's partial band may admit along marginal
+    # axes -- fail-bounded instead of fail-open when the marginal-band signal is
+    # dishonest (aliased photometric drive / contaminated map locks). 0 (default)
+    # = unbudgeted (pre-budget behavior). Deploy with the governor caps (~0.15/0.05).
+    odom/xicp/partialBudgetTrans: 0.0   # [m]  per scan; 0 = unbudgeted
+    odom/xicp/partialBudgetRot: 0.0     # [rad] per scan; 0 = unbudgeted
 
     # Saliency-weighted point selection (anti-dilution). Up-weight rare salient
     # source points (edges/ribs/corners, from the local covariance shape) by up to

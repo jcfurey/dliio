@@ -595,6 +595,10 @@ void dlio::OdomNode::getParams() {
 
   // Frames
   dlio::declare_param(this, "frames/odom", this->odom_frame, "odom");
+  // Disable to let a downstream fusion node (robot_localization) own the
+  // odom->baselink TF; dlio still publishes the odometry message.
+  dlio::declare_param(this, "odom/publishTf", this->publish_tf_, true,
+      "Broadcast the odom->baselink transform (disable when an EKF owns it)");
   dlio::declare_param(this, "frames/baselink", this->baselink_frame, "base_link");
   dlio::declare_param(this, "frames/lidar", this->lidar_frame, "lidar");
   dlio::declare_param(this, "frames/imu", this->imu_frame, "imu");
@@ -617,6 +621,10 @@ void dlio::OdomNode::getParams() {
       "Keyframe translation threshold [m] (live-tunable)", 0.0, 10.0);
   dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0,
       "Keyframe rotation threshold [deg] (live-tunable)", 0.0, 180.0);
+  // Tunnel-slosh fix: veto keyframe creation while the degeneracy gate holds
+  // axes (the pose is sloshing; keyframing it pollutes the submap). Default off.
+  dlio::declare_param(this, "odom/keyframe/degenGate", this->keyframe_degen_gate_, false,
+      "Skip keyframe creation while the registration holds degenerate axes (anti map-contamination)");
 
   // Bound on the keyframe map (0 = unlimited). When exceeded, the most
   // spatially redundant processed keyframe is removed.
@@ -801,6 +809,15 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/xicp/fullRatio", this->xicp_full_ratio_, 0.05,
       "X-ICP localizable bar as a fraction of lambda_max; should exceed degeneracyThreshRatio", 0.0, 1.0);
   this->gicp.setXicpTernary(this->xicp_ternary_enabled_, static_cast<float>(this->xicp_full_ratio_));
+  // Partial-band admission budget (FINDINGS_2026-07-08 runaway fix): caps the
+  // cumulative motion the ternary gate's partial band may admit per scan,
+  // making X-ICP fail-bounded instead of fail-open. 0 (default) = unbudgeted.
+  dlio::declare_param(this, "odom/xicp/partialBudgetTrans", this->xicp_partial_budget_trans_, 0.0,
+      "Per-scan cap on partial-band admitted translation [m] (0 = unbudgeted)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/xicp/partialBudgetRot", this->xicp_partial_budget_rot_, 0.0,
+      "Per-scan cap on partial-band admitted rotation [rad] (0 = unbudgeted)", 0.0, 3.1416);
+  this->gicp.setXicpPartialBudget(static_cast<float>(this->xicp_partial_budget_trans_),
+                                  static_cast<float>(this->xicp_partial_budget_rot_));
   // Saliency-weighted point selection (anti-dilution): up-weight rare salient
   // source points (edges/ribs/corners) so the abundant planar walls don't swamp
   // the weak along-axis DOF. boost = 1 (default) -> unit weights, bit-identical.
@@ -1024,7 +1041,12 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = this->state.q.y();
   transformStamped.transform.rotation.z = this->state.q.z();
 
-  br->sendTransform(transformStamped);
+  // Skippable when a fusion layer (e.g. robot_localization EKF) owns the
+  // odom->baselink transform: dlio then contributes odometry MESSAGES only
+  // (see cfg/robot_localization_ekf.yaml). Default true -> unchanged.
+  if (this->publish_tf_) {
+    br->sendTransform(transformStamped);
+  }
 
   // baselink->imu and baselink->lidar are fixed extrinsics, so they are NOT
   // re-sent here: in extrinsics/source=yaml they are published once (latched) by
@@ -3271,6 +3293,18 @@ void dlio::OdomNode::updateKeyframes() {
 
   if (abs(dd) <= this->keyframe_thresh_dist_ && abs(theta_deg) > this->keyframe_thresh_rot_ && num_nearby <= 1) {
     newKeyframe = true;
+  }
+
+  // Degeneracy gate (tunnel-slosh fix): while the registration is holding
+  // degenerate axes, the pose is dead-reckoning/oscillating along them --
+  // inserting a keyframe at such a pose plants duplicated wall structure in the
+  // submap ("map-lock" aliasing), which feeds the oscillation back (the
+  // self-contamination loop; cf. DLIOM's accurate-state keyframe selection,
+  // arXiv:2305.01843). Veto keyframe creation until observability returns.
+  // Default off -> bit-identical.
+  if (newKeyframe && this->keyframe_degen_gate_ &&
+      this->gicp.lastDegenerateDirections() > 0) {
+    newKeyframe = false;
   }
 
   if (newKeyframe) {

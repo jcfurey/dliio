@@ -482,6 +482,8 @@ private:
 
   double keyframe_thresh_dist_;
   double keyframe_thresh_rot_;
+  bool keyframe_degen_gate_ = false;   // veto keyframes while degenerate axes are held (anti map-contamination)
+  bool publish_tf_ = true;             // broadcast odom->baselink (off when a fusion EKF owns the TF)
 
   int max_keyframes_;
   bool dashboard_;
@@ -623,6 +625,8 @@ private:
   double genz_point_weight_ = 1.0;     // isotropic point-to-point metric weight [1/m^2]
   bool xicp_ternary_enabled_ = false;  // X-ICP ternary localizability gate; off = existing gate
   double xicp_full_ratio_ = 0.05;      // upper (localizable) bar as a fraction of lambda_max
+  double xicp_partial_budget_trans_ = 0.0;  // per-scan partial-band admission cap [m]; 0 = unbudgeted
+  double xicp_partial_budget_rot_ = 0.0;    // per-scan partial-band admission cap [rad]; 0 = unbudgeted
   bool saliency_enabled_ = false;      // anti-dilution saliency weighting of the geometric term
   double saliency_boost_ = 1.0;        // weight of a maximally-salient source point (1 = off)
   std::string lidar_image_channel_;    // cloud field feeding the image slot: reflectivity|intensity|ambient
