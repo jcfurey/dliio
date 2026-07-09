@@ -3622,13 +3622,22 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // Concatenate the per-point visual refs in the SAME order as the cloud so
     // indices line up with the target points (only when the map term is on and
     // the refs are index-aligned with the keyframes).
+    //
+    // Locked: keyframes.size()/keyframe_{visual,lidar}_refs.size() read here
+    // race updateKeyframes()'s locked push_back on these same vectors on the
+    // main thread (2026-07-09 crash hunt, dliio lidar_image std::out_of_range
+    // combo crash) -- a push_back-triggered reallocation mid-read can produce
+    // a torn/garbage size compare, silently flipping build_lidar_refs or
+    // desyncing it from the keyframe count the per-`k` loop below later reads
+    // under its own lock. Cheap (two size() calls), so lock just for this.
+    lock.lock();
     const bool build_visual_refs = this->visual_map_enabled_
         && this->keyframe_visual_refs.size() == this->keyframes.size();
-    std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
-        build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
-    // Same index-alignment contract for the keyframe-image LiDAR refs.
     const bool build_lidar_refs = this->lidar_image_refs_enabled_
         && this->keyframe_lidar_refs.size() == this->keyframes.size();
+    lock.unlock();
+    std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
+        build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
     std::shared_ptr<std::vector<float>> submap_lidar_refs_ =
         build_lidar_refs ? std::make_shared<std::vector<float>>() : nullptr;
 
@@ -3644,8 +3653,12 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
       std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
       std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
           build_visual_refs ? this->keyframe_visual_refs[k] : nullptr;
+      // .at(), not [k]: fail loud with a precise (small, sane) index/size pair
+      // right here if build_lidar_refs's earlier size compare was ever wrong,
+      // instead of silently reading past the end and propagating a garbage
+      // shared_ptr downstream (2026-07-09 crash hunt).
       std::shared_ptr<const std::vector<float>> kf_lrefs =
-          build_lidar_refs ? this->keyframe_lidar_refs[k] : nullptr;
+          build_lidar_refs ? this->keyframe_lidar_refs.at(k) : nullptr;
       lock.unlock();
 
       *submap_cloud_ += *kf_cloud;
