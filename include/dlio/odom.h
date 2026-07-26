@@ -465,6 +465,8 @@ private:
   dlio::SloshGuard slosh_guard_;          // detector (window/fracs set from params at startup)
   Eigen::Vector3f slosh_axis_ = Eigen::Vector3f::Zero();  // tracked weak axis (persists across scans)
   bool slosh_axis_valid_ = false;
+  int slosh_axis_hold_ = 20;              // scans the tracked axis survives without the gate flagging one
+  int slosh_axis_stale_ = 0;              // consecutive scans with no weak axis from the gate
   double degen_gov_cov_pos_var_ = 0.0;    // [m^2]   variance added along a held position axis; 0 = none
   double degen_gov_cov_rot_var_ = 0.0;    // [rad^2] variance added along a held rotation axis; 0 = none
   // Extra pose covariance from the inflation, world frame, written on the scan

@@ -41,6 +41,19 @@ does ≤ 2 m/s; 1.0 m/scan at 10 Hz is a 5× margin — trips indicate estimator
 failure, not fast driving. Distinct from `odom/degenGov/maxStep*` (held axes
 only) and `odom/gicp/maxCorr*` (correction vs prior, prior excluded).
 
+**Known constraint before you tighten these** (2026-07-26 audit): the caps are
+per *scan*, not per second, but the real inter-scan period varies — a dropped
+scan under CPU starvation (this repo's documented #1 cause of tunnel-run
+failures) means genuinely more motion between outputs, which the fuse reads as
+implausible. The 5× margin above absorbs roughly a 5× scan gap at full speed,
+but it is doing double duty for speed *and* period, so tightening the caps eats
+the dropped-scan headroom silently. If you tighten them — or run a faster
+platform — convert to a velocity bound (`cap = max_speed × actual dt`), which is
+exact and needs no assumed nominal rate; `getNextPose` has the true period
+available (`scan_stamp - prev_scan_stamp` is not yet advanced there). Watch
+`Physics Fuse Trips` against `Scans Dropped est` in Round 0 to tell a genuine
+trip from a dropped-scan artefact.
+
 ## 2. Slosh guard (anti-corkscrew) — `odom/slosh/*`
 
 `dlio::SloshGuard` (include/dlio/slosh_guard.h, pure, unit-tested in
@@ -49,12 +62,27 @@ test/test_slosh_guard.cpp) is the offline harness's reversal verdict
 can respond *while the corkscrew is happening* instead of after the bag ends.
 
 Detector: per scan, project the output step onto the tracked weak axis (the
-gate's dominant held translation direction, sign-aligned scan-to-scan; it
-**persists across scans the gate misses**, because gate chatter is itself part
-of the oscillation loop — doc/FUSION_ARCHITECTURE.md Loop B). Steps below
-`deadband` are ignored. Over the last `window` active steps, the sign-flip
-fraction is the oscillation score: a straight traverse scores ~0, a corkscrew
-~1. Hysteresis (`engageFrac`/`disengageFrac`) prevents response chatter.
+gate's weakest held translation direction — the gate records in ascending
+eigenvalue order, so `front()` is the weakest, not an arbitrary member —
+sign-aligned scan-to-scan; it **persists across scans the gate misses**,
+because gate chatter is itself part of the oscillation loop —
+doc/FUSION_ARCHITECTURE.md Loop B). Steps below `deadband` are ignored. Over
+the last `window` active steps, the sign-flip fraction is the oscillation
+score: a straight traverse scores ~0, a corkscrew ~1. Hysteresis
+(`engageFrac`/`disengageFrac`) prevents response chatter.
+
+**Axis lifetime** (`axisHoldScans`, 2026-07-26 correctness fix). Persistence is
+bounded in two ways, because an axis that outlives its conditions is a source of
+FALSE engagement in healthy operation:
+- *Ageing*: after `axisHoldScans` consecutive scans with no weak axis from the
+  gate, the tracked axis goes invalid and the evidence window drains one sample
+  per scan. (Before this fix the validity flag latched true on the first
+  degenerate scan and never cleared, which made the window-decay path
+  unreachable in production and let a stale axis score flips indefinitely.)
+- *Identity change*: the weak-axis set can change membership, so if the new
+  direction differs from the tracked one by more than 30° it is a different
+  physical DOF — the accumulated sign history would read as noise projected on
+  it, so the evidence is reset outright rather than mixed.
 
 Response while engaged:
 - **velocity damping along the tracked axis** (`velDamp`) — the oscillation's

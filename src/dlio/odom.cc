@@ -325,6 +325,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Minimum active samples before the guard may engage");
   dlio::declare_param(this, "odom/slosh/velDamp", this->slosh_vel_damp_, 0.5,
       "Per-scan velocity damping along the tracked axis while engaged (0..1)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/axisHoldScans", this->slosh_axis_hold_, 20,
+      "Scans the tracked weak axis survives without the gate flagging one before it goes stale");
   this->slosh_guard_ = dlio::SloshGuard(slosh_window,
       static_cast<float>(this->slosh_deadband_),
       static_cast<float>(slosh_engage), static_cast<float>(slosh_disengage),
@@ -2803,15 +2805,41 @@ void dlio::OdomNode::getNextPose() {
   // part of the loop). Engagement drives extra velocity damping in
   // updateState() and a keyframe veto in updateKeyframes().
   if (this->slosh_enabled_) {
+    // front() is the SMALLEST-eigenvalue held direction: the gate records in
+    // ascending eigenvalue order (SelfAdjointEigenSolver), so this is the
+    // weakest axis, not an arbitrary one.
+    constexpr float kAxisSameCos = 0.866f;   // 30 deg: same physical DOF
     const auto& weak_dirs = this->gicp.lastDegenTransDirs();
+    bool axis_fresh = false;
     if (!weak_dirs.empty()) {
       Eigen::Vector3f a = weak_dirs.front().cast<float>();
       const float n = a.norm();
       if (n > 1e-6f) {
         a /= n;
-        if (this->slosh_axis_valid_ && a.dot(this->slosh_axis_) < 0.f) { a = -a; }
+        if (this->slosh_axis_valid_) {
+          if (a.dot(this->slosh_axis_) < 0.f) { a = -a; }   // sign-align first
+          // A materially different DIRECTION is a different physical DOF (the
+          // weak-axis set can change membership scan to scan). The accumulated
+          // sign history describes the old axis and would score as noise on the
+          // new one, so drop the evidence rather than mix frames.
+          if (a.dot(this->slosh_axis_) < kAxisSameCos) { this->slosh_guard_.reset(); }
+        }
         this->slosh_axis_ = a;
         this->slosh_axis_valid_ = true;
+        this->slosh_axis_stale_ = 0;
+        axis_fresh = true;
+      }
+    }
+    if (!axis_fresh && this->slosh_axis_valid_) {
+      // Age the axis out. It deliberately PERSISTS across the gate's misses
+      // (chatter is part of the oscillation loop), but it must not outlive the
+      // conditions that produced it: a latched stale axis would keep scoring
+      // flips on a meaningless projection and could engage the damping +
+      // keyframe veto during healthy, fully-observable operation. Going invalid
+      // also re-enables the guard's window decay (otherwise unreachable).
+      if (++this->slosh_axis_stale_ > this->slosh_axis_hold_) {
+        this->slosh_axis_valid_ = false;
+        this->slosh_axis_stale_ = 0;
       }
     }
     const Eigen::Vector3f step =

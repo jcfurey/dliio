@@ -106,6 +106,47 @@ TEST(SloshGuard, ReengagementCountsAgain) {
   EXPECT_EQ(g.activations(), 2);
 }
 
+// reset() drops evidence and disengages -- the node calls it when the tracked
+// axis changes IDENTITY, since the sign history describes the old DOF.
+TEST(SloshGuard, ResetDropsEvidenceAndDisengages) {
+  SloshGuard g(10, 0.02f, 0.5f, 0.25f, 4);
+  for (int i = 0; i < 10; ++i) { g.update((i % 2 == 0) ? 0.1f : -0.1f, true); }
+  ASSERT_TRUE(g.engaged());
+  ASSERT_GT(g.activeSamples(), 0);
+
+  g.reset();
+  EXPECT_FALSE(g.engaged());
+  EXPECT_EQ(g.activeSamples(), 0);
+  EXPECT_FLOAT_EQ(g.reversalFraction(), 0.f);
+  EXPECT_EQ(g.activations(), 1);          // cumulative count survives a reset
+
+  // After a reset the guard must re-earn engagement from scratch: min_active
+  // samples of fresh evidence, not the pre-reset history.
+  for (int i = 0; i < 3; ++i) { g.update((i % 2 == 0) ? 0.1f : -0.1f, true); }
+  EXPECT_FALSE(g.engaged());              // 3 < min_active 4
+  g.update(-0.1f, true);
+  EXPECT_TRUE(g.engaged());
+  EXPECT_EQ(g.activations(), 2);
+}
+
+// The axis-invalid decay path is what clears a verdict when the gate stops
+// flagging a weak axis. Pin that a sustained invalid run fully drains a FULL
+// window (the node reaches this via slosh/axisHoldScans ageing the axis out).
+TEST(SloshGuard, SustainedInvalidDrainsFullWindow) {
+  SloshGuard g(10, 0.02f, 0.5f, 0.25f, 4);
+  for (int i = 0; i < 10; ++i) { g.update((i % 2 == 0) ? 0.1f : -0.1f, true); }
+  ASSERT_TRUE(g.engaged());
+  ASSERT_EQ(g.activeSamples(), 10);
+
+  for (int i = 0; i < 10; ++i) { g.update(0.f, false); }
+  EXPECT_EQ(g.activeSamples(), 0);        // one sample drained per invalid scan
+  EXPECT_FALSE(g.engaged());
+  // Further invalid scans on an empty window must stay safe (no underflow).
+  for (int i = 0; i < 5; ++i) { g.update(0.f, false); }
+  EXPECT_EQ(g.activeSamples(), 0);
+  EXPECT_FALSE(g.engaged());
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

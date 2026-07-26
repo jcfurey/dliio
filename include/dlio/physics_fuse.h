@@ -26,6 +26,19 @@
 
 namespace dlio {
 
+// CAVEAT -- the caps are PER SCAN, not per second. The real inter-scan period
+// varies: a dropped scan (CPU starvation, this repo's documented #1 cause of
+// tunnel-run failures; cf. the 1.8x period-jump detector in callbackPointCloud)
+// means genuinely MORE motion between outputs, which this reads as implausible
+// and clamps. The shipped overlay absorbs that in its margin -- 1.0 m/scan vs a
+// 2 m/s crawler at 10 Hz is 5x, so it takes a ~5x scan gap at full speed to
+// trip -- but that one margin is doing double duty for speed AND period, so
+// TIGHTENING the caps for stricter bounding silently eats the dropped-scan
+// headroom. If the caps are tightened, or the platform is faster, convert these
+// to a velocity bound (cap = max_speed * actual_dt), which is exact and needs no
+// assumed nominal rate; the caller has the true period at this point
+// (scan_stamp - prev_scan_stamp, still un-advanced during getNextPose).
+//
 // Clamp T_new's step relative to T_prev to max_step_trans [m] and
 // max_step_rot [rad]. tripped (optional) reports whether any clamp engaged.
 // Translation: the step VECTOR is rescaled (direction preserved). Rotation:

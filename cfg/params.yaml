@@ -238,6 +238,13 @@
     odom/slosh/disengageFrac: 0.25    # disengage at/below this (hysteresis)
     odom/slosh/minActive: 8           # min active steps before engagement
     odom/slosh/velDamp: 0.5           # velocity damping along the axis while engaged
+    # Scans the tracked axis survives without the gate flagging one. It must
+    # persist across gate misses (chatter is part of the oscillation), but must
+    # not outlive them: a latched stale axis keeps scoring flips on a
+    # meaningless projection and could engage during healthy operation. Past
+    # this, the axis goes invalid and the evidence window drains one sample per
+    # scan. A materially different axis (>30 deg) resets the evidence outright.
+    odom/slosh/axisHoldScans: 20
 
     # Term mass-normalization (opt-in). Each residual term accumulates into a
     # shared information-form Hessian (H += weight * J^T J); for the photometric

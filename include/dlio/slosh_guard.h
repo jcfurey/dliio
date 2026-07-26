@@ -77,6 +77,15 @@ class SloshGuard {
     return static_cast<float>(flips) / static_cast<float>(signs_.size() - 1);
   }
 
+  // Drop the accumulated evidence and any engagement. Used when the tracked
+  // axis changes IDENTITY (not just sign): the sign history describes the old
+  // physical DOF and would read as noise projected on the new one. Keeps the
+  // configured thresholds and the cumulative activation count.
+  void reset() {
+    signs_.clear();
+    engaged_ = false;
+  }
+
   bool engaged() const { return engaged_; }
   long activations() const { return activations_; }
   int activeSamples() const { return static_cast<int>(signs_.size()); }
