@@ -15,6 +15,7 @@
 #include "dlio/degeneracy_governor.h"
 #include "dlio/degeneracy_observer.h"
 #include "dlio/physics_fuse.h"
+#include "nano_gicp/elevation_lut.h"
 #include <set>
 #include <unordered_map>
 #include <limits>
@@ -2453,8 +2454,14 @@ dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstP
   const Eigen::Vector3f t = T_lw.translation();
   const float inv_az_a = 1.f / this->lidar_az_a_;
   const float inv_el_a = 1.f / this->lidar_el_a_;
-  const bool use_lut = (static_cast<int>(this->lidar_el_lut_.size()) == img.rows
-                        && !this->lidar_el_lut_.empty());
+  // MUST match the model the GICP map term projects with, or the reference is
+  // sampled at different pixels than the residual lands on. Both now read the
+  // one flag validated when the LUT was built (2026-07-26 audit: this sampler
+  // previously checked only the size, so a single NaN row -- a beam with no
+  // returns in the one scan the LUT is built from -- silently split the two
+  // sides onto different projection models and killed every reference).
+  const bool use_lut = this->lidar_el_lut_valid_
+                       && static_cast<int>(this->lidar_el_lut_.size()) == img.rows;
   const float bw = 2.f;
   const float umax = static_cast<float>(img.cols) - 1.f - bw;
   const float vmax = static_cast<float>(img.rows) - 1.f - bw;
@@ -2468,21 +2475,10 @@ dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstP
     const float u = (az - this->lidar_az_b_) * inv_az_a;
     float v;
     if (use_lut) {
-      // Invert the monotonic per-row elevation LUT (non-uniform OS beams);
-      // outside its coverage -> invalid.
-      const auto& lut = this->lidar_el_lut_;
-      const int n = static_cast<int>(lut.size());
-      const bool inc = lut[n - 1] >= lut[0];
-      bool found = false;
-      for (int k = 0; k < n - 1; ++k) {
-        const float a = lut[k], b = lut[k + 1];
-        const float lo = inc ? a : b, hi = inc ? b : a;
-        if (el >= lo && el <= hi && std::abs(b - a) > 1e-9f) {
-          v = static_cast<float>(k) + (el - a) / (b - a);
-          found = true;
-          break;
-        }
-      }
+      // Shared inversion (nano_gicp/elevation_lut.h) -- the same code the map
+      // and flow terms project with. Outside the LUT's coverage -> invalid.
+      float slope;
+      const bool found = nano_gicp::rowFromElevationLut(this->lidar_el_lut_, el, v, slope);
       if (!found) { continue; }
     } else {
       v = (el - this->lidar_el_b_) * inv_el_a;
@@ -2635,9 +2631,19 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
       this->lidar_az_b_ = static_cast<float>((sa - this->lidar_az_a_ * sc) / na);
       if (std::abs(this->lidar_el_a_) > 1e-9f && std::abs(this->lidar_az_a_) > 1e-9f) {
         this->lidar_proj_ready_ = true;
+        // Validate the per-row LUT ONCE, here, where it is built (it is cached
+        // for the whole run). Every consumer -- the GICP map/flow terms and the
+        // keyframe-reference sampler -- gates on this single flag, so they can
+        // never disagree about which projection model is in force. A row with
+        // no returns in this one scan stays NaN forever, which is exactly the
+        // case that must fall back to the linear model everywhere at once.
+        this->lidar_el_lut_valid_ =
+            nano_gicp::elevationLutUsable(this->lidar_el_lut_, height);
         RCLCPP_INFO(this->get_logger(),
-            "LiDAR intensity image %dx%d; spherical model el=%.5f*row%+.4f, az=%.6f*col%+.4f",
-            width, height, this->lidar_el_a_, this->lidar_el_b_, this->lidar_az_a_, this->lidar_az_b_);
+            "LiDAR intensity image %dx%d; spherical model el=%.5f*row%+.4f, az=%.6f*col%+.4f; "
+            "per-row elevation LUT %s",
+            width, height, this->lidar_el_a_, this->lidar_el_b_, this->lidar_az_a_, this->lidar_az_b_,
+            this->lidar_el_lut_valid_ ? "VALID (used)" : "unusable (linear model)");
       }
     }
   }
@@ -2684,11 +2690,11 @@ void dlio::OdomNode::getNextPose() {
     this->gicp.setLidarProjection(this->lidar_az_a_, this->lidar_az_b_, this->lidar_el_a_, this->lidar_el_b_);
     // Per-row elevation LUT (non-uniform OS beams): pass only if fully finite
     // and strictly monotonic, else fall back to the linear el model.
-    bool lut_ok = this->lidar_el_lut_.size() == (size_t)this->lidar_refl_img_.rows && !this->lidar_el_lut_.empty();
-    for (size_t k = 1; k < this->lidar_el_lut_.size() && lut_ok; ++k) {
-      const float a = this->lidar_el_lut_[k - 1], b = this->lidar_el_lut_[k];
-      if (!std::isfinite(a) || !std::isfinite(b) || a == b) { lut_ok = false; }
-    }
+    // Validated once when the LUT was built (nano_gicp::elevationLutUsable);
+    // the keyframe-reference sampler gates on the SAME flag so both sides
+    // always project with the same model.
+    const bool lut_ok = this->lidar_el_lut_valid_
+        && this->lidar_el_lut_.size() == (size_t)this->lidar_refl_img_.rows;
     this->gicp.setLidarElevationLut(lut_ok ? this->lidar_el_lut_ : std::vector<float>{});
     // Range image + tolerance for the occlusion / wrong-surface rejection.
     this->gicp.setLidarRangeImage(this->lidar_range_img_);

@@ -203,6 +203,12 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_elevation_lut test/test_elevation_lut.cpp)
+  target_compile_definitions(test_elevation_lut PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_elevation_lut
+    dlio_components
+  )
+
   ament_add_gtest(test_physics_fuse test/test_physics_fuse.cpp)
   target_compile_definitions(test_physics_fuse PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_physics_fuse

@@ -641,6 +641,7 @@ private:
   float lidar_img_az_grad_energy_ = 0.f;  // mean |dI/dcol| over valid pairs (/scale units): full-res texture present?
   float lidar_az_a_, lidar_az_b_, lidar_el_a_, lidar_el_b_;  // self-calibrated spherical model
   std::vector<float> lidar_el_lut_;    // per-row mean elevation [rad] (non-uniform beams)
+  bool lidar_el_lut_valid_ = false;    // LUT passed elevationLutUsable() when built; ALL consumers gate on this
   double lidar_range_abs_tol_, lidar_range_rel_tol_;  // occlusion tolerance [m], fraction
   bool lidar_cond_scale_enabled_;      // direction-scale the lidar-map term along weak geom axes
   double lidar_cs_power_, lidar_cs_cap_;  // cond-scale exponent + per-direction boost cap

@@ -29,6 +29,7 @@
 #include <omp.h>
 #include <Eigen/Dense>
 #include <pcl/common/transforms.h>
+#include "nano_gicp/elevation_lut.h"
 
 namespace {
 // Bilinear sample of a single-channel CV_32F image. Caller guarantees the 2x2
@@ -45,29 +46,6 @@ inline float bilinearSample(const cv::Mat& img, float u, float v) {
   return top * (1.f - ay) + bot * ay;
 }
 
-// Invert a monotonic per-row elevation LUT: given an elevation [rad], return
-// the fractional row and the local slope d(el)/d(row) [rad/row] used by the
-// projection Jacobian. Returns false if el is outside the LUT's coverage.
-// Handles both increasing- and decreasing-with-row beam orderings.
-inline bool rowFromElevationLut(const std::vector<float>& lut, float el,
-                                float& row_out, float& slope_out) {
-  const int n = static_cast<int>(lut.size());
-  if (n < 2) { return false; }
-  const bool inc = lut[n - 1] >= lut[0];
-  for (int k = 0; k < n - 1; ++k) {
-    const float a = lut[k], b = lut[k + 1];
-    const float lo = inc ? a : b;
-    const float hi = inc ? b : a;
-    if (el >= lo && el <= hi) {
-      const float denom = b - a;
-      if (std::abs(denom) < 1e-9f) { continue; }
-      row_out = static_cast<float>(k) + (el - a) / denom;
-      slope_out = denom;  // [rad/row] between row k and k+1
-      return true;
-    }
-  }
-  return false;
-}
 }  // namespace
 
 template class nano_gicp::NanoGICP<dlio::Point, dlio::Point>;
