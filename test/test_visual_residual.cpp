@@ -60,6 +60,17 @@ class TestableGICP : public nano_gicp::NanoGICP<dlio::Point, dlio::Point> {
     this->accumulateLidarMapResidual(trans, &H, &b, &cost);
     return cost;
   }
+
+  // Returns (H, b, cost) for the frame-to-FRAME LiDAR flow term alone.
+  double lidarFlowSystem(const Eigen::Isometry3f& trans,
+                         Eigen::Matrix<double, 6, 6>& H,
+                         Eigen::Matrix<double, 6, 1>& b) {
+    H.setZero();
+    b.setZero();
+    double cost = 0.0;
+    this->accumulateLidarFlowResidual(trans, &H, &b, &cost);
+    return cost;
+  }
 };
 
 dlio::Point makePoint(float x, float y, float z) {
@@ -925,6 +936,145 @@ TEST(VisualDenseSource, StrideCapsIteration) {
   capped.visualSystem(Eigen::Isometry3f::Identity(), H, bvec);
   EXPECT_LT(capped.lastVisualCount(), full.lastVisualCount());
   EXPECT_LE(capped.lastVisualCount(), 40);           // <= ~maxPoints
+}
+
+// ---- Frame-to-FRAME LiDAR flow term: numerical correctness ------------------
+//
+// doc/LIDAR_FLOW_TERM.md calls the Jacobian "correct by construction" but states
+// a sign/frame slip "can only be ruled out on the bag" -- until now the only
+// flow tests were crash/bounded smoke checks. These pin the two properties that
+// actually catch a sign or frame error without a bag: the residual vanishes at
+// the true pose, and the analytic Jacobian matches a finite difference of the
+// cost. Uses the image-to-image reference mode (the default since the 2026-07-09
+// intensity audit), so both sides of the residual are image samples.
+namespace {
+
+// Set up a flow problem where the PREVIOUS scan sits at a known offset from the
+// current one, both looking at the same textured cylinder.
+void setupFlow(TestableGICP& g, const cv::Mat& img, const Eigen::Isometry3f& T_lw_prev,
+               const Cloud::Ptr& src) {
+  g.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  g.setLidarImage(img);                       // current image = reference side
+  g.setLidarFrame(Eigen::Isometry3f::Identity());   // world == current lidar
+  g.setLidarFlowPrev(img, T_lw_prev);         // same texture seen from prev pose
+  g.setLidarFlowMode(true, 0);                // image-to-image, single pixel
+  g.setLidarFlowWeight(1.0f);
+  g.setInputSource(src);
+}
+
+}  // namespace
+
+// With the previous scan at the SAME pose as the current one, every point
+// projects to the same pixel in both images, so the residual is identically
+// zero at trans = Identity. A flipped residual sign or a swapped frame would
+// still be zero here -- that is what the finite-difference test below is for --
+// but a projection/frame mismatch shows up immediately as a nonzero cost.
+TEST(LidarFlowResidual, ResidualIsZeroWhenFramesCoincide) {
+  TestableGICP gicp;
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto src = makeLidarTarget();
+  setupFlow(gicp, img, Eigen::Isometry3f::Identity(), src);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  const double cost = gicp.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_GT(gicp.lastLidarFlowCount(), 20);   // the term actually engaged
+  EXPECT_NEAR(cost, 0.0, 1e-9);
+  EXPECT_LT(b.norm(), 1e-3);                  // no gradient at the optimum
+  EXPECT_LT(gicp.lastLidarFlowRms(), 1e-4);
+}
+
+// THE sign/frame test: the analytic gradient must agree with a central finite
+// difference of the term's own cost, per DOF. A flipped Jacobian sign or a
+// left/right perturbation mix-up inverts one or more components and fails here.
+TEST(LidarFlowResidual, AnalyticJacobianMatchesFiniteDifference) {
+  TestableGICP gicp;
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto src = makeLidarTarget();
+  // Previous scan displaced, so the residual is non-trivial at Identity.
+  Eigen::Isometry3f T_lw_prev = Eigen::Isometry3f::Identity();
+  T_lw_prev.pretranslate(Eigen::Vector3f(0.12f, -0.07f, 0.04f));
+  setupFlow(gicp, img, T_lw_prev, src);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  const double c0 = gicp.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(gicp.lastLidarFlowCount(), 20);
+  ASSERT_GT(c0, 1e-9);                        // non-trivial working point
+
+  // House convention (see VisualResidual.AnalyticJacobianMatchesFiniteDifference
+  // above): the accumulators build b = +J^T r and the solver descends via
+  // solve(-b), so the gradient of the term's cost is +2b.
+  const float eps = 1e-4f;
+  Eigen::Matrix<double, 6, 1> num_grad = Eigen::Matrix<double, 6, 1>::Zero();
+  for (int k = 0; k < 6; ++k) {
+    Eigen::Matrix<double, 6, 1> dx = Eigen::Matrix<double, 6, 1>::Zero();
+    dx(k) = eps;
+    auto step = [&](double s) {
+      Eigen::Isometry3f T = Eigen::Isometry3f::Identity();
+      const Eigen::Vector3f rot = (s * dx.head<3>()).cast<float>();
+      if (rot.norm() > 1e-12f) { T.prerotate(Eigen::AngleAxisf(rot.norm(), rot / rot.norm())); }
+      T.pretranslate((s * dx.tail<3>()).cast<float>());
+      return T;
+    };
+    Eigen::Matrix<double, 6, 6> Hp, Hm; Eigen::Matrix<double, 6, 1> bp, bm;
+    const double cp = gicp.lidarFlowSystem(step(+1.0), Hp, bp);
+    const double cm = gicp.lidarFlowSystem(step(-1.0), Hm, bm);
+    num_grad(k) = (cp - cm) / (2.0 * eps);
+  }
+  const Eigen::Matrix<double, 6, 1> analytic = 2.0 * b;
+  // Tight: the cost is a bilinear image sample so the difference carries some
+  // interpolation noise, but agreement is otherwise to several digits. A sign
+  // slip in ANY dof blows this up by 2x the component.
+  EXPECT_LT((num_grad - analytic).norm(), 0.02 * analytic.norm() + 1e-6)
+      << "num=" << num_grad.transpose() << "\nana=" << analytic.transpose();
+}
+
+// Descent check: stepping along the term's own Gauss-Newton direction must
+// LOWER its cost. This is the property a flipped sign destroys outright.
+TEST(LidarFlowResidual, GaussNewtonStepDecreasesCost) {
+  TestableGICP gicp;
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto src = makeLidarTarget();
+  Eigen::Isometry3f T_lw_prev = Eigen::Isometry3f::Identity();
+  T_lw_prev.pretranslate(Eigen::Vector3f(0.10f, 0.05f, -0.03f));
+  setupFlow(gicp, img, T_lw_prev, src);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  const double cost0 = gicp.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(cost0, 1e-9);
+  H.diagonal().array() += 1e-6;
+  const Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(-b);
+  Eigen::Isometry3f stepped = Eigen::Isometry3f::Identity();
+  const Eigen::Vector3f rot = dx.head<3>().cast<float>();
+  if (rot.norm() > 1e-12f) { stepped.prerotate(Eigen::AngleAxisf(rot.norm(), rot / rot.norm())); }
+  stepped.pretranslate(dx.tail<3>().cast<float>());
+
+  Eigen::Matrix<double, 6, 6> H1; Eigen::Matrix<double, 6, 1> b1;
+  const double cost1 = gicp.lidarFlowSystem(stepped, H1, b1);
+  EXPECT_LT(cost1, cost0);                    // a flipped Jacobian would ascend
+}
+
+// Legacy point-field reference mode must remain wired: with imageRef off the
+// reference is the source point's own .reflectivity, so a cylinder whose points
+// carry exactly their own image sample is again zero-residual at coincidence.
+TEST(LidarFlowResidual, FieldReferenceModeStillZeroAtCoincidence) {
+  TestableGICP gicp;
+  cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto src = makeLidarTarget();
+  for (auto& p : src->points) {
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    p.reflectivity = bilinearSampleRamp(img, u, v) * 255.f;   // matches /255 scale
+  }
+  gicp.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  gicp.setLidarFrame(Eigen::Isometry3f::Identity());
+  gicp.setLidarFlowPrev(img, Eigen::Isometry3f::Identity());
+  gicp.setLidarFlowMode(false, 0);            // legacy: point-field reference
+  gicp.setLidarFlowWeight(1.0f);
+  gicp.setInputSource(src);
+
+  Eigen::Matrix<double, 6, 6> H; Eigen::Matrix<double, 6, 1> b;
+  const double cost = gicp.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b);
+  EXPECT_GT(gicp.lastLidarFlowCount(), 20);
+  EXPECT_NEAR(cost, 0.0, 1e-9);
 }
 
 int main(int argc, char** argv) {
