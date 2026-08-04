@@ -15,6 +15,7 @@
 #include "rclcpp/create_timer.hpp"
 
 #include <filesystem>
+#include <system_error>
 
 dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
     : Node("dlio_map_node", options) {
@@ -117,7 +118,16 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
   float leaf_size = req->leaf_size;
   std::string p = req->save_path;
 
-  if (!std::filesystem::is_directory(p)) {
+  std::error_code directory_error;
+  const bool is_directory = std::filesystem::is_directory(p, directory_error);
+  if (directory_error) {
+    RCLCPP_ERROR(this->get_logger(), "save_pcd: could not inspect directory %s: %s",
+                 p.c_str(), directory_error.message().c_str());
+    res->success = false;
+    return;
+  }
+
+  if (!is_directory) {
     RCLCPP_ERROR(this->get_logger(), "save_pcd: could not find directory %s", p.c_str());
     res->success = false;
     return;

@@ -13,6 +13,8 @@
  ***********************************************************/
 
 #include "rclcpp/rclcpp.hpp"
+#include "rcl_interfaces/msg/floating_point_range.hpp"
+#include "rcl_interfaces/msg/parameter_descriptor.hpp"
 
 namespace dlio {
 
