@@ -1,0 +1,38 @@
+# EXAMPLE: Ouster sensor using the calibrated-reflectivity photometric channel.
+#
+# Ouster calibrated reflectivity is already range-normalized by the sensor, so
+# the photometric term gets a cleaner signal than raw intensity (and the
+# software range correction is skipped automatically). Recommended together
+# with the 'plane' regularization + degeneracy gate in tunnel-like
+# environments.
+#
+# Usage (overlay on top of the defaults; later files win):
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
+#     params_file:=$(ros2 pkg prefix direct_lidar_inertial_odometry)/share/direct_lidar_inertial_odometry/cfg/params.yaml
+#   ros2 param load ... or append this file:
+#     --ros-args --params-file .../cfg/examples/ouster_reflectivity.yaml
+#
+# Requires the driver to publish the 'reflectivity' point field
+# (ouster-ros does by default).
+
+/**:
+  ros__parameters:
+    odom/gicp/photometricChannel: reflectivity
+    # Ouster calibrated reflectivity: 0-100 diffuse %, 101-255 retroreflective.
+    odom/gicp/photometricScale: 255.0
+    # CAVEAT (2026-07-09, doc/INTENSITY_AUDIT_2026-07-09.md): this 3D term reads
+    # VOXEL-AVERAGED (0.25m leaf) reflectivity with ~0.5-1m kNN gradient support,
+    # so fine wall texture never reaches it. Fine as a mild aid in feature-rich,
+    # non-degenerate environments; in self-similar corridors the surviving
+    # low-frequency shading is an ALIASED drive -- use the image-domain terms
+    # (odom/lidar_image/*) and photometricWeight 0 there (see ouster_tunnel.yaml).
+    odom/gicp/photometricWeight: 0.1
+
+    # Sharper degeneracy discrimination for self-similar environments.
+    odom/gicp/regularizationMethod: plane
+    odom/gicp/degeneracyThreshRatio: 0.005
+
+    # The OS-series integrated IMU offset (from the Ouster datasheet); replace
+    # with your unit's calibration if available.
+    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]

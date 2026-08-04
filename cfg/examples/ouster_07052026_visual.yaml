@@ -1,0 +1,21 @@
+# Extra visual-term override for the 07052026_4_an dataset. Layer AFTER
+# ouster_tunnel_visual.yaml (dlio_07052026.launch.py does this automatically)
+# — this file only adds what that one leaves off by default.
+#
+# denseSource: ouster_tunnel_visual.yaml ships this OFF ("enable to test").
+# Confirmed needed here (2026-07-08): without it, the f2f term's source cloud
+# (~1-3k sparse voxelised points) doesn't populate the Lucid camera's FOV at
+# all — the in-FOV count collapses to ~0, same starvation the file's own
+# comment predicts. Enabling it (projects the full ~43k-point deskewed scan
+# instead) is necessary but not sufficient on this bag: even with it AND the
+# timestamp-domain fix (see dlio_07052026.launch.py's timestamp_mode
+# comment), most candidate points still land in "behind camera" / "out of
+# bounds" rejects rather than becoming active matches — likely the
+# extrinsics/cam2lidar calibration (copied from ouster_tunnel_visual.yaml,
+# itself flagged "CONFIRM which camera serial" — never fully verified) not
+# applying cleanly to this rig/session. Re-derive cam2lidar before trusting
+# any Visual Points/Rescued Axes numbers from this dataset.
+/**:
+  ros__parameters:
+    odom/visual/denseSource/enabled: true
+    odom/visual/denseSource/maxPoints: 4000

@@ -10,24 +10,64 @@
 #                                                         #
 ###########################################################
 
+# ROBOT / SENSOR CONFIGURATION
+# Per-robot settings: sensor extrinsics, IMU intrinsics, preprocessing
+# switches. Copy this file per robot and pass it to the launch file via
+# robot_config:=/path/to/your_robot.yaml. Algorithm tuning lives in
+# params.yaml. Example overlays: cfg/examples/.
+
 /**:
   ros__parameters:
 
     version: 1.1.1
 
+    # Adapt keyframe spacing and GICP correspondence distance to the
+    # environment's spaciousness (from DLO). Disable for fixed thresholds.
     adaptive: true
 
+    # Motion-correct each scan using continuous-time IMU integration.
+    # Requires per-point timestamps (auto-detected: Ouster 't', Velodyne
+    # 'time', Hesai/Livox 'timestamp'); falls back off if absent.
     pointcloud/deskew: true
+    # Voxel-downsample each scan before registration (resolution in
+    # params.yaml: odom/preprocessing/voxelFilter/res).
     pointcloud/voxelize: true
 
+    # Estimate IMU biases (and optionally initial attitude) by averaging
+    # while STATIONARY for odom/imu/calibration/time seconds at startup.
+    # If false, the intrinsics below are used as-is.
     imu/calibration: true
+    # Some IMUs (notably Livox built-in IMUs) report linear acceleration in units
+    # of g rather than m/s^2. Set true to scale the incoming accel by odom/gravity
+    # on intake; leave false for IMUs already in m/s^2 (the usual case).
+    imu/normalized: false
+    # Accelerometer bias [m/s^2] and gyro bias [rad/s], used when
+    # imu/calibration is false (e.g. from a prior calibration run).
     imu/intrinsics/accel/bias: [ 0.0, 0.0, 0.0 ]
+    imu/intrinsics/gyro/bias:  [ 0.0, 0.0, 0.0 ]
+    # Accelerometer scale/misalignment matrix (row-major 3x3).
     imu/intrinsics/accel/sm:   [ 1.,  0.,  0.,
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]
-    imu/intrinsics/gyro/bias: [ 0.0, 0.0, 0.0 ]
 
-    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ] 
+    # Extrinsics source:
+    #   yaml (default) - use the extrinsics/baselink2{imu,lidar} (and
+    #                    cam2lidar) values below; published once on /tf_static.
+    #   tf             - look the extrinsics up from tf2 at startup (e.g.
+    #                    base_link->imu, base_link->lidar published by
+    #                    robot_state_publisher from the robot URDF). The node
+    #                    does NOT publish those static transforms in this mode;
+    #                    it waits (up to ~10 s) for them, then falls back to the
+    #                    YAML values below if they never arrive. The YAML
+    #                    extrinsics therefore double as the fallback.
+    extrinsics/source: yaml
+
+    # Rigid extrinsics from base_link to each sensor: translation [m] and
+    # row-major rotation matrix. Published once on /tf_static at startup
+    # (extrinsics/source: yaml), or used as the fallback (extrinsics/source: tf).
+    # The defaults below are the Ouster OS1's internal IMU offset; replace
+    # with your robot's calibration.
+    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]
     extrinsics/baselink2imu/R: [ 1.,  0.,  0.,
                                  0.,  1.,  0.,
                                  0.,  0.,  1. ]
@@ -35,3 +75,17 @@
     extrinsics/baselink2lidar/R: [ 1.,  0.,  0.,
                                    0.,  1.,  0.,
                                    0.,  0.,  1. ]
+
+    # camera -> lidar extrinsic for the optional direct visual term: R,t maps a
+    # camera-frame point into the lidar frame (same storage convention as
+    # baselink2lidar). Identity is a placeholder; set per-rig (see the
+    # ouster_tunnel_visual overlay). Only used when odom/visual/enabled.
+    extrinsics/cam2lidar/t: [ 0.,  0.,  0. ]
+    extrinsics/cam2lidar/R: [ 1.,  0.,  0.,
+                              0.,  1.,  0.,
+                              0.,  0.,  1. ]
+
+    # Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion [k1,k2,p1,p2,k3]
+    # for the visual term. Defaults are the 06042026 bag's /lucid_camera_1.
+    camera/intrinsics: [ 1094.19, 1092.23, 969.58, 721.31 ]
+    camera/distortion: [ -0.04409, 0.05337, -0.00124, 0.00002, 0.0 ]

@@ -1,0 +1,45 @@
+# ThreadSanitizer suppressions for the dliio concurrency harness
+# (test_node_concurrency).
+#
+# These are NOT data-race bugs. Each access below is serialized by rclcpp
+# callback-group mutual exclusion, which establishes a happens-before edge
+# through the executor that ThreadSanitizer cannot observe (rclcpp/rmw are not
+# TSan-instrumented, so consecutive invocations migrated across executor threads
+# look unsynchronized to TSan). Verified by inspection: every member touched
+# here is accessed from exactly ONE MutuallyExclusive callback group.
+#
+# Genuine cross-group races found by this harness WERE fixed (not suppressed):
+#   - publishPose reading this->state / imu_stamp  -> now snapshotted under geo.mtx
+#   - debug() reading this->state                  -> now snapshotted under geo.mtx
+#   - imu_rates write vs publishDiagnostics read   -> guarded by mtx_imu
+#   - IMU-buffer iteration vs push_front           -> range copied under mtx_imu
+#   - geo.first_opt_done cross-group bool          -> std::atomic<bool>
+#   - keyframe_normals/visual_refs concat vs push  -> copied under keyframes_mutex
+#
+# imu_cb_group (MutuallyExclusive): callbackImu + its helpers own these scalars
+# (prev_imu_stamp, first_imu_stamp, imu_meas, calibration accumulators) and the
+# transformImu() function-statics; they are never touched off the IMU callback.
+race:dlio::OdomNode::transformImu
+race:dlio::OdomNode::callbackImu
+race:dlio::OdomNode::propagateState
+# Pose timer (default MutuallyExclusive group): odom_ros/pose_ros message members
+# across serialized timer ticks. (The frame_id std::string writes that used to
+# race here are now set once in the constructor, so only the message-body writes
+# remain under this suppression.)
+race:dlio::OdomNode::publishPose
+
+# Worker-thread HANDLE join/reassign across serialized scan callbacks. The
+# `if (t.joinable()) t.join(); ... t = std::thread(...)` pattern (debug_thread,
+# publish_thread, publish_keyframe_thread) touches the std::thread handle from
+# the scan callback only; consecutive scans migrated across executor threads make
+# the handle read (joinable) and write (operator=/swap) look unsynchronized.
+# Scoped to the std::thread handle ops so real data races in the estimator logic
+# of callbackPointCloud are still reported.
+race:std::thread::joinable
+race:std::thread::swap
+
+# Third-party library noise (not dliio code):
+# OpenNI2 (pulled in transitively by PCL's I/O component) unlocks a global mutex
+# it did not lock during library load/teardown.
+called_from_lib:libOpenNI2
+mutex:libOpenNI2

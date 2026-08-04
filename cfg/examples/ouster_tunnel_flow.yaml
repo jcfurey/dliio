@@ -1,0 +1,48 @@
+# EXAMPLE: frame-to-frame LiDAR flow term + direction-separated fusion
+# (EXPLORATION #2, the second pick). Default-off elsewhere. (2026-06-26,
+# doc/LIDAR_FLOW_TERM.md + doc/DIRECTION_SEPARATED_FUSION.md.)
+#
+# Premise: the frame-to-MAP reflectivity term is along-axis ALIASED (a smooth
+# tunnel looks the same a metre forward), so it can't observe along-tunnel motion.
+# The frame-to-FRAME flow term registers the current scan against the PREVIOUS
+# scan's image, where that motion shows up as image flow, and is fused through
+# directionSeparateTerm so it ONLY constrains the geometrically-weak (degenerate)
+# subspace and can't perturb the well-observed axes — the "fuse only into the
+# degenerate direction" anti-dilution guard the scalar intensity term lacked.
+#
+# Overlay ON TOP of ouster_tunnel.yaml + ouster_06042026_extrinsics.yaml
+# [+ ouster_tunnel_lidarimg.yaml [+ _nearir]] + ouster_tunnel_xicp.yaml.
+# (2026-07-09: flow/enabled now builds the LiDAR image itself, so the lidarimg
+# overlay is no longer a hard prerequisite — layer it when you also want the
+# frame-to-map term / near-IR channel selection.)
+#
+# The Jacobian's SIGN AND MAGNITUDE are now verified numerically (2026-07-26,
+# LidarFlowResidual in test/test_visual_residual.cpp): the analytic gradient
+# matches a central finite difference of the term's own cost across all six DOF
+# to within 2%, a Gauss-Newton step decreases the cost, and the residual is zero
+# when the frames coincide in both reference modes. The old "smoke-test the sign
+# first" step is therefore retired -- a sign slip fails those tests by
+# construction, not on the bag.
+#
+# STILL NOT validated on real data: whether range/intensity flow actually
+# recovers the along-axis DOF -- that is the open question, and it is about
+# EFFICACY, not correctness. Start the weight low anyway and sweep:
+#   EXTRA_PARAMS="odom/lidar_image/flow/weight=0.05 odom/lidar_image/dirSeparated/ratio=0.05"
+# weight {0.02,0.05,0.1} x ratio {0.02,0.05}. Start the weight low.
+
+/**:
+  ros__parameters:
+    # restrict the LiDAR-image term to the weak subspace (composes with the flow term)
+    odom/lidar_image/dirSeparated/enabled: true
+    odom/lidar_image/dirSeparated/ratio: 0.05   # weak-subspace bar (fraction of lambda_max)
+    # frame-to-frame flow signal (count-normalized; comparable to lidar_image/weight 0.05)
+    odom/lidar_image/flow/enabled: true
+    odom/lidar_image/flow/weight: 0.02   # START LOW; sweep {0.02,0.05,0.1}
+    # Image-to-image reference + patch residuals (doc/INTENSITY_AUDIT_2026-07-09.md):
+    # the reference brightness comes from the CURRENT scan's full-res image, not
+    # the voxel-averaged point field (the voxel blur destroyed the graffiti-scale
+    # texture the term needs), and each point compares a zero-mean (2P+1)^2 patch
+    # (brightness-offset invariant, uses the strokes' spatial structure). imageRef
+    # false + patch 0 reproduces the original term for A/B.
+    odom/lidar_image/flow/imageRef: true
+    odom/lidar_image/flow/patch: 2   # 5x5; sweep {0,1,2,3}

@@ -1,0 +1,48 @@
+# EXTRINSICS overlay for the 07052026_4_an Ouster dataset (raw-packet capture
+# of the SAME OS-1-64 unit/mount as the 06042026 dataset — os_sensor->os_lidar
+# and os_sensor->os_imu extrinsics in this bag's /tf_static match
+# ouster_06042026_extrinsics.yaml's to rounding). Identical rotation/
+# translation math as that overlay; see its header for the full derivation
+# (Rz(180) between os_lidar and os_imu, dlio.yaml's identity default not
+# applying it, the resulting pitch/roll wobble, why extrinsics/source: tf
+# doesn't help since the os_* frames aren't connected to base_link).
+#
+# frames/baselink RENAMED — new for this dataset (06042026 didn't need it):
+# this bag's own /tf_static already defines a full rig TF tree from its
+# onboard nav/camera stack, including base_link_correction->base_link
+# (static). dlio's default frames/baselink is "base_link" — broadcasting
+# odom->base_link would make base_link have two different parents
+# (base_link_correction, statically, vs this node's odom, dynamically), and
+# tf2 rejects one side as TF_OLD_DATA (same conflict hit and fixed for RESPLE
+# in config_07052026.yaml). Rename dlio's own baselink frame so its tree
+# stays disjoint from the bag's. frames/odom is left as "odom" — dlio only
+# ever publishes odom as a PARENT (odom->base_link), never claims it as a
+# child, so it doesn't collide with the bag's separate map->odom static
+# edge; dlio.rviz's "Fixed Frame: odom" stays valid unmodified. (dlio.rviz's
+# "Target Frame: base_link" TF-display setting becomes stale/cosmetic-only
+# since the real frame is now dliio_base_link — harmless, everything else
+# in the rviz config still renders in the odom frame.)
+#
+# USAGE: merge AFTER dlio.yaml so it overrides the identity defaults, e.g.
+#   --params-file .../cfg/examples/ouster_07052026_extrinsics.yaml
+
+/**:
+  ros__parameters:
+    extrinsics/source: yaml
+
+    frames/baselink: dliio_base_link
+
+    # os_lidar -> os_imu rotation = Rz(180 deg) = diag(-1, -1, 1).
+    extrinsics/baselink2imu/R: [ -1.,  0.,  0.,
+                                  0., -1.,  0.,
+                                  0.,  0.,  1. ]
+    # os_lidar -> os_imu translation [m], composed from /tf_static
+    # (os_sensor->os_lidar t=[0,0,0.038195] Rz180; os_sensor->os_imu
+    # t=[-0.002441,-0.009725,0.007533]).
+    extrinsics/baselink2imu/t: [ 0.002441, 0.009725, -0.030662 ]
+
+    # base_link (renamed dliio_base_link above) == os_lidar frame.
+    extrinsics/baselink2lidar/R: [ 1., 0., 0.,
+                                   0., 1., 0.,
+                                   0., 0., 1. ]
+    extrinsics/baselink2lidar/t: [ 0., 0., 0. ]
