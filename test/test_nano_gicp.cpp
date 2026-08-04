@@ -82,6 +82,9 @@ nano_gicp::NanoGICP<dlio::Point, dlio::Point> makeGICP() {
   gicp.setMaximumIterations(32);
   gicp.setCorrespondenceRandomness(16);
   gicp.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
+  // Most NanoGICP tests exercise the Lyrical degeneracy implementation. The
+  // deployed integration default is deliberately off pending bag validation.
+  gicp.setDegeneracyThreshRatio(0.005f);
   return gicp;
 }
 
@@ -150,6 +153,23 @@ TEST(NanoGICP, DegeneracyGateCanBeDisabled) {
   Cloud aligned;
   gicp.align(aligned);
   EXPECT_EQ(gicp.lastDegenerateDirections(), 0);
+}
+
+TEST(NanoGICP, DegeneracyGateIsDisabledByIntegrationDefault) {
+  auto target = makePlane(1.0f, 0.05f);
+  nano_gicp::NanoGICP<dlio::Point, dlio::Point> gicp;
+  gicp.setMaxCorrespondenceDistance(1.0f);
+  gicp.setMaximumIterations(32);
+  gicp.setCorrespondenceRandomness(16);
+  gicp.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
+  gicp.setInputTarget(target);
+  gicp.setInputSource(target);
+
+  Cloud aligned;
+  gicp.align(aligned);
+  EXPECT_EQ(gicp.lastDegenerateDirections(), 0);
+  EXPECT_FLOAT_EQ(gicp.lastGeoRotMargin(), -1.0f);
+  EXPECT_FLOAT_EQ(gicp.lastGeoTransMargin(), -1.0f);
 }
 
 // The held degenerate eigen-directions are EXPOSED (world-frame unit vectors)
@@ -566,6 +586,10 @@ TEST(NanoGICP, PhotometricNormalizationDisabledIsBitIdentical) {
 
   auto run = [&](bool set_zero) {
     auto g = makeGICP();
+    // This test isolates setter-path identity. Independent multithreaded solves
+    // may differ in floating-point reduction order even when they take the same
+    // code path, so use a deterministic reduction for the exact comparison.
+    g.setNumThreads(1);
     g.setPhotometricWeight(0.5f);                 // engage photometric (gradients on setInputTarget)
     if (set_zero) { g.setPhotometricRefCount(0.f); }
     g.setInputTarget(target);
@@ -662,7 +686,7 @@ TEST(NanoGICP, GeoTrustMarginReflectsConditioning) {
   gp.setInputTarget(plane);
   gp.setInputSource(plane);
   Cloud ap; gp.align(ap);
-  EXPECT_GE(gp.lastGeoTransMargin(), 0.0f);         // computed (gate on by default)
+  EXPECT_GE(gp.lastGeoTransMargin(), 0.0f);         // computed (test helper enables the gate)
   EXPECT_LT(gp.lastGeoTransMargin(), 1.0f);         // weakest trans axis is degenerate
   EXPECT_LT(gp.lastGeoTransMargin(), gc.lastGeoTransMargin());
 }
@@ -922,6 +946,9 @@ TEST(NanoGICP, AdaptiveKernelDisabledIsBitIdentical) {
 
   auto run = [&](bool set_off) {
     auto g = makeGICP();
+    // See PhotometricNormalizationDisabledIsBitIdentical: exact equality is a
+    // code-path assertion, not a cross-run OpenMP reproducibility assertion.
+    g.setNumThreads(1);
     g.setPhotometricWeight(0.5f);
     if (set_off) { g.setAdaptiveKernel(false, 0.5f, 2.0f, 0.f); }
     g.setInputTarget(target);
@@ -967,6 +994,49 @@ TEST(NanoGICP, TinyCloudDoesNotCrashCovarianceEstimation) {
     gicp.setInputSource(tiny);
   });
   EXPECT_EQ(gicp.getSourceCovariances().size(), tiny->size());
+}
+
+TEST(NanoGICP, NullAndEmptyCloudsDoNotReplaceValidInputs) {
+  auto target = makeCorner(1.0f, 0.1f);
+  auto source = transformCloud(target, Eigen::Matrix4f::Identity());
+  auto gicp = makeGICP();
+  gicp.setInputTarget(target);
+  gicp.setInputSource(source);
+  ASSERT_EQ(gicp.getSourceCovariances().size(), source->size());
+
+  Cloud::ConstPtr null_cloud;
+  auto empty_cloud = std::make_shared<Cloud>();
+  EXPECT_NO_THROW(gicp.setInputSource(null_cloud));
+  EXPECT_NO_THROW(gicp.setInputSource(empty_cloud));
+  EXPECT_NO_THROW(gicp.setInputTarget(null_cloud));
+  EXPECT_NO_THROW(gicp.setInputTarget(empty_cloud));
+  EXPECT_NO_THROW(gicp.registerInputTarget(null_cloud));
+  EXPECT_NO_THROW(gicp.registerInputTarget(empty_cloud));
+
+  // Invalid updates leave the last valid source/target and their derived data
+  // intact, matching PCL's empty-cloud behavior without dereferencing null.
+  EXPECT_EQ(gicp.getSourceCovariances().size(), source->size());
+  Cloud aligned;
+  ASSERT_NO_THROW(gicp.align(aligned));
+  EXPECT_TRUE(gicp.getFinalTransformation().allFinite());
+}
+
+TEST(NanoGICP, RejectsNonFiniteMahalanobisInverse) {
+  auto target = makeCorner(1.0f, 0.1f);
+  auto gicp = makeGICP();
+  gicp.setInputTarget(target);
+  gicp.setInputSource(target);
+
+  Eigen::Matrix4f invalid_cov = Eigen::Matrix4f::Identity();
+  invalid_cov(0, 0) = std::numeric_limits<float>::quiet_NaN();
+  auto invalid_covs = std::make_shared<nano_gicp::CovarianceList>(
+      target->size(), invalid_cov);
+  gicp.setTargetCovariances(invalid_covs);
+
+  Cloud aligned;
+  ASSERT_NO_THROW(gicp.align(aligned));
+  EXPECT_TRUE(gicp.getFinalTransformation().allFinite());
+  EXPECT_TRUE(gicp.getFinalTransformation().isApprox(Eigen::Matrix4f::Identity(), 0.f));
 }
 
 // Covariance regularization (synthetic plane): PLANE forces the scale-free

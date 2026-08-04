@@ -188,7 +188,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   // separately and the GICP update is projected off directions below
   // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
   double degeneracyThreshRatio;
-  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.005,
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.0,
       "Degeneracy gate ratio (live-tunable; 0 disables)", 0.0, 1.0);
   this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
 

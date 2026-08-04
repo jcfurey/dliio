@@ -276,7 +276,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->photometric_ref_count_ = 0.0f;   // mass-normalization OFF by default (raw)
   this->last_photometric_count_ = 0;
   this->last_photometric_rms_ = 0.0f;
-  this->degeneracy_thresh_ratio_ = 0.005f;
+  this->degeneracy_thresh_ratio_ = 0.0f;  // opt in after environment-specific validation
   this->degeneracy_softness_ = 0.0f;   // binary gate by default (bit-identical)
   this->prob_gate_enabled_ = false;    // probabilistic gate OFF by default
   this->prob_noise_floor_rot_ = 0.0f;
@@ -347,7 +347,7 @@ NanoGICP<PointSource, PointTarget>::NanoGICP() {
   this->genz_point_weight_ = 1.0f;   // isotropic point-to-point metric scale [1/m^2]
   this->current_genz_alpha_ = 1.0f;  // pure point-to-plane until a scan sets it
   this->xicp_ternary_enabled_ = false;  // X-ICP ternary gate OFF -> existing gate (bit-identical)
-  this->xicp_full_ratio_ = 0.05f;        // localizable bar; > degeneracy_thresh_ratio_ (0.005 default)
+  this->xicp_full_ratio_ = 0.05f;        // localizable bar; > degeneracy_thresh_ratio_ when enabled
   this->xicp_partial_budget_trans_ = 0.f;  // per-scan partial-band admission cap [m]; 0 = unbudgeted
   this->xicp_partial_budget_rot_ = 0.f;    // per-scan partial-band admission cap [rad]; 0 = unbudgeted
   this->saliency_enabled_ = false;       // anti-dilution saliency weighting OFF -> unit weights (bit-identical)
@@ -770,6 +770,11 @@ void NanoGICP<PointSource, PointTarget>::setRegularizationMethod(RegularizationM
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceConstPtr& cloud) {
+  if (!cloud || cloud->empty()) {
+    PCL_ERROR("[pcl::NanoGICP::setInputSource] Invalid or empty point cloud dataset given!\n");
+    return;
+  }
+
   pcl::Registration<PointSource, PointTarget>::setInputSource(cloud);
   
   input_kdtree_.reset(new nanoflann::KdTreeFLANN<PointSource>(false));
@@ -784,6 +789,11 @@ void NanoGICP<PointSource, PointTarget>::setInputSource(const PointCloudSourceCo
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setInputTarget(const PointCloudTargetConstPtr& cloud) {
+  if (!cloud || cloud->empty()) {
+    PCL_ERROR("[pcl::NanoGICP::setInputTarget] Invalid or empty point cloud dataset given!\n");
+    return;
+  }
+
   registerInputTarget(cloud);
 
   auto covs = std::make_shared<CovarianceList>();
@@ -793,6 +803,11 @@ void NanoGICP<PointSource, PointTarget>::setInputTarget(const PointCloudTargetCo
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::registerInputTarget(const PointCloudTargetConstPtr& cloud) {
+  if (!cloud || cloud->empty()) {
+    PCL_ERROR("[pcl::NanoGICP::registerInputTarget] Invalid or empty point cloud dataset given!\n");
+    return;
+  }
+
   pcl::Registration<PointSource, PointTarget>::setInputTarget(cloud);
 
   auto kdtree = std::make_shared<nanoflann::KdTreeFLANN<PointTarget>>(false);
@@ -1410,16 +1425,18 @@ void NanoGICP<PointSource, PointTarget>::update_correspondences(const Eigen::Iso
         // (a healthy scan satisfies all of these, so this is bit-identical there).
         if (found > 0 && k_indices[0] >= 0 && k_indices[0] < n_target &&
             std::isfinite(k_sq_dists[0]) && k_sq_dists[0] < max_dist_sq) {
-            correspondences_[i] = k_indices[0];
-            sq_distances_[i] = k_sq_dists[0];
-
             const Eigen::Matrix4f& source_cov = source_covs_[i];
             const Eigen::Matrix4f& target_cov = (*target_covs_)[k_indices[0]];
             Eigen::Matrix4f RCR = (source_cov + target_cov);
             RCR(3, 3) = 1.0;
 
-            mahalanobis_[i] = RCR.inverse();
-            mahalanobis_[i](3, 3) = 0.0;
+            Eigen::Matrix4f mahalanobis = RCR.inverse();
+            if (!mahalanobis.allFinite()) { continue; }
+            mahalanobis(3, 3) = 0.0;
+
+            correspondences_[i] = k_indices[0];
+            sq_distances_[i] = k_sq_dists[0];
+            mahalanobis_[i] = mahalanobis;
         }
     }
 }

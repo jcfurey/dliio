@@ -132,9 +132,11 @@
     # the update is projected off directions with eigenvalue below
     # ratio * block_lambda_max, holding the IMU prior along unobservable
     # directions instead of amplifying noise. Raise (e.g. 0.02) to gate
-    # earlier/more aggressively; 0.0 disables the gate entirely.
+    # earlier/more aggressively. The integration default is 0.0 (disabled) to
+    # preserve feature/intensity-dev behavior until bag validation; the tunnel
+    # and reflectivity example overlays opt in at 0.005.
     # Most discriminative with regularizationMethod: plane.
-    odom/gicp/degeneracyThreshRatio: 0.005
+    odom/gicp/degeneracyThreshRatio: 0.0
 
     # Soft degeneracy gate: instead of toggling each eigen-direction between
     # full-trust (above the threshold) and full prior-hold (below it), ramp the
