@@ -1,3 +1,5 @@
+#pragma once
+
 /***********************************************************
  *                                                         *
  * Copyright (c)                                           *
@@ -28,7 +30,7 @@ class dlio::MapNode: public rclcpp::Node {
 
 public:
 
-  MapNode();
+  explicit MapNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~MapNode();
 
   void start();
@@ -38,6 +40,7 @@ private:
   void getParams();
 
   void callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& keyframe);
+  void publishMap();
 
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
@@ -45,14 +48,13 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr keyframe_sub;
   rclcpp::CallbackGroup::SharedPtr keyframe_cb_group, save_pcd_cb_group;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub;
+  rclcpp::TimerBase::SharedPtr map_pub_timer;
 
   rclcpp::Service<direct_lidar_inertial_odometry::srv::SavePCD>::SharedPtr save_pcd_srv;
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
+  std::mutex map_mutex;  // guards dlio_map across callbackKeyframe / publishMap / savePCD
   pcl::VoxelGrid<PointType> voxelgrid;
-
-  // FIX: protects dlio_map between callbackKeyframe and savePCD service threads
-  std::mutex map_mutex;
 
   std::string odom_frame;
 

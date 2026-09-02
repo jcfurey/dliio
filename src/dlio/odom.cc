@@ -12,12 +12,89 @@
 
 #include "dlio/odom.h"
 #include "dlio/utils.h"
+#include "dlio/degeneracy_governor.h"
+#include "dlio/degeneracy_observer.h"
+#include "dlio/physics_fuse.h"
+#include "nano_gicp/elevation_lut.h"
+#include <set>
+#include <unordered_map>
+#include <limits>
+#include <cstdint>
 
 #include <queue>
 
 #include "rclcpp/qos.hpp"
+#include "rclcpp/create_timer.hpp"
+#include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <sensor_msgs/image_encodings.hpp>
+#include <cv_bridge/cv_bridge.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
-dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
+#ifdef HAVE_LIVOX_ROS_DRIVER2
+#include <livox_ros_driver2/msg/custom_msg.hpp>
+
+namespace {
+// Convert a Livox custom message to a PointType cloud and serialize it as a
+// PointCloud2. Each point's timestamp is stored as ABSOLUTE nanoseconds (a
+// double = base_ns + per-point offset_time) so getScanFromROS classifies the
+// cloud as LIVOX (timestamp > 1e14) and deskew recovers absolute seconds via
+// the existing LIVOX branch -- no separate point struct needed.
+sensor_msgs::msg::PointCloud2 livoxToPointCloud2(
+    const livox_ros_driver2::msg::CustomMsg& livox, const std::string& frame_id) {
+  const double base_ns = static_cast<double>(livox.header.stamp.sec) * 1e9
+                       + static_cast<double>(livox.header.stamp.nanosec);
+
+  pcl::PointCloud<dlio::Point> cloud;
+  cloud.points.reserve(livox.point_num);
+  for (std::uint32_t i = 0; i < livox.point_num; ++i) {
+    const auto& src = livox.points[i];
+    dlio::Point p;
+    p.x = src.x;
+    p.y = src.y;
+    p.z = src.z;
+    p.intensity = static_cast<float>(src.reflectivity);
+    p.reflectivity = static_cast<float>(src.reflectivity);
+    p.timestamp = base_ns + static_cast<double>(src.offset_time);
+    cloud.points.push_back(p);
+  }
+  cloud.width = static_cast<std::uint32_t>(cloud.points.size());
+  cloud.height = 1;
+  cloud.is_dense = true;
+
+  sensor_msgs::msg::PointCloud2 out;
+  pcl::toROSMsg(cloud, out);
+  out.header.stamp = livox.header.stamp;
+  out.header.frame_id = frame_id;
+  return out;
+}
+}  // namespace
+#endif
+
+// Keep statistics history vectors bounded: drop the oldest half once they
+// exceed max_size, so long runs don't grow memory (and debug() stays O(window)).
+template <typename T>
+static void cap_history(std::vector<T>& v, size_t max_size = 1000) {
+  if (v.size() > max_size) {
+    v.erase(v.begin(), v.begin() + v.size()/2);
+  }
+}
+
+// Bilinear sample of a single-channel CV_32F image (caller guarantees the 2x2
+// neighborhood is in bounds). Shared by the keyframe visual-ref sampler.
+static inline float bilinearF(const cv::Mat& img, float u, float v) {
+  const int x0 = static_cast<int>(std::floor(u));
+  const int y0 = static_cast<int>(std::floor(v));
+  const float ax = u - x0, ay = v - y0;
+  const float* r0 = img.ptr<float>(y0);
+  const float* r1 = img.ptr<float>(y0 + 1);
+  const float top = r0[x0] * (1.f - ax) + r0[x0 + 1] * ax;
+  const float bot = r1[x0] * (1.f - ax) + r1[x0 + 1] * ax;
+  return top * (1.f - ay) + bot * ay;
+}
+
+dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
+    : Node("dlio_odom_node", options) {
 
   this->getParams();
 
@@ -31,33 +108,294 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->deskew_status = false;
   this->deskew_size = 0;
 
-  // FIX: slash-separated names match the YAML file.
-  // Dot-separated names were silently ignored so config values never took effect.
-  this->photometric_weight_ = this->declare_parameter<double>("odom/gicp/photometricWeight", 0.0);
-  this->gicp.setPhotometricWeight(this->photometric_weight_);
+  // NOTE: declare with slash-separated names via dlio::declare_param so these match
+  // the keys in cfg/params.yaml. Dot-separated names do NOT match the YAML keys and
+  // silently fall back to the defaults (which left the photometric term disabled).
+  double photometricWeight;
+  dlio::declare_param(this, "odom/gicp/photometricWeight", photometricWeight, 0.0,
+      "Weight of the photometric GICP residual relative to the geometric term (live-tunable)", 0.0, 10.0);
+
   // Intensity range correction parameters
-  this->intensity_alpha_ = this->declare_parameter("odom/preprocessing/intensityAlpha", 2.0);
-  this->intensity_r_ref_ = this->declare_parameter("odom/preprocessing/intensityRRef", 1.0);
-  int gradientKNeighbors   = this->declare_parameter<int>("odom/gicp/gradientKNeighbors", 10);
+  dlio::declare_param(this, "odom/preprocessing/intensityAlpha", this->intensity_alpha_, 2.0,
+      "Intensity range-correction falloff exponent (2.0 = inverse-square)");
+  dlio::declare_param(this, "odom/preprocessing/intensityRRef", this->intensity_r_ref_, 1.0,
+      "Intensity range-correction reference range [m]");
+  dlio::declare_param(this, "odom/preprocessing/intensityIncidence", this->intensity_incidence_, false,
+      "Also divide intensity by cos(incidence angle) (Kashani radiometric model); organized scans only");
+  dlio::declare_param(this, "odom/preprocessing/intensityCosMin", this->intensity_cos_min_, 0.2,
+      "Floor on cos(incidence) to avoid grazing-angle blow-up (0.2 ~= 78 deg)");
+  int gradientKNeighbors;
+  dlio::declare_param(this, "odom/gicp/gradientKNeighbors", gradientKNeighbors, 10,
+      "Neighbors used to estimate the spatial photometric gradient on the submap");
 
+  // Photometric channel: "intensity" (range-dependent; pairs with the range
+  // correction below) or "reflectivity" (e.g. Ouster calibrated reflectivity,
+  // already range-normalized -> the range correction is skipped for it).
+  std::string photometricChannel;
+  dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"),
+      "Point field feeding the photometric term: 'intensity' or 'reflectivity'");
+  this->use_reflectivity_ = (photometricChannel == "reflectivity");
+  this->photometric_active_ = (photometricWeight > 0.0);
+  if (photometricChannel != "intensity" && photometricChannel != "reflectivity") {
+    RCLCPP_WARN(this->get_logger(),
+        "Unknown odom/gicp/photometricChannel '%s'; defaulting to 'intensity'.",
+        photometricChannel.c_str());
+  }
+
+  this->gicp.setPhotometricWeight(photometricWeight);
   this->gicp.setGradientKNeighbors(gradientKNeighbors);
+  this->gicp.setPhotometricChannel(this->use_reflectivity_);
 
-  double photometricScale = this->declare_parameter<double>("odom/gicp/photometricScale", 255.0);
+  // Full-scale of the photometric channel; the channel is normalized by this
+  // so photometricWeight is sensor-independent (255 covers 8-bit intensity and
+  // Ouster calibrated reflectivity; use 65535 for raw 16-bit channels).
+  double photometricScale;
+  dlio::declare_param(this, "odom/gicp/photometricScale", photometricScale, 255.0,
+      "Full-scale of the photometric channel (channel is divided by this; 255 for 8-bit / Ouster reflectivity)");
   this->gicp.setPhotometricScale(static_cast<float>(photometricScale));
 
+  // Huber threshold on the normalized photometric residual; residuals beyond
+  // it are downweighted so specular/wet-surface outliers can't shove the
+  // pose at full weight. <= 0 disables.
+  double photometricHuberDelta;
+  dlio::declare_param(this, "odom/gicp/photometricHuberDelta", photometricHuberDelta, 0.05,
+      "Huber threshold on the normalized photometric residual (live-tunable; <=0 disables)", 0.0, 1.0);
+  this->gicp.setPhotometricHuberDelta(static_cast<float>(photometricHuberDelta));
 
+  // GICP covariance regularization:
+  //   min_eig (default)    - clamp small singular values (this fork's historical
+  //                          behavior, previously mislabeled "plane")
+  //   plane                - true GICP plane-to-plane: fixed (1, 1, 1e-3) discs
+  //   normalized_min_eig   - scale-normalized clamp
+  //   frobenius | none
+  std::string regularizationMethod;
+  dlio::declare_param(this, "odom/gicp/regularizationMethod", regularizationMethod, std::string("min_eig"),
+      "GICP covariance regularization: min_eig | plane | normalized_min_eig | frobenius | none");
+  nano_gicp::RegularizationMethod reg_method = nano_gicp::RegularizationMethod::MIN_EIG;
+  if (regularizationMethod == "plane") { reg_method = nano_gicp::RegularizationMethod::PLANE; }
+  else if (regularizationMethod == "normalized_min_eig") { reg_method = nano_gicp::RegularizationMethod::NORMALIZED_MIN_EIG; }
+  else if (regularizationMethod == "frobenius") { reg_method = nano_gicp::RegularizationMethod::FROBENIUS; }
+  else if (regularizationMethod == "none") { reg_method = nano_gicp::RegularizationMethod::NONE; }
+  else if (regularizationMethod != "min_eig") {
+    RCLCPP_WARN(this->get_logger(),
+        "Unknown odom/gicp/regularizationMethod '%s'; using 'min_eig'.",
+        regularizationMethod.c_str());
+  }
+  this->gicp.setRegularizationMethod(reg_method);
+
+  // Degeneracy gate for geometrically self-similar environments (featureless
+  // tunnels/conduits): rotation/translation Hessian blocks are eigen-analyzed
+  // separately and the GICP update is projected off directions below
+  // ratio * block_lambda_max, holding the IMU prior there. 0 disables.
+  double degeneracyThreshRatio;
+  dlio::declare_param(this, "odom/gicp/degeneracyThreshRatio", degeneracyThreshRatio, 0.0,
+      "Degeneracy gate ratio (live-tunable; 0 disables)", 0.0, 1.0);
+  this->gicp.setDegeneracyThreshRatio(static_cast<float>(degeneracyThreshRatio));
+
+  // Soft degeneracy gate: ramp the keep-fraction smoothly across a band around
+  // the threshold instead of toggling each eigen-direction between full-trust
+  // and full-hold. Bounds the scan-to-scan chatter when an eigenvalue hovers
+  // near the threshold (a divergence seed in the chaotic tunnel basin).
+  // 0 (default) = original binary gate, bit-identical. Live-tunable.
+  double degeneracySoftness;
+  dlio::declare_param(this, "odom/gicp/degeneracySoftness", degeneracySoftness, 0.0,
+      "Soft-gate band half-width (multiplicative; live-tunable; 0 = binary gate)", 0.0, 10.0);
+  this->gicp.setDegeneracySoftness(static_cast<float>(degeneracySoftness));
+
+  // Probabilistic degeneracy gate (Hatleskog & Alexis, IEEE RA-L 2024 adaptation,
+  // arXiv:2410.10784): the per-direction hold strength becomes the confidence
+  // that the eigenvalue clears an ABSOLUTE (sensor-noise) floor, rather than a
+  // ratio*lambda_max threshold -- so the observability test transfers across
+  // scenes/sensors. noiseFloor{Rot,Trans} are the per-block eigenvalue noise
+  // (rad^2 / m^2); 0 falls back to the ratio threshold (probit shape over the
+  // existing gate). OFF by default -> the ratio/smoothstep gate, bit-identical.
+  bool probGateEnabled;
+  double probNoiseFloorRot, probNoiseFloorTrans, probConfidenceS, probSpread;
+  dlio::declare_param(this, "odom/gicp/probGate/enabled", probGateEnabled, false);
+  dlio::declare_param(this, "odom/gicp/probGate/noiseFloorRot", probNoiseFloorRot, 0.0,
+      "Absolute rotation-block eigenvalue noise floor [rad^2] (0 = use ratio thresh)", 0.0, 1e12);
+  dlio::declare_param(this, "odom/gicp/probGate/noiseFloorTrans", probNoiseFloorTrans, 0.0,
+      "Absolute translation-block eigenvalue noise floor [m^2] (0 = use ratio thresh)", 0.0, 1e12);
+  dlio::declare_param(this, "odom/gicp/probGate/confidenceS", probConfidenceS, 1.0,
+      "Signal must exceed s * noise floor (paper's confidence factor)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/probGate/spread", probSpread, 1.0,
+      "Probit transition width in log-eigenvalue units", 0.0, 100.0);
+  this->gicp.setProbabilisticGate(probGateEnabled, static_cast<float>(probNoiseFloorRot),
+      static_cast<float>(probNoiseFloorTrans), static_cast<float>(probConfidenceS),
+      static_cast<float>(probSpread));
+
+  // Adaptive robust kernel on the photometric term (Barron, CVPR 2019 +
+  // Chebrolu et al., IEEE RA-L 2021, arXiv:2004.14938): replace the fixed
+  // photometric Huber with Barron's loss whose shape alpha is re-fit to the
+  // residual distribution each iteration (no hand-tuned kernel). scale = Barron c
+  // (0 -> reuse photometricHuberDelta). OFF by default -> the fixed Huber,
+  // bit-identical. The fitted alpha is published as "Photometric Kernel Alpha".
+  bool adaptiveKernelEnabled;
+  double kernelAlphaLo, kernelAlphaHi, kernelScale;
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/enabled", adaptiveKernelEnabled, false);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/alphaLo", kernelAlphaLo, 0.5,
+      "Min Barron shape alpha (more robust); clamped to (0,2]", 0.0, 2.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/alphaHi", kernelAlphaHi, 2.0,
+      "Max Barron shape alpha (2 = L2); clamped to (0,2]", 0.0, 2.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveKernel/scale", kernelScale, 0.0,
+      "Barron scale c (normalized units; 0 = reuse photometricHuberDelta)", 0.0, 100.0);
+  this->gicp.setAdaptiveKernel(adaptiveKernelEnabled, static_cast<float>(kernelAlphaLo),
+      static_cast<float>(kernelAlphaHi), static_cast<float>(kernelScale));
+
+  // Per-scan IMU-consistency clamp: bound the TOTAL GICP correction (final pose
+  // vs the IMU-prior initial guess) per scan. Caps map-lock/divergence runaway
+  // along the intermittently un-gated degenerate axis without touching healthy
+  // motion (the prior already contains the motion). 0 disables each cap.
+  double maxCorrTrans, maxCorrRot;
+  dlio::declare_param(this, "odom/gicp/maxCorrTrans", maxCorrTrans, 0.0,
+      "Per-scan total GICP correction translation cap vs IMU prior [m] (0 disables)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/gicp/maxCorrRot", maxCorrRot, 0.0,
+      "Per-scan total GICP correction rotation cap vs IMU prior [rad] (0 disables)", 0.0, 3.1416);
+  this->gicp.setMaxCorrection(static_cast<float>(maxCorrTrans), static_cast<float>(maxCorrRot));
+
+  // Margin-adaptive clamp: tighten the maxCorrection caps as the geometric trust
+  // margin degrades, so the correction is bounded toward the IMU prior under
+  // degeneracy (e.g. a specular floor dropout taking the vertical/pitch
+  // constraint). Off by default -> the base caps above are used unchanged.
+  // Requires a base cap (>0) and the degeneracy gate on (for the margins).
+  bool adaptiveClampEnabled;
+  double clampMarginLo, clampMarginHi, clampFloor;
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/enabled", adaptiveClampEnabled, false);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/marginLo", clampMarginLo, 1.0,
+      "Trust margin at/below which the clamp is fully tightened", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/marginHi", clampMarginHi, 3.0,
+      "Trust margin at/above which the base cap is used (no tightening)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/gicp/adaptiveClamp/floor", clampFloor, 0.25,
+      "Tightest cap fraction at full degeneracy (multiplier in (0,1])", 0.0, 1.0);
+  this->gicp.setAdaptiveClamp(adaptiveClampEnabled, static_cast<float>(clampMarginLo),
+      static_cast<float>(clampMarginHi), static_cast<float>(clampFloor));
+
+  // Degeneracy GOVERNOR (fail-safe for the held-prior runaway). On the axes the
+  // gate flagged degenerate and held to the IMU prior, that prior dead-reckons
+  // (and double-integrates accel/gyro bias) into the km-scale tunnel runaway
+  // that no existing clamp catches (maxCorrection bounds the GICP CORRECTION,
+  // not the prior). The governor caps per-scan OUTPUT motion along those
+  // world-frame directions vs the previous pose to a physical per-scan step;
+  // bounding the pose pulls the velocity back via updateState()'s observer.
+  // Cov inflation marks the held axes untrusted for downstream consumers.
+  // Master off / 0 caps = bit-identical. maxStep is a per-scan cap [m]/[rad]
+  // (~ platform max speed / scan rate, e.g. 3 m/s at 10 Hz -> 0.30 m).
+  dlio::declare_param(this, "odom/degenGov/enabled", this->degen_gov_enabled_, false);
+  double degenMaxStepTrans, degenMaxStepRot;
+  dlio::declare_param(this, "odom/degenGov/maxStepTrans", degenMaxStepTrans, 0.0,
+      "Max per-scan output motion along a held-degenerate translation axis [m] (0 disables)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/degenGov/maxStepRot", degenMaxStepRot, 0.0,
+      "Max per-scan output motion about a held-degenerate rotation axis [rad] (0 disables)", 0.0, 3.1416);
+  this->degen_gov_max_step_trans_ = static_cast<float>(degenMaxStepTrans);
+  this->degen_gov_max_step_rot_ = static_cast<float>(degenMaxStepRot);
+  dlio::declare_param(this, "odom/degenGov/covPosVar", this->degen_gov_cov_pos_var_, 0.0,
+      "Variance added to /odom pose cov along a held-degenerate position axis [m^2] (0 = none)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/degenGov/covRotVar", this->degen_gov_cov_rot_var_, 0.0,
+      "Variance added to /odom pose cov along a held-degenerate rotation axis [rad^2] (0 = none)", 0.0, 1e6);
+
+  // PHYSICS FUSE (physics_fuse.h, doc/RUNTIME_GUARDS.md): clamp the TOTAL
+  // per-scan output step in ANY direction to a physical bound. The governor
+  // only acts along axes the gate flagged; the fuse catches everything else --
+  // gate misses, runaway on an unflagged axis, and a diverging IMU prior (the
+  // 2026-07-09 leg-1 takeoff reached 3.3e7 m). A tripped scan is flagged
+  // (diagnostics + keyframe veto). 0 = off, bit-identical.
+  dlio::declare_param(this, "odom/fuse/maxStepTrans", this->fuse_max_step_trans_, 0.0,
+      "Max per-scan output translation in any direction [m] (~max speed/scan rate; 0 disables)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/fuse/maxStepRot", this->fuse_max_step_rot_, 0.0,
+      "Max per-scan output rotation [rad] (0 disables)", 0.0, 3.1416);
+
+  // SLOSH GUARD (slosh_guard.h, doc/RUNTIME_GUARDS.md): online detector for
+  // the corkscrew/back-and-forth oscillation (the harness's `revs` verdict,
+  // moved into the estimator). Tracks the signed output step along the weak
+  // (held) translation axis; a high sign-flip fraction over the window engages
+  // extra velocity damping along that axis (the oscillation's flywheel) and a
+  // keyframe veto until it subsides. Off (default) = bit-identical.
+  dlio::declare_param(this, "odom/slosh/enabled", this->slosh_enabled_, false,
+      "Enable the online slosh (oscillation) detector + damping response");
+  int slosh_window = 20, slosh_min_active = 8;
+  double slosh_engage = 0.5, slosh_disengage = 0.25;
+  dlio::declare_param(this, "odom/slosh/window", slosh_window, 20,
+      "Sliding window of active (above-deadband) steps considered");
+  dlio::declare_param(this, "odom/slosh/deadband", this->slosh_deadband_, 0.02,
+      "Ignore per-scan steps below this magnitude [m] (stationary noise)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/slosh/engageFrac", slosh_engage, 0.5,
+      "Sign-flip fraction at/above which the guard engages", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/disengageFrac", slosh_disengage, 0.25,
+      "Sign-flip fraction at/below which the guard disengages (hysteresis)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/minActive", slosh_min_active, 8,
+      "Minimum active samples before the guard may engage");
+  dlio::declare_param(this, "odom/slosh/velDamp", this->slosh_vel_damp_, 0.5,
+      "Per-scan velocity damping along the tracked axis while engaged (0..1)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/slosh/axisHoldScans", this->slosh_axis_hold_, 20,
+      "Scans the tracked weak axis survives without the gate flagging one before it goes stale");
+  this->slosh_guard_ = dlio::SloshGuard(slosh_window,
+      static_cast<float>(this->slosh_deadband_),
+      static_cast<float>(slosh_engage), static_cast<float>(slosh_disengage),
+      slosh_min_active);
+
+  // Term mass-normalization (opt-in): scale a term's Hessian contribution to a
+  // nominal residual count so its weight is independent of how many points are
+  // valid that scan (and comparable across terms) -- the same trick the LiDAR-
+  // image term already uses internally. 0 (default) = OFF (raw mass, bit-
+  // identical). NOTE: enabling RE-SCALES the term's effective weight, so a tuned
+  // weight (e.g. photometricWeight) must be re-derived once.
+  double photometricRefCount, visualRefCount, visualMapRefCount;
+  dlio::declare_param(this, "odom/gicp/photometricRefCount", photometricRefCount, 0.0,
+      "Photometric term mass-normalization nominal count (live-tunable; 0 = off/raw)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/gicp/visualRefCount", visualRefCount, 0.0,
+      "Frame-to-frame visual term mass-normalization nominal count (0 = off/raw)", 0.0, 1e6);
+  dlio::declare_param(this, "odom/gicp/visualMapRefCount", visualMapRefCount, 0.0,
+      "Frame-to-map visual term mass-normalization nominal count (0 = off/raw)", 0.0, 1e6);
+  this->gicp.setPhotometricRefCount(static_cast<float>(photometricRefCount));
+  this->gicp.setVisualRefCount(static_cast<float>(visualRefCount));
+  this->gicp.setVisualMapRefCount(static_cast<float>(visualMapRefCount));
+
+  // gicp_temp prepares the submap target (kd-tree + photometric gradients) in
+  // the background thread, so it needs the same photometric configuration.
+  this->gicp_temp.setPhotometricWeight(photometricWeight);
+  this->gicp_temp.setGradientKNeighbors(gradientKNeighbors);
+  this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
+  this->gicp_temp.setPhotometricScale(static_cast<float>(photometricScale));
+  this->gicp_temp.setPhotometricRefCount(static_cast<float>(photometricRefCount));
+  this->gicp_temp.setRegularizationMethod(reg_method);
 
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
-  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud", 1,
+  // SensorDataQoS (best-effort): LiDAR drivers commonly publish sensor data
+  // best-effort; a reliable subscription would be QoS-incompatible and
+  // silently receive nothing.
+  this->lidar_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("pointcloud",
+      rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&dlio::OdomNode::callbackPointCloud, this, std::placeholders::_1), lidar_sub_opt);
 
   this->imu_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto imu_sub_opt = rclcpp::SubscriptionOptions();
   imu_sub_opt.callback_group = this->imu_cb_group;
-  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu", rclcpp::SensorDataQoS(),
+  // SensorDataQoS (best-effort, to match live IMU drivers) but with a DEEP queue:
+  // the default SensorDataQoS depth is 5 (~10-50 ms at IMU rates). If the IMU
+  // callback group is briefly starved (heavy scan on a shared core, or fast bag
+  // replay), a burst beyond the queue is dropped at the middleware -> gaps ->
+  // "IMU does not cover the scan period" -> scan skip. keep_last(100) buffers
+  // ~0.2-1 s without changing reliability, so it stays compatible with
+  // best-effort live publishers.
+  this->imu_sub = this->create_subscription<sensor_msgs::msg::Imu>("imu",
+      rclcpp::SensorDataQoS().keep_last(100),
       std::bind(&dlio::OdomNode::callbackImu, this, std::placeholders::_1), imu_sub_opt);
+
+  // Camera image for the optional direct visual term (off by default). Only
+  // subscribed when enabled, so the LIO path is untouched otherwise.
+  if (this->visual_enabled_) {
+    this->image_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    auto image_sub_opt = rclcpp::SubscriptionOptions();
+    image_sub_opt.callback_group = this->image_cb_group;
+    this->image_sub = this->create_subscription<sensor_msgs::msg::Image>("camera",
+        rclcpp::SensorDataQoS().keep_last(10),
+        std::bind(&dlio::OdomNode::callbackImage, this, std::placeholders::_1), image_sub_opt);
+    RCLCPP_INFO(this->get_logger(),
+        "Direct visual term ENABLED (weight %.3f); subscribing to 'camera'.",
+        this->visual_weight_);
+  }
 
   this->odom_pub     = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
   this->pose_pub     = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 1);
@@ -66,9 +404,75 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
 
-  this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+#ifdef HAVE_LIVOX_ROS_DRIVER2
+  // Optional raw Livox ingestion: subscribe to a livox_ros_driver2 CustomMsg on
+  // 'livox', republish it as PointCloud2 on 'livox2dlio'. To use a raw Livox
+  // stream, remap the cloud input to it (pointcloud:=livox2dlio). Decoupled from
+  // the estimator threading -- it's purely a format shim in its own callback group.
+  this->livox_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  auto livox_sub_opt = rclcpp::SubscriptionOptions();
+  livox_sub_opt.callback_group = this->livox_cb_group;
+  this->livox_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "livox2dlio", rclcpp::SensorDataQoS().keep_last(1));
+  this->livox_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+      "livox", rclcpp::SensorDataQoS().keep_last(1),
+      [this](const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
+        this->livox_pub->publish(livoxToPointCloud2(*msg, this->lidar_frame));
+      }, livox_sub_opt);
+  RCLCPP_INFO(this->get_logger(),
+      "Livox CustomMsg ingestion ENABLED: converting 'livox' -> 'livox2dlio' "
+      "(remap pointcloud:=livox2dlio to use it).");
+#endif
+  // Absolute /diagnostics (unlike the relative pubs above, this is NOT remapped
+  // by the launch file) so the standard diagnostics topic always lands at /diagnostics.
+  this->diag_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+      "/diagnostics", rclcpp::QoS(10).best_effort());
 
-  this->publish_timer = this->create_wall_timer(std::chrono::duration<double>(0.01),
+  // Live parameter tuning (ros2 param set during a run). Registered after all
+  // params are declared so initialization doesn't trip it.
+  this->on_set_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&dlio::OdomNode::onSetParams, this, std::placeholders::_1));
+
+  this->br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+  this->static_br = std::make_shared<tf2_ros::StaticTransformBroadcaster>(*this);
+  if (this->extrinsics_source_ == "tf") {
+    // robot_state_publisher owns base_link->sensor TF from the URDF; resolve the
+    // extrinsics from tf2 instead of publishing our own static transforms.
+    // Gate processing until they're available (the YAML values remain as a
+    // fallback if the lookups never succeed).
+    this->extrinsics_ready_.store(false);
+    this->tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    this->tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*this->tf_buffer_);
+    // Node-clock timer (rclcpp::create_timer), not create_wall_timer: it must
+    // respect use_sim_time so under bag replay it ticks on sim time (and pauses
+    // with a paused bag) consistently with the tf2 buffer's sim-time stamps.
+    this->extrinsics_timer_ = rclcpp::create_timer(this, this->get_clock(),
+        rclcpp::Duration::from_seconds(0.5),
+        std::bind(&dlio::OdomNode::resolveExtrinsicsFromTf, this));
+    RCLCPP_INFO(this->get_logger(),
+        "extrinsics/source=tf: waiting for base_link->{imu,lidar} from tf2...");
+  } else {
+    this->publishStaticTransforms();
+  }
+
+  // constant diagonal covariance on the published odometry (set once;
+  // the message object is reused by publishPose)
+  for (int i = 0; i < 6; i++) {
+    this->odom_ros.pose.covariance[i*7] = this->pose_cov_[i];
+    this->odom_ros.twist.covariance[i*7] = this->twist_cov_[i];
+  }
+  // Frame ids are constant too -- set them once here rather than re-assigning
+  // these std::string members on every 100 Hz publishPose tick (the reused
+  // message objects are only touched by the pose timer).
+  this->odom_ros.header.frame_id = this->odom_frame;
+  this->odom_ros.child_frame_id = this->baselink_frame;
+  this->pose_ros.header.frame_id = this->odom_frame;
+
+  // Node-clock timer (respects use_sim_time): under bag replay the 100 Hz pose
+  // cadence tracks sim time and pauses with a paused bag, instead of free-running
+  // on wall time. Stamps are the data time regardless (publishPose uses imu_stamp).
+  this->publish_timer = rclcpp::create_timer(this, this->get_clock(),
+      rclcpp::Duration::from_seconds(0.01),
       std::bind(&dlio::OdomNode::publishPose, this));
 
   this->T = Eigen::Matrix4f::Identity();
@@ -103,6 +507,16 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->current_scan = std::make_shared<const pcl::PointCloud<PointType>>();
   this->submap_cloud = std::make_shared<const pcl::PointCloud<PointType>>();
 
+  // Visual term runtime state
+  this->visual_maps_ready_ = false;
+  this->visual_has_prev_ = false;
+  this->visual_cur_pending_valid_ = false;
+  this->visual_T_cw_prev_ = Eigen::Isometry3f::Identity();
+  this->lidar_proj_ready_ = false;
+  this->lidar_img_ready_ = false;
+  this->lidar_az_a_ = 1.f; this->lidar_az_b_ = 0.f;
+  this->lidar_el_a_ = 1.f; this->lidar_el_b_ = 0.f;
+
   this->num_processed_keyframes = 0;
 
   this->submap_hasChanged = true;
@@ -111,25 +525,26 @@ dlio::OdomNode::OdomNode() : Node("dlio_odom_node") {
   this->first_scan_stamp = 0.;
   this->elapsed_time = 0.;
   this->length_traversed = 0.;
+  this->length_prev_p = Eigen::Vector3f(0., 0., 0.);
 
   this->convex_hull.setDimension(3);
   this->concave_hull.setDimension(3);
   this->concave_hull.setAlpha(this->keyframe_thresh_dist_);
   this->concave_hull.setKeepInformation(true);
 
-this->gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-this->gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-this->gicp.setMaximumIterations(this->gicp_max_iter_);
-this->gicp.setTransformationEpsilon(this->gicp_transformation_ep_);
-this->gicp.setRotationEpsilon(this->gicp_rotation_ep_);
-this->gicp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
+  this->gicp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
+  this->gicp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
+  this->gicp.setMaximumIterations(this->gicp_max_iter_);
+  this->gicp.setTransformationEpsilon(this->gicp_transformation_ep_);
+  this->gicp.setRotationEpsilon(this->gicp_rotation_ep_);
+  this->gicp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
 
-this->gicp_temp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
-this->gicp_temp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
-this->gicp_temp.setMaximumIterations(this->gicp_max_iter_);
-this->gicp_temp.setTransformationEpsilon(this->gicp_transformation_ep_);
-this->gicp_temp.setRotationEpsilon(this->gicp_rotation_ep_);
-this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
+  this->gicp_temp.setCorrespondenceRandomness(this->gicp_k_correspondences_);
+  this->gicp_temp.setMaxCorrespondenceDistance(this->gicp_max_corr_dist_);
+  this->gicp_temp.setMaximumIterations(this->gicp_max_iter_);
+  this->gicp_temp.setTransformationEpsilon(this->gicp_transformation_ep_);
+  this->gicp_temp.setRotationEpsilon(this->gicp_rotation_ep_);
+  this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
 
   pcl::Registration<PointType, PointType>::KdTreeReciprocalPtr temp;
   this->gicp.setSearchMethodSource(temp, true);
@@ -137,7 +552,7 @@ this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
   this->gicp_temp.setSearchMethodSource(temp, true);
   this->gicp_temp.setSearchMethodTarget(temp, true);
 
-  this->geo.first_opt_done.store(false); // FIX: atomic store, not operator=
+  this->geo.first_opt_done = false;
   this->geo.prev_vel = Eigen::Vector3f(0., 0., 0.);
 
   pcl::console::setVerbosityLevel(pcl::console::L_ERROR);
@@ -147,6 +562,11 @@ this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
   this->crop.setMax(Eigen::Vector4f(this->crop_size_, this->crop_size_, this->crop_size_, 1.0));
 
   this->voxel.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
+  // pcl::VoxelGrid drops the custom 'reflectivity'/'intensity' fields (its
+  // centroid only averages a fixed set of known fields), zeroing the photometric
+  // channel and silently killing the photometric/COIN-LIO terms. Save the leaf
+  // layout so preprocessPoints() can average those channels per voxel by hand.
+  this->voxel.setSaveLeafLayout(true);
 
   this->metrics.spaciousness.push_back(0.);
   this->metrics.density.push_back(this->gicp_max_corr_dist_);
@@ -191,7 +611,24 @@ this->gicp_temp.setInitialLambdaFactor(this->gicp_init_lambda_factor_);
 
 }
 
-dlio::OdomNode::~OdomNode() {}
+dlio::OdomNode::~OdomNode() {
+
+  // Unblock the background submap thread (it may be paused waiting on
+  // main_loop_running) and wait for it; then join the worker threads.
+  // Threads are joined (not detached) so a component unload or shutdown
+  // cannot leave them running against a destroyed node.
+  {
+    std::lock_guard<std::mutex> lk(this->main_loop_running_mutex);
+    this->main_loop_running = false;
+  }
+  this->submap_build_cv.notify_all();
+  if (this->submap_future.valid()) { this->submap_future.wait(); }
+
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
+  if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
+  if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
+}
 
 void dlio::OdomNode::getParams() {
 
@@ -200,9 +637,17 @@ void dlio::OdomNode::getParams() {
 
   // Frames
   dlio::declare_param(this, "frames/odom", this->odom_frame, "odom");
+  // Disable to let a downstream fusion node (robot_localization) own the
+  // odom->baselink TF; dlio still publishes the odometry message.
+  dlio::declare_param(this, "odom/publishTf", this->publish_tf_, true,
+      "Broadcast the odom->baselink transform (disable when an EKF owns it)");
   dlio::declare_param(this, "frames/baselink", this->baselink_frame, "base_link");
   dlio::declare_param(this, "frames/lidar", this->lidar_frame, "lidar");
   dlio::declare_param(this, "frames/imu", this->imu_frame, "imu");
+  dlio::declare_param(this, "frames/camera", this->camera_frame_, "camera");
+  // Extrinsics source: "yaml" (the extrinsics/* params below) or "tf" (look them
+  // up from tf2, e.g. published by robot_state_publisher from the robot URDF).
+  dlio::declare_param(this, "extrinsics/source", this->extrinsics_source_, std::string("yaml"));
 
   // Deskew Flag
   dlio::declare_param(this, "pointcloud/deskew", this->deskew_, true);
@@ -214,8 +659,24 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/computeTimeOffset", this->time_offset_, false);
 
   // Keyframe Threshold
-  dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1);
-  dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0);
+  dlio::declare_param(this, "odom/keyframe/threshD", this->keyframe_thresh_dist_, 0.1,
+      "Keyframe translation threshold [m] (live-tunable)", 0.0, 10.0);
+  dlio::declare_param(this, "odom/keyframe/threshR", this->keyframe_thresh_rot_, 1.0,
+      "Keyframe rotation threshold [deg] (live-tunable)", 0.0, 180.0);
+  // Tunnel-slosh fix: veto keyframe creation while the degeneracy gate holds
+  // axes (the pose is sloshing; keyframing it pollutes the submap). Default off.
+  dlio::declare_param(this, "odom/keyframe/degenGate", this->keyframe_degen_gate_, false,
+      "Skip keyframe creation while the registration holds degenerate axes (anti map-contamination)");
+
+  // Bound on the keyframe map (0 = unlimited). When exceeded, the most
+  // spatially redundant processed keyframe is removed.
+  dlio::declare_param(this, "odom/keyframe/maxKeyframes", this->max_keyframes_, 0,
+      "Bound on the keyframe map; most redundant keyframe pruned when exceeded (0 = unlimited)");
+
+  // Terminal status dashboard (ANSI clear-screen); disable when logs are
+  // multiplexed (ros2 launch, containers, systemd).
+  dlio::declare_param(this, "odom/debug/dashboard", this->dashboard_, true,
+      "Terminal ANSI status dashboard; disable under multiplexed logging");
 
   // Submap
   dlio::declare_param(this, "odom/submap/keyframe/knn", this->submap_knn_, 10);
@@ -234,6 +695,16 @@ void dlio::OdomNode::getParams() {
   // Voxel Grid Filter
   dlio::declare_param(this, "pointcloud/voxelize", this->vf_use_, true);
   dlio::declare_param(this, "odom/preprocessing/voxelFilter/res", this->vf_res_, 0.05);
+
+  // Sub-floor reject (specular ghost removal); OFF by default -> bit-identical.
+  // Requires a gravity-aligned odom frame (odom/imu/approximateGravity:true).
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/enabled", this->subfloor_reject_enabled_, false);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/margin", this->subfloor_margin_, 0.30);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/radius", this->subfloor_radius_, 8.0);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/cell", this->subfloor_cell_, 1.0);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/zBin", this->subfloor_zbin_, 0.10);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/minBinCount", this->subfloor_min_bin_, 8);
+  dlio::declare_param(this, "odom/preprocessing/subFloorReject/maxRejectFrac", this->subfloor_max_frac_, 0.15);
 
   // Adaptive Parameters
   dlio::declare_param(this, "adaptive", this->adaptive_params_, true);
@@ -268,6 +739,182 @@ void dlio::OdomNode::getParams() {
   this->extrinsics.baselink2lidar_T.block(0, 3, 3, 1) = this->extrinsics.baselink2lidar.t;
   this->extrinsics.baselink2lidar_T.block(0, 0, 3, 3) = this->extrinsics.baselink2lidar.R;
 
+  // camera -> lidar extrinsic (same storage convention as baselink2lidar: the
+  // R,t block maps a camera-frame point into the lidar frame, i.e. T_lidar_cam)
+  std::vector<double> cam2lidar_t, cam2lidar_R;
+  dlio::declare_param(this, "extrinsics/cam2lidar/t", cam2lidar_t, t_default);
+  dlio::declare_param(this, "extrinsics/cam2lidar/R", cam2lidar_R, R_default);
+  this->cam2lidar_T_ = Eigen::Matrix4f::Identity();
+  this->cam2lidar_T_.block(0, 3, 3, 1) =
+      Eigen::Vector3f(cam2lidar_t[0], cam2lidar_t[1], cam2lidar_t[2]);
+  this->cam2lidar_T_.block(0, 0, 3, 3) =
+      Eigen::Map<const Eigen::Matrix<float, -1, -1, Eigen::RowMajor>>(
+          std::vector<float>(cam2lidar_R.begin(), cam2lidar_R.end()).data(), 3, 3);
+
+  // Direct visual (camera) photometric term (off by default).
+  dlio::declare_param(this, "odom/visual/enabled", this->visual_enabled_, false,
+      "Enable the direct visual (camera) photometric residual (constrains the LiDAR-degenerate tunnel axis)");
+  dlio::declare_param(this, "odom/visual/weight", this->visual_weight_, 0.0,
+      "Weight of the visual photometric residual relative to the geometric GICP term");
+  dlio::declare_param(this, "odom/visual/huberDelta", this->visual_huber_delta_, 0.05,
+      "Huber threshold on the normalized visual residual (<= 0 disables robustification)");
+  dlio::declare_param(this, "odom/visual/maxTimeDiff", this->visual_max_dt_, 0.05,
+      "Max |image_stamp - scan_stamp| [s] to pair a camera frame with a scan");
+  // Dense source for the frame-to-frame term: project the full deskewed scan
+  // (not the sparse voxelised registration cloud) so the narrow camera FOV stays
+  // populated. OFF by default -> the f2f term iterates input_ (bit-identical).
+  dlio::declare_param(this, "odom/visual/denseSource/enabled", this->visual_dense_source_, false,
+      "Feed the f2f visual term the dense deskewed scan instead of the voxelised registration cloud");
+  dlio::declare_param(this, "odom/visual/denseSource/maxPoints", this->visual_dense_max_, 4000,
+      "Stride the dense f2f source down to <= this many points (bounds per-iteration cost)");
+  // Degeneracy-gate safety floor: when the visual term rescues a LiDAR-
+  // degenerate axis, its total deviation from the IMU prior along that axis is
+  // bounded to these PER-SCAN budgets (summed across LM iterations), so a
+  // wrong/biased visual constraint can neither diverge nor inflate the path.
+  dlio::declare_param(this, "odom/visual/gateMaxStepTrans", this->visual_gate_max_trans_, 0.3,
+      "Visual gate safety floor: max per-scan translation correction on a rescued degenerate axis [m]");
+  dlio::declare_param(this, "odom/visual/gateMaxStepRot", this->visual_gate_max_rot_, 0.05,
+      "Visual gate safety floor: max per-scan rotation correction on a rescued degenerate axis [rad]");
+
+  // Frame-to-MAP camera term: anchors absolute position to map landmarks (wall
+  // texture/graffiti), breaking the geometric self-similarity that drags the
+  // pose back in a tunnel. Off by default; requires odom/visual/enabled too.
+  dlio::declare_param(this, "odom/visual/map/enabled", this->visual_map_enabled_, false,
+      "Enable the frame-to-MAP camera photometric term (absolute anchor to keyframe landmarks)");
+  dlio::declare_param(this, "odom/visual/map/weight", this->visual_map_weight_, 0.0,
+      "Weight of the frame-to-map camera residual relative to the geometric GICP term");
+  dlio::declare_param(this, "odom/visual/map/gateMaxStepTrans", this->visual_map_gate_max_trans_, 1.0,
+      "Per-scan rescue budget for the absolute map anchor on a degenerate translation axis [m]");
+  dlio::declare_param(this, "odom/visual/map/gateMaxStepRot", this->visual_map_gate_max_rot_, 0.1,
+      "Per-scan rescue budget for the absolute map anchor on a degenerate rotation axis [rad]");
+  dlio::declare_param(this, "odom/visual/map/viewAngleMax", this->visual_map_view_angle_, 0.6,
+      "Max viewing-ray deviation [rad] between a map ref and the current view before it is dropped");
+
+  // COIN-LIO LiDAR intensity-image term: anchors absolute position to wall
+  // texture in the LiDAR reflectivity image (360deg coverage; better suited to
+  // this rig than the narrow camera). Reuses the absolute-anchor gate budget
+  // (odom/visual/map/gateMaxStep*). OFF by default; needs an organized scan.
+  dlio::declare_param(this, "odom/lidar_image/enabled", this->lidar_image_enabled_, false,
+      "Enable the COIN-LIO LiDAR intensity-image frame-to-map term (organized scan + reflectivity)");
+  dlio::declare_param(this, "odom/lidar_image/weight", this->lidar_image_weight_, 0.0,
+      "Weight of the LiDAR intensity-image residual relative to the geometric GICP term");
+  // Keyframe-image references (doc/INTENSITY_AUDIT_2026-07-09.md): the map term's
+  // reference brightness normally comes from the target point's .reflectivity
+  // field, which is VOXEL-AVERAGED (0.25m leaf) -- the graffiti-scale texture the
+  // residual keys on is blurred away before the term ever sees it. When enabled,
+  // each keyframe samples per-point brightness from its FULL-RESOLUTION
+  // reflectivity image at creation and the submap hands those to the gicp.
+  // Off (default) = field reference, bit-identical.
+  dlio::declare_param(this, "odom/lidar_image/imageRefs", this->lidar_image_refs_enabled_, false,
+      "Map-term reference from each keyframe's full-res image (true) vs the voxel-averaged field (false)");
+  dlio::declare_param(this, "odom/lidar_image/rangeAbsTol", this->lidar_range_abs_tol_, 0.5,
+      "Occlusion check: absolute range tolerance [m] for accepting a projected map point");
+  dlio::declare_param(this, "odom/lidar_image/rangeRelTol", this->lidar_range_rel_tol_, 0.1,
+      "Occlusion check: relative range tolerance (fraction of pixel range)");
+  // Condition-scaled directional weighting: boost the LiDAR-map term along the
+  // geometrically-weak (degenerate) axes so it can clear the gate's rescue bar
+  // there. OFF by default -> the term accumulates directly (bit-identical).
+  dlio::declare_param(this, "odom/lidar_image/condScale/enabled", this->lidar_cond_scale_enabled_, false,
+      "Direction-scale the LiDAR-map term toward geometrically-weak axes (clears the rescue bar there)");
+  dlio::declare_param(this, "odom/lidar_image/condScale/power", this->lidar_cs_power_, 1.0,
+      "Cond-scale exponent on (lambda_max/lambda_k) per geometric eigen-direction");
+  dlio::declare_param(this, "odom/lidar_image/condScale/cap", this->lidar_cs_cap_, 50.0,
+      "Cond-scale max per-direction boost (alpha) applied to the LiDAR-map term");
+  // Direction-separated LiDAR fusion (LOFF-style): restrict the term to the
+  // geometrically-weak subspace so it can only move the degenerate axis and can't
+  // perturb the well-observed ones. Off (default) -> term added in full,
+  // bit-identical. Composes with condScale (boost then separate).
+  dlio::declare_param(this, "odom/lidar_image/dirSeparated/enabled", this->lidar_dir_separated_enabled_, false,
+      "Restrict the LiDAR-map term to the geometrically-weak (degenerate) subspace (LOFF-style)");
+  dlio::declare_param(this, "odom/lidar_image/dirSeparated/ratio", this->lidar_ds_ratio_, 0.05,
+      "Weak-subspace bar as a fraction of lambda_max (per block) for direction separation", 0.0, 1.0);
+  // Frame-to-FRAME LiDAR flow term (EXPLORATION #2): register the current scan
+  // against the PREVIOUS scan's image to observe along-tunnel motion. Pairs with
+  // dirSeparated so it only constrains the degenerate axis. weight 0 (default) = off.
+  dlio::declare_param(this, "odom/lidar_image/flow/enabled", this->lidar_flow_enabled_, false,
+      "Enable the frame-to-frame LiDAR flow term (registers against the previous scan's image)");
+  dlio::declare_param(this, "odom/lidar_image/flow/weight", this->lidar_flow_weight_, 0.0,
+      "Weight of the frame-to-frame LiDAR flow residual (count-normalized; 0 = off)", 0.0, 1e6);
+  // Flow reference mode (doc/INTENSITY_AUDIT_2026-07-09.md): imageRef samples the
+  // reference brightness from the CURRENT scan's full-resolution image, so both
+  // sides of the residual carry pre-voxel texture (graffiti); false = legacy
+  // voxel-averaged .reflectivity reference (bit-identical to the original term).
+  // patch compares a zero-mean (2P+1)^2 window per point (COIN-LIO-style patches;
+  // 0 = single pixel).
+  dlio::declare_param(this, "odom/lidar_image/flow/imageRef", this->lidar_flow_image_ref_, true,
+      "Flow reference from the current full-res image (true) vs the voxel-averaged point field (false)");
+  dlio::declare_param(this, "odom/lidar_image/flow/patch", this->lidar_flow_patch_, 0,
+      "Flow patch half-width in pixels (0 = single pixel; clamped to [0,3] by the gicp)");
+  // GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L 2025).
+  // On an ill-conditioned scan (geometric translation lambda_min/lambda_max < knee)
+  // mix an isotropic point-to-point metric into the GICP cost to regularize the
+  // unconstrained tunnel axis; healthy scans stay pure point-to-plane. Static
+  // config (no per-scan state), so it is pushed to the gicp once here. floor = 1
+  // (default) -> blend OFF, bit-identical.
+  dlio::declare_param(this, "odom/genz/enabled", this->genz_enabled_, false,
+      "Enable the GenZ-ICP adaptive point-to-plane/point-to-point blend (degeneracy-robust)");
+  dlio::declare_param(this, "odom/genz/floor", this->genz_floor_, 1.0,
+      "Smallest point-to-plane weight alpha in [0,1] (1 = blend off; ~0.5 = up to 50/50 worst case)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/genz/knee", this->genz_knee_, 0.1,
+      "Conditioning (trans-block lambda_min/lambda_max) below which point-to-point starts mixing in", 0.0, 1.0);
+  dlio::declare_param(this, "odom/genz/pointWeight", this->genz_point_weight_, 1.0,
+      "Isotropic point-to-point metric weight [1/m^2] (~ the plane metric's typical eigenvalue)", 0.0, 1e6);
+  this->gicp.setGenZWeighting(this->genz_enabled_, static_cast<float>(this->genz_floor_),
+      static_cast<float>(this->genz_knee_), static_cast<float>(this->genz_point_weight_));
+  // X-ICP ternary localizability gate (Tuna et al., T-RO 2024): adds a controlled
+  // partial-admit band between the existing degeneracy bar (degeneracyThreshRatio)
+  // and a looser localizable bar (fullRatio). Static config -> pushed once here.
+  // enabled = false (default) -> the existing binary/soft gate, bit-identical.
+  dlio::declare_param(this, "odom/xicp/ternaryEnabled", this->xicp_ternary_enabled_, false,
+      "Enable the X-ICP ternary localizability gate (partial-admit band above the degeneracy bar)");
+  dlio::declare_param(this, "odom/xicp/fullRatio", this->xicp_full_ratio_, 0.05,
+      "X-ICP localizable bar as a fraction of lambda_max; should exceed degeneracyThreshRatio", 0.0, 1.0);
+  this->gicp.setXicpTernary(this->xicp_ternary_enabled_, static_cast<float>(this->xicp_full_ratio_));
+  // Partial-band admission budget (FINDINGS_2026-07-08 runaway fix): caps the
+  // cumulative motion the ternary gate's partial band may admit per scan,
+  // making X-ICP fail-bounded instead of fail-open. 0 (default) = unbudgeted.
+  dlio::declare_param(this, "odom/xicp/partialBudgetTrans", this->xicp_partial_budget_trans_, 0.0,
+      "Per-scan cap on partial-band admitted translation [m] (0 = unbudgeted)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/xicp/partialBudgetRot", this->xicp_partial_budget_rot_, 0.0,
+      "Per-scan cap on partial-band admitted rotation [rad] (0 = unbudgeted)", 0.0, 3.1416);
+  this->gicp.setXicpPartialBudget(static_cast<float>(this->xicp_partial_budget_trans_),
+                                  static_cast<float>(this->xicp_partial_budget_rot_));
+  // Saliency-weighted point selection (anti-dilution): up-weight rare salient
+  // source points (edges/ribs/corners) so the abundant planar walls don't swamp
+  // the weak along-axis DOF. boost = 1 (default) -> unit weights, bit-identical.
+  dlio::declare_param(this, "odom/saliency/enabled", this->saliency_enabled_, false,
+      "Enable saliency-weighted geometric GICP (up-weight edge/rib/corner points)");
+  dlio::declare_param(this, "odom/saliency/boost", this->saliency_boost_, 1.0,
+      "Weight of a maximally-salient source point (1 = off; e.g. 4 = up to 4x on salient points)", 1.0, 100.0);
+  this->gicp.setSaliencyWeighting(this->saliency_enabled_, static_cast<float>(this->saliency_boost_));
+  // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
+  // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
+  // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is
+  // shot-noise-dominated per pixel, so it pairs with denoiseKernel. Default
+  // 'reflectivity' + scale 255 + no denoise is bit-identical to the prior behavior.
+  dlio::declare_param(this, "odom/lidar_image/channel", this->lidar_image_channel_, std::string("reflectivity"),
+      "Cloud field feeding the LiDAR-image slot: 'reflectivity' | 'intensity' | 'ambient' (near-IR)");
+  if (this->lidar_image_channel_ != "reflectivity" && this->lidar_image_channel_ != "intensity"
+      && this->lidar_image_channel_ != "ambient") {
+    RCLCPP_WARN(this->get_logger(),
+        "Unknown odom/lidar_image/channel '%s'; defaulting to 'reflectivity'.",
+        this->lidar_image_channel_.c_str());
+    this->lidar_image_channel_ = "reflectivity";
+  }
+  dlio::declare_param(this, "odom/lidar_image/scale", this->lidar_image_scale_, 255.0,
+      "Full-scale normalization of the LiDAR-image channel (reflectivity ~255, near-IR ~thousands)");
+  this->gicp.setLidarImageScale(static_cast<float>(this->lidar_image_scale_));
+  dlio::declare_param(this, "odom/lidar_image/denoiseKernel", this->lidar_image_denoise_kernel_, 0,
+      "K x K spatial box-blur of the organized image channel before residuals (<=1 = off; tames near-IR shot noise)");
+  // Camera intrinsics (fx, fy, cx, cy) and plumb_bob distortion (k1,k2,p1,p2,k3).
+  // Defaults are the 06042026 bag's embedded /lucid_camera_1 camera_info.
+  std::vector<double> intr_default{1094.19, 1092.23, 969.58, 721.31};
+  std::vector<double> dist_default{-0.04409, 0.05337, -0.00124, 0.00002, 0.0};
+  dlio::declare_param(this, "camera/intrinsics", this->camera_intrinsics_, intr_default);
+  dlio::declare_param(this, "camera/distortion", this->camera_distortion_, dist_default);
+  if (this->camera_intrinsics_.size() != 4) { this->camera_intrinsics_ = intr_default; }
+  if (this->camera_distortion_.size() < 4)  { this->camera_distortion_ = dist_default; }
+
   // IMU
   dlio::declare_param(this, "odom/imu/calibration/accel", this->calibrate_accel_, true);
   dlio::declare_param(this, "odom/imu/calibration/gyro", this->calibrate_gyro_, true);
@@ -279,6 +926,9 @@ void dlio::OdomNode::getParams() {
 
   dlio::declare_param(this, "odom/imu/approximateGravity", this->gravity_align_, true);
   dlio::declare_param(this, "imu/calibration", this->imu_calibrate_, true);
+  // Scale incoming accel by gravity (for IMUs that report it in units of g,
+  // e.g. Livox built-in IMUs); default off keeps the m/s^2 convention.
+  dlio::declare_param(this, "imu/normalized", this->imu_normalized_, false);
   dlio::declare_param(this, "imu/intrinsics/accel/bias", prior_accel_bias, accel_default);
   dlio::declare_param(this, "imu/intrinsics/gyro/bias", prior_gyro_bias, gyro_default);
 
@@ -312,24 +962,37 @@ void dlio::OdomNode::getParams() {
   dlio::declare_param(this, "odom/gicp/rotationEpsilon", this->gicp_rotation_ep_, 0.0005);
   dlio::declare_param(this, "odom/gicp/initLambdaFactor", this->gicp_init_lambda_factor_, 1e-9);
 
+  // Published odometry covariance (diagonal: x y z roll pitch yaw).
+  // All-zero covariance makes the odometry unusable for downstream fusion
+  // (robot_localization etc. either reject it or trust it infinitely).
+  std::vector<double> cov_default{0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025};
+  dlio::declare_param(this, "odom/covariance/pose", this->pose_cov_, cov_default);
+  dlio::declare_param(this, "odom/covariance/twist", this->twist_cov_, cov_default);
+  if (this->pose_cov_.size() != 6) { this->pose_cov_ = cov_default; }
+  if (this->twist_cov_.size() != 6) { this->twist_cov_ = cov_default; }
+
   // Geometric Observer
-  dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kv", this->geo_Kv_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kq", this->geo_Kq_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kab", this->geo_Kab_, 1.0);
-  dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0);
-  dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0);
-  dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
-
-  // FIX: imu/normalized — true when IMU reports accel in units of g (not m/s²).
-  //      Multiplied by gravity_ on intake. Default false: backward compatible.
-  dlio::declare_param(this, "imu/normalized", this->imu_normalized_, false);
-
-  // FIX: map/maxKeyframes — 0 = disabled (default, backward compatible).
-  //      When > 0, the most spatially redundant keyframe is pruned when exceeded.
-  dlio::declare_param(this, "map/maxKeyframes", this->max_keyframes_, 0);
+  dlio::declare_param(this, "odom/geo/Kp", this->geo_Kp_, 1.0, "Observer position gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kv", this->geo_Kv_, 1.0, "Observer velocity gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kq", this->geo_Kq_, 1.0, "Observer orientation gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kab", this->geo_Kab_, 1.0, "Observer accel-bias gain (live-tunable)", 0.0, 100.0);
+  dlio::declare_param(this, "odom/geo/Kgb", this->geo_Kgb_, 1.0, "Observer gyro-bias gain (live-tunable)", 0.0, 100.0);
+  // LODESTAR-flavored degeneracy-aware observer gain: scale the LiDAR correction
+  // on held-degenerate axes (1 = off / full trust, 0 = freeze the axis to the IMU
+  // prior). Reads the gate's held world-frame dirs; 1.0 (default) -> bit-identical.
+  dlio::declare_param(this, "odom/geo/degenObsGain", this->geo_degen_obs_gain_, 1.0,
+      "Observer correction gain on held-degenerate axes (1 = off, 0 = freeze to IMU prior)", 0.0, 1.0);
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): while the gate holds axes,
+  // the observer's velocity state keeps integrating IMU/accel error along them
+  // and powers both the dead-reckon runaway and the slosh limit cycle (the
+  // reason dliio twist is not fused downstream, doc/FUSION_ARCHITECTURE.md).
+  // Damp the velocity component along each held axis by this factor per scan:
+  // v_along *= (1 - damp). 0 (default) = off, bit-identical; 1 = zero it.
+  dlio::declare_param(this, "odom/geo/degenVelDamp", this->geo_degen_vel_damp_, 0.0,
+      "Per-scan velocity damping along held-degenerate axes (0 = off, 1 = zero the component)", 0.0, 1.0);
+  dlio::declare_param(this, "odom/geo/abias_max", this->geo_abias_max_, 1.0, "Accel-bias clamp [m/s^2] (live-tunable)", 0.0, 50.0);
+  dlio::declare_param(this, "odom/geo/gbias_max", this->geo_gbias_max_, 1.0, "Gyro-bias clamp [rad/s] (live-tunable)", 0.0, 10.0);
 }
-
 
 void dlio::OdomNode::start() {
 
@@ -344,42 +1007,61 @@ void dlio::OdomNode::start() {
 
 void dlio::OdomNode::publishPose() {
 
-  // nav_msgs::msg::Odometry
-  this->odom_ros.header.stamp = this->imu_stamp;
-  this->odom_ros.header.frame_id = this->odom_frame;
-  this->odom_ros.child_frame_id = this->baselink_frame;
+  // This timer runs on its own thread; snapshot the state + stamp under geo.mtx
+  // (the IMU thread writes them via propagateState/updateState under the same
+  // lock) so the published pose is internally consistent, not a torn read.
+  State st;
+  rclcpp::Time stamp;
+  const bool cov_inflate = this->degen_gov_enabled_ &&
+      (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0);
+  std::array<double, 36> cov_extra{};
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    st = this->state;
+    stamp = this->imu_stamp;
+    if (cov_inflate) { cov_extra = this->degen_cov_extra_; }
+  }
 
-  this->odom_ros.pose.pose.position.x = this->state.p[0];
-  this->odom_ros.pose.pose.position.y = this->state.p[1];
-  this->odom_ros.pose.pose.position.z = this->state.p[2];
+  // Degeneracy cov inflation: base diagonal + the rank-1 held-axis terms. Only
+  // when active -> otherwise the ctor-set constant cov is published untouched.
+  if (cov_inflate) {
+    for (int i = 0; i < 36; ++i) { this->odom_ros.pose.covariance[i] = cov_extra[i]; }
+    for (int i = 0; i < 6; ++i) { this->odom_ros.pose.covariance[i * 7] += this->pose_cov_[i]; }
+  }
 
-  this->odom_ros.pose.pose.orientation.w = this->state.q.w();
-  this->odom_ros.pose.pose.orientation.x = this->state.q.x();
-  this->odom_ros.pose.pose.orientation.y = this->state.q.y();
-  this->odom_ros.pose.pose.orientation.z = this->state.q.z();
+  // nav_msgs::msg::Odometry  (frame_id / child_frame_id set once in the ctor)
+  this->odom_ros.header.stamp = stamp;
 
-  this->odom_ros.twist.twist.linear.x = this->state.v.lin.w[0];
-  this->odom_ros.twist.twist.linear.y = this->state.v.lin.w[1];
-  this->odom_ros.twist.twist.linear.z = this->state.v.lin.w[2];
+  this->odom_ros.pose.pose.position.x = st.p[0];
+  this->odom_ros.pose.pose.position.y = st.p[1];
+  this->odom_ros.pose.pose.position.z = st.p[2];
 
-  this->odom_ros.twist.twist.angular.x = this->state.v.ang.b[0];
-  this->odom_ros.twist.twist.angular.y = this->state.v.ang.b[1];
-  this->odom_ros.twist.twist.angular.z = this->state.v.ang.b[2];
+  this->odom_ros.pose.pose.orientation.w = st.q.w();
+  this->odom_ros.pose.pose.orientation.x = st.q.x();
+  this->odom_ros.pose.pose.orientation.y = st.q.y();
+  this->odom_ros.pose.pose.orientation.z = st.q.z();
+
+  this->odom_ros.twist.twist.linear.x = st.v.lin.w[0];
+  this->odom_ros.twist.twist.linear.y = st.v.lin.w[1];
+  this->odom_ros.twist.twist.linear.z = st.v.lin.w[2];
+
+  this->odom_ros.twist.twist.angular.x = st.v.ang.b[0];
+  this->odom_ros.twist.twist.angular.y = st.v.ang.b[1];
+  this->odom_ros.twist.twist.angular.z = st.v.ang.b[2];
 
   this->odom_pub->publish(this->odom_ros);
 
-  // geometry_msgs::msg::PoseStamped
-  this->pose_ros.header.stamp = this->imu_stamp;
-  this->pose_ros.header.frame_id = this->odom_frame;
+  // geometry_msgs::msg::PoseStamped  (frame_id set once in the ctor)
+  this->pose_ros.header.stamp = stamp;
 
-  this->pose_ros.pose.position.x = this->state.p[0];
-  this->pose_ros.pose.position.y = this->state.p[1];
-  this->pose_ros.pose.position.z = this->state.p[2];
+  this->pose_ros.pose.position.x = st.p[0];
+  this->pose_ros.pose.position.y = st.p[1];
+  this->pose_ros.pose.position.z = st.p[2];
 
-  this->pose_ros.pose.orientation.w = this->state.q.w();
-  this->pose_ros.pose.orientation.x = this->state.q.x();
-  this->pose_ros.pose.orientation.y = this->state.q.y();
-  this->pose_ros.pose.orientation.z = this->state.q.z();
+  this->pose_ros.pose.orientation.w = st.q.w();
+  this->pose_ros.pose.orientation.x = st.q.x();
+  this->pose_ros.pose.orientation.y = st.q.y();
+  this->pose_ros.pose.orientation.z = st.q.z();
 
   this->pose_pub->publish(this->pose_ros);
 
@@ -404,6 +1086,12 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   p.pose.orientation.z = this->state.q.z();
 
   this->path_ros.poses.push_back(p);
+  // bound the path message: at scan rate an unbounded Path grows quadratically
+  // in publish bandwidth over long runs
+  if (this->path_ros.poses.size() > 10000) {
+    this->path_ros.poses.erase(this->path_ros.poses.begin(),
+                               this->path_ros.poses.begin() + 1000);
+  }
   this->path_pub->publish(this->path_ros);
 
   // transform: odom to baselink
@@ -422,10 +1110,24 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = this->state.q.y();
   transformStamped.transform.rotation.z = this->state.q.z();
 
-  br->sendTransform(transformStamped);
+  // Skippable when a fusion layer (e.g. robot_localization EKF) owns the
+  // odom->baselink transform: dlio then contributes odometry MESSAGES only
+  // (see cfg/robot_localization_ekf.yaml). Default true -> unchanged.
+  if (this->publish_tf_) {
+    br->sendTransform(transformStamped);
+  }
+
+  // baselink->imu and baselink->lidar are fixed extrinsics, so they are NOT
+  // re-sent here: in extrinsics/source=yaml they are published once (latched) by
+  // the static broadcaster; in =tf robot_state_publisher owns them (see ctor).
+
+}
+
+void dlio::OdomNode::publishStaticTransforms() {
 
   // transform: baselink to imu
-  transformStamped.header.stamp = this->imu_stamp;
+  geometry_msgs::msg::TransformStamped transformStamped;
+  transformStamped.header.stamp = this->now();
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->imu_frame;
 
@@ -439,10 +1141,9 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = q.y();
   transformStamped.transform.rotation.z = q.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
   // transform: baselink to lidar
-  transformStamped.header.stamp = this->imu_stamp;
   transformStamped.header.frame_id = this->baselink_frame;
   transformStamped.child_frame_id = this->lidar_frame;
 
@@ -456,11 +1157,78 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
   transformStamped.transform.rotation.y = qq.y();
   transformStamped.transform.rotation.z = qq.z();
 
-  br->sendTransform(transformStamped);
+  this->static_br->sendTransform(transformStamped);
 
 }
 
+void dlio::OdomNode::resolveExtrinsicsFromTf() {
+  // Look up the latest available transforms. base_link<-imu and base_link<-lidar
+  // are required; lidar<-camera only when the visual term is enabled.
+  auto toMatrix = [](const geometry_msgs::msg::TransformStamped& tf) {
+    const auto& q = tf.transform.rotation;
+    const auto& t = tf.transform.translation;
+    Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+    M.block<3, 3>(0, 0) = Eigen::Quaternionf(static_cast<float>(q.w), static_cast<float>(q.x),
+                                             static_cast<float>(q.y), static_cast<float>(q.z))
+                              .normalized().toRotationMatrix();
+    M.block<3, 1>(0, 3) = Eigen::Vector3f(static_cast<float>(t.x), static_cast<float>(t.y),
+                                          static_cast<float>(t.z));
+    return M;
+  };
+
+  try {
+    if (!this->tf_buffer_->canTransform(this->baselink_frame, this->imu_frame, tf2::TimePointZero) ||
+        !this->tf_buffer_->canTransform(this->baselink_frame, this->lidar_frame, tf2::TimePointZero)) {
+      throw tf2::TransformException("pending");
+    }
+    const auto T_bi = toMatrix(
+        this->tf_buffer_->lookupTransform(this->baselink_frame, this->imu_frame, tf2::TimePointZero));
+    const auto T_bl = toMatrix(
+        this->tf_buffer_->lookupTransform(this->baselink_frame, this->lidar_frame, tf2::TimePointZero));
+    Eigen::Matrix4f T_lc = this->cam2lidar_T_;  // keep YAML cam2lidar unless tf has it
+    if (this->visual_enabled_ &&
+        this->tf_buffer_->canTransform(this->lidar_frame, this->camera_frame_, tf2::TimePointZero)) {
+      T_lc = toMatrix(
+          this->tf_buffer_->lookupTransform(this->lidar_frame, this->camera_frame_, tf2::TimePointZero));
+    }
+
+    // Commit the extrinsics, then release via the atomic store so the scan/imu
+    // threads (which acquire-load extrinsics_ready_ before reading) see them.
+    this->extrinsics.baselink2imu_T = T_bi;
+    this->extrinsics.baselink2imu.t = T_bi.block<3, 1>(0, 3);
+    this->extrinsics.baselink2imu.R = T_bi.block<3, 3>(0, 0);
+    this->extrinsics.baselink2lidar_T = T_bl;
+    this->extrinsics.baselink2lidar.t = T_bl.block<3, 1>(0, 3);
+    this->extrinsics.baselink2lidar.R = T_bl.block<3, 3>(0, 0);
+    this->cam2lidar_T_ = T_lc;
+
+    this->extrinsics_ready_.store(true);
+    this->extrinsics_timer_->cancel();
+    RCLCPP_INFO(this->get_logger(), "extrinsics resolved from tf2 "
+        "(base_link->imu t=[%.4f %.4f %.4f], base_link->lidar t=[%.4f %.4f %.4f]).",
+        this->extrinsics.baselink2imu.t[0], this->extrinsics.baselink2imu.t[1],
+        this->extrinsics.baselink2imu.t[2], this->extrinsics.baselink2lidar.t[0],
+        this->extrinsics.baselink2lidar.t[1], this->extrinsics.baselink2lidar.t[2]);
+  } catch (const tf2::TransformException& e) {
+    if (++this->extrinsics_attempts_ >= 20) {  // ~10 s
+      RCLCPP_WARN(this->get_logger(),
+          "extrinsics/source=tf: transforms unavailable after %d attempts (%s); "
+          "falling back to the YAML extrinsics.", this->extrinsics_attempts_, e.what());
+      this->extrinsics_ready_.store(true);
+      this->extrinsics_timer_->cancel();
+    } else {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "extrinsics/source=tf: still waiting for base_link->{imu,lidar} (%s)...", e.what());
+    }
+  }
+}
+
 void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
+
+  // Skip the (per-scan) dense transform + serialize when nobody is listening,
+  // so RViz/Foxglove not subscribed to the deskewed cloud costs nothing -- the
+  // single biggest viz-vs-estimator CPU contention source.
+  if (this->deskewed_pub->get_subscription_count() == 0) { return; }
 
   if (this->wait_until_move_) {
     if (this->length_traversed < 0.1) { return; }
@@ -497,16 +1265,10 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   this->kf_pose_ros.header.frame_id = this->odom_frame;
   this->kf_pose_pub->publish(this->kf_pose_ros);
 
-  // publish keyframe scan for map
-  if (this->vf_use_) {
-    if (kf.second->points.size() == kf.second->width * kf.second->height) {
-      sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
-      pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
-      keyframe_cloud_ros.header.stamp = timestamp;
-      keyframe_cloud_ros.header.frame_id = this->odom_frame;
-      this->kf_cloud_pub->publish(keyframe_cloud_ros);
-    }
-  } else {
+  // publish keyframe scan for map (only when a consumer -- the map node and/or a
+  // viz client -- is subscribed; the toROSMsg of a full keyframe cloud is not free)
+  if (this->kf_cloud_pub->get_subscription_count() > 0 &&
+      kf.second->points.size() == kf.second->width * kf.second->height) {
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
     keyframe_cloud_ros.header.stamp = timestamp;
@@ -516,82 +1278,375 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
 
 }
 
+float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_incidence,
+                                       float alpha, float r_ref, float cos_min) {
+  if (!(range > 0.f) || r_ref <= 0.f) { return intensity; }
+  const float c = std::max(cos_incidence, cos_min);  // c>0 (cos_min should be >0)
+  return std::clamp(intensity * std::pow(range / r_ref, alpha) / c, 0.f, 255.f);
+}
+
+dlio::SensorType dlio::OdomNode::detectSensorType(
+    const std::vector<sensor_msgs::msg::PointField>& fields,
+    bool has_points, double first_timestamp) {
+  for (const auto& field : fields) {
+    if (field.name == "t") {
+      return dlio::SensorType::OUSTER;
+    } else if (field.name == "time") {
+      return dlio::SensorType::VELODYNE;
+    } else if (field.name == "timestamp" && has_points && first_timestamp < 1e14) {
+      return dlio::SensorType::HESAI;
+    } else if (field.name == "timestamp" && has_points && first_timestamp > 1e14) {
+      return dlio::SensorType::LIVOX;
+    }
+  }
+  return dlio::SensorType::UNKNOWN;
+}
+
+void dlio::OdomNode::resolvePhotometricChannel(bool has_reflectivity, bool has_intensity,
+                                               bool& use_reflectivity, bool& photometric_active) {
+  if (!photometric_active) { return; }                       // term off: nothing to resolve
+  if (!has_reflectivity && !has_intensity) {
+    photometric_active = false;                              // neither available -> disable
+  } else if (use_reflectivity && !has_reflectivity) {
+    use_reflectivity = false;                                // reflectivity -> intensity
+  } else if (!use_reflectivity && !has_intensity) {
+    use_reflectivity = true;                                 // intensity -> reflectivity
+  }
+}
+
+std::vector<uint8_t> dlio::OdomNode::subFloorKeepMask(
+    const std::vector<float>& xs, const std::vector<float>& ys,
+    const std::vector<float>& zs, float cx, float cy,
+    float radius, float cell, float z_bin, int min_bin_count,
+    float margin, float max_reject_frac) {
+
+  const size_t n = zs.size();
+  std::vector<uint8_t> keep(n, 1);
+  if (n == 0 || cell <= 0.f || z_bin <= 0.f || radius <= 0.f) { return keep; }
+
+  // Pass 1: per 2D cell, histogram z of the points inside the radius window.
+  // cell key packs (ix,iy) into one int64; z key is the floor-divided z-bin.
+  const float r2 = radius * radius;
+  std::unordered_map<int64_t, std::unordered_map<int, int>> hist;
+  for (size_t i = 0; i < n; ++i) {
+    const float dx = xs[i] - cx, dy = ys[i] - cy;
+    if (dx * dx + dy * dy > r2) { continue; }                 // only the near-range window
+    const int ix = static_cast<int>(std::floor(dx / cell));
+    const int iy = static_cast<int>(std::floor(dy / cell));
+    const int64_t ckey = (static_cast<int64_t>(ix) << 32) ^ (static_cast<uint32_t>(iy));
+    const int zb = static_cast<int>(std::floor(zs[i] / z_bin));
+    ++hist[ckey][zb];
+  }
+
+  // Pass 2: per cell, the floor is the LOWEST z-bin with >= min_bin_count points
+  // (dense surface). Sparse sub-floor ghosts don't form such a bin, so they
+  // can't pull the floor down. floor_z = lower edge of that bin.
+  std::unordered_map<int64_t, float> floor_z;
+  floor_z.reserve(hist.size());
+  for (const auto& cellkv : hist) {
+    int lowest = std::numeric_limits<int>::max();
+    for (const auto& zkv : cellkv.second) {
+      if (zkv.second >= min_bin_count && zkv.first < lowest) { lowest = zkv.first; }
+    }
+    if (lowest != std::numeric_limits<int>::max()) {
+      floor_z[cellkv.first] = static_cast<float>(lowest) * z_bin;
+    }
+  }
+
+  // Pass 3: drop in-window points more than `margin` below their cell's floor.
+  size_t dropped = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const float dx = xs[i] - cx, dy = ys[i] - cy;
+    if (dx * dx + dy * dy > r2) { continue; }
+    const int ix = static_cast<int>(std::floor(dx / cell));
+    const int iy = static_cast<int>(std::floor(dy / cell));
+    const int64_t ckey = (static_cast<int64_t>(ix) << 32) ^ (static_cast<uint32_t>(iy));
+    const auto it = floor_z.find(ckey);
+    if (it == floor_z.end()) { continue; }                    // no dense floor -> keep
+    if (zs[i] < it->second - margin) { keep[i] = 0; ++dropped; }
+  }
+
+  // Safety: a reject this large means the floor estimate is wrong, not that the
+  // scan is mostly ghosts -- don't gut the scan; no-op instead.
+  if (max_reject_frac > 0.f && dropped > static_cast<size_t>(max_reject_frac * n)) {
+    std::fill(keep.begin(), keep.end(), 1);
+  }
+  return keep;
+}
+
+void dlio::OdomNode::rejectSubFloor() {
+  this->last_subfloor_rejected_ = 0;
+  // Off by default; requires a gravity-aligned world frame (z = up), which the
+  // prior transform gives only when gravity_align_ is on.
+  if (!this->subfloor_reject_enabled_ || !this->gravity_align_) { return; }
+  if (!this->current_scan || this->current_scan->empty()) { return; }
+
+  const auto& in = *this->current_scan;
+  const size_t m = in.size();
+  std::vector<float> xs(m), ys(m), zs(m);
+  for (size_t i = 0; i < m; ++i) { xs[i] = in[i].x; ys[i] = in[i].y; zs[i] = in[i].z; }
+
+  const auto keep = OdomNode::subFloorKeepMask(
+      xs, ys, zs, this->T_prior(0, 3), this->T_prior(1, 3),
+      static_cast<float>(this->subfloor_radius_), static_cast<float>(this->subfloor_cell_),
+      static_cast<float>(this->subfloor_zbin_), this->subfloor_min_bin_,
+      static_cast<float>(this->subfloor_margin_), static_cast<float>(this->subfloor_max_frac_));
+
+  auto kept = std::make_shared<pcl::PointCloud<PointType>>();
+  kept->reserve(m);
+  for (size_t i = 0; i < m; ++i) {
+    if (keep[i]) { kept->push_back(in[i]); }
+    else { ++this->last_subfloor_rejected_; }
+  }
+  if (this->last_subfloor_rejected_ == 0) { return; }          // nothing dropped: leave as-is
+  kept->header = in.header;
+  this->current_scan = kept;
+}
+
+rcl_interfaces::msg::SetParametersResult
+dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
+  // Parameters that may be retuned live (the drift-hunt knobs). Others still
+  // "set" at the ROS level but have no effect until restart.
+  static const std::set<std::string> kLive = {
+    "odom/gicp/photometricWeight", "odom/gicp/photometricHuberDelta",
+    "odom/gicp/photometricScale", "odom/gicp/degeneracyThreshRatio",
+    "odom/gicp/degeneracySoftness", "odom/gicp/photometricRefCount",
+    "odom/gicp/maxCorrespondenceDistance",
+    "odom/keyframe/threshD", "odom/keyframe/threshR",
+    "odom/geo/Kp", "odom/geo/Kv", "odom/geo/Kq", "odom/geo/Kab",
+    "odom/geo/Kgb", "odom/geo/abias_max", "odom/geo/gbias_max"
+  };
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;  // ranges already validated by rclcpp before this
+  std::lock_guard<std::mutex> lock(this->live_mtx_);
+  for (const auto& p : params) {
+    if (kLive.count(p.get_name())) {
+      this->live_pending_[p.get_name()] = p.as_double();
+      this->live_dirty_.store(true);
+    }
+  }
+  return result;
+}
+
+void dlio::OdomNode::applyLiveParams() {
+  if (!this->live_dirty_.load()) { return; }
+  std::map<std::string, double> pending;
+  {
+    std::lock_guard<std::mutex> lock(this->live_mtx_);
+    pending.swap(this->live_pending_);
+    this->live_dirty_.store(false);
+  }
+  for (const auto& kv : pending) {
+    const std::string& name = kv.first;
+    const double v = kv.second;
+    if (name == "odom/gicp/photometricWeight") {
+      this->gicp.setPhotometricWeight(static_cast<float>(v));
+      this->gicp_temp.setPhotometricWeight(static_cast<float>(v));
+      this->photometric_active_ = (v > 0.0);
+    } else if (name == "odom/gicp/photometricHuberDelta") {
+      this->gicp.setPhotometricHuberDelta(static_cast<float>(v));
+      this->gicp_temp.setPhotometricHuberDelta(static_cast<float>(v));
+    } else if (name == "odom/gicp/photometricScale") {
+      this->gicp.setPhotometricScale(static_cast<float>(v));
+      this->gicp_temp.setPhotometricScale(static_cast<float>(v));
+    } else if (name == "odom/gicp/degeneracyThreshRatio") {
+      this->gicp.setDegeneracyThreshRatio(static_cast<float>(v));
+    } else if (name == "odom/gicp/degeneracySoftness") {
+      this->gicp.setDegeneracySoftness(static_cast<float>(v));
+    } else if (name == "odom/gicp/photometricRefCount") {
+      this->gicp.setPhotometricRefCount(static_cast<float>(v));
+      this->gicp_temp.setPhotometricRefCount(static_cast<float>(v));
+    } else if (name == "odom/gicp/maxCorrespondenceDistance") {
+      this->gicp_max_corr_dist_ = v;
+      if (!this->adaptive_params_) {  // adaptive recomputes this each scan
+        this->gicp.setMaxCorrespondenceDistance(static_cast<float>(v));
+        this->gicp_temp.setMaxCorrespondenceDistance(static_cast<float>(v));
+      }
+    } else if (name == "odom/keyframe/threshD") { this->keyframe_thresh_dist_ = v;
+    } else if (name == "odom/keyframe/threshR") { this->keyframe_thresh_rot_ = v;
+    } else if (name == "odom/geo/Kp")  { this->geo_Kp_ = v;
+    } else if (name == "odom/geo/Kv")  { this->geo_Kv_ = v;
+    } else if (name == "odom/geo/Kq")  { this->geo_Kq_ = v;
+    } else if (name == "odom/geo/Kab") { this->geo_Kab_ = v;
+    } else if (name == "odom/geo/Kgb") { this->geo_Kgb_ = v;
+    } else if (name == "odom/geo/abias_max") { this->geo_abias_max_ = v;
+    } else if (name == "odom/geo/gbias_max") { this->geo_gbias_max_ = v;
+    }
+    RCLCPP_INFO(this->get_logger(), "live param: %s = %.6g", name.c_str(), v);
+  }
+}
+
 void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
 
   pcl::PointCloud<PointType>::Ptr original_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
   pcl::fromROSMsg(*pc, *original_scan_);
 
-  bool has_intensity = false;
-  for (const auto& field : pc->fields) {
-    if (field.name == "intensity") { has_intensity = true; break; }
+  // One-time intensity<->reflectivity fallback: resolve the configured photometric
+  // channel against the fields the sensor actually publishes, so a mismatch
+  // degrades gracefully instead of silently producing an all-zero (dead) term.
+  // Field availability is a property of the topic, so resolving once is enough;
+  // this runs on the first scan, before the background submap thread starts, so
+  // reconfiguring gicp/gicp_temp here is race-free.
+  if (!this->channel_resolved_) {
+    auto has_field = [&pc](const char* name) {
+      return std::any_of(pc->fields.begin(), pc->fields.end(),
+          [name](const sensor_msgs::msg::PointField& f){ return f.name == name; });
+    };
+    const bool has_refl = has_field("reflectivity");
+    const bool has_int  = has_field("intensity");
+    const bool was_refl = this->use_reflectivity_;
+    const bool was_active = this->photometric_active_;
+    resolvePhotometricChannel(has_refl, has_int, this->use_reflectivity_, this->photometric_active_);
+
+    if (!this->photometric_active_ && was_active) {
+      RCLCPP_WARN(this->get_logger(), "photometric term enabled but the cloud has neither "
+          "'reflectivity' nor 'intensity'; disabling the photometric term.");
+      this->gicp.setPhotometricWeight(0.f);
+      this->gicp_temp.setPhotometricWeight(0.f);
+    } else if (this->use_reflectivity_ != was_refl) {
+      RCLCPP_WARN(this->get_logger(), "photometricChannel=%s unavailable in the cloud; "
+          "falling back to '%s'.", was_refl ? "reflectivity" : "intensity",
+          this->use_reflectivity_ ? "reflectivity" : "range-corrected intensity");
+      this->gicp.setPhotometricChannel(this->use_reflectivity_);
+      this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
+    }
+    this->channel_resolved_ = true;
   }
 
-  static bool warned_missing_intensity = false;
-  if (!has_intensity && this->photometric_weight_ > 1e-8) {
-    if (!warned_missing_intensity) {
-      RCLCPP_WARN(this->get_logger(),
-          "photometricWeight > 0 but incoming cloud has no 'intensity' field; disabling photometric term.");
-      warned_missing_intensity = true;
+  // Populate the reflectivity channel from the raw message. pcl::fromROSMsg only
+  // copies fields whose datatype matches our struct (reflectivity is a float here,
+  // but sensors publish it as uint8/uint16), so copy it explicitly with conversion.
+  // Done before NaN removal so indices still line up 1:1 with the message.
+  // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
+  // 3D-spatial reflectivity photometric term).
+  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_ ||
+      this->lidar_flow_enabled_) {
+    // Which cloud field feeds the per-point image slot (point.reflectivity).
+    // Default 'reflectivity' -> bit-identical. The COIN-LIO image term may select
+    // a higher-texture channel (odom/lidar_image/channel = intensity|ambient);
+    // honoured only when the 3D reflectivity photometric term isn't also using
+    // the slot (they share it), so the default photometric path is unchanged.
+    std::string img_field = "reflectivity";
+    if (this->lidar_image_enabled_ && !(this->use_reflectivity_ && this->photometric_active_)) {
+      img_field = this->lidar_image_channel_;   // reflectivity | intensity | ambient
+    }
+    auto field_it = std::find_if(pc->fields.begin(), pc->fields.end(),
+        [&img_field](const sensor_msgs::msg::PointField& f){ return f.name == img_field; });
+    if (field_it != pc->fields.end()) {
+      const size_t n = original_scan_->points.size();
+      auto fill = [&](auto it) {
+        for (size_t i = 0; i < n; ++i, ++it) {
+          original_scan_->points[i].reflectivity = static_cast<float>(*it);
+        }
+      };
+      using PF = sensor_msgs::msg::PointField;
+      switch (field_it->datatype) {
+        case PF::UINT8:   fill(sensor_msgs::PointCloud2ConstIterator<uint8_t >(*pc, img_field)); break;
+        case PF::UINT16:  fill(sensor_msgs::PointCloud2ConstIterator<uint16_t>(*pc, img_field)); break;
+        case PF::UINT32:  fill(sensor_msgs::PointCloud2ConstIterator<uint32_t>(*pc, img_field)); break;
+        case PF::FLOAT32: fill(sensor_msgs::PointCloud2ConstIterator<float   >(*pc, img_field)); break;
+        default:
+          RCLCPP_WARN_ONCE(this->get_logger(),
+              "LiDAR-image channel '%s' has unsupported datatype %u; channel will be zero.",
+              img_field.c_str(), field_it->datatype);
+          break;
+      }
+    } else {
+      // Selected field absent. The 3D photometric term already fell back to
+      // intensity above; the COIN-LIO LiDAR-image term still needs a per-point
+      // channel, so build it from 'intensity' (already populated by fromROSMsg).
+      // The image is then a raw-intensity image (range-dependent, not calibrated),
+      // but functional.
+      for (auto& p : original_scan_->points) { p.reflectivity = p.intensity; }
+      RCLCPP_WARN_ONCE(this->get_logger(),
+          "LiDAR-image term: cloud has no '%s' field; using 'intensity' for the "
+          "LiDAR image (range-dependent, not calibrated).", img_field.c_str());
     }
   }
-  this->gicp.setPhotometricWeight(0.0);
-  this->photometric_weight_ = 0.0;
-}
+
+  // Spatial denoise of the image channel: near-IR/ambient is shot-noise-dominated
+  // per pixel (temporal noise ~1.5x the Poisson floor), so a K x K box blur over
+  // the organized grid averages the independent shot noise down ~sqrt(valid
+  // neighbours) while preserving structured wall texture (lag-1 autocorr ~0.9).
+  // In-place on the .reflectivity slot before the image is built, so the current
+  // image and the keyframe references denoise consistently. No-op for K <= 1 or a
+  // non-organized cloud, and (default 0) bit-identical for reflectivity.
+  if (this->lidar_image_enabled_ && this->lidar_image_denoise_kernel_ > 1 &&
+      pc->height > 1 && original_scan_->height == pc->height &&
+      original_scan_->width == pc->width) {
+    this->denoiseOrganizedChannel(original_scan_, pc->width, pc->height,
+                                  this->lidar_image_denoise_kernel_);
+  }
+
+  // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
+  // removal flattens it. No-op if the cloud isn't organized. The flow term
+  // consumes the same image, so a flow-only config also builds it (previously
+  // it silently no-oped without the map term).
+  this->lidar_img_ready_ = false;
+  if ((this->lidar_image_enabled_ || this->lidar_flow_enabled_) && pc->height > 1 &&
+      original_scan_->height == pc->height && original_scan_->width == pc->width) {
+    this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
+  }
+
+  // Radiometric intensity correction (raw-intensity photometric path only):
+  // range falloff and, optionally, incidence angle (Kashani et al.). Applied
+  // BEFORE NaN removal so the organized grid is available for cheap per-point
+  // normals. Skipped for reflectivity (sensor-calibrated) and when the
+  // photometric term is off, so downstream consumers only see modified
+  // intensities when the feature is actually in use.
+  if (!this->use_reflectivity_ && this->photometric_active_ && this->intensity_r_ref_ > 0.0) {
+    const float alpha   = static_cast<float>(this->intensity_alpha_);
+    const float r_ref   = static_cast<float>(this->intensity_r_ref_);
+    const float cos_min = static_cast<float>(this->intensity_cos_min_);
+    const bool organized = (original_scan_->height > 1 && original_scan_->width > 1);
+    const bool do_incidence = this->intensity_incidence_ && organized;
+
+    if (do_incidence) {
+      const int W = static_cast<int>(original_scan_->width);
+      const int H = static_cast<int>(original_scan_->height);
+      for (int row = 0; row < H; ++row) {
+        for (int col = 0; col < W; ++col) {
+          auto& pt = original_scan_->at(col, row);
+          const float r = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+          if (!(r > 0.f)) { continue; }
+          // Surface normal from organized neighbors (right & down); falls back
+          // to range-only (cos=1) at borders / where a neighbor is invalid.
+          float cos_a = 1.0f;
+          if (col + 1 < W && row + 1 < H) {
+            const auto& pr = original_scan_->at(col + 1, row);
+            const auto& pd = original_scan_->at(col, row + 1);
+            if (std::isfinite(pr.x) && std::isfinite(pd.x)) {
+              const Eigen::Vector3f c(pt.x, pt.y, pt.z);
+              Eigen::Vector3f n = (Eigen::Vector3f(pr.x, pr.y, pr.z) - c)
+                                  .cross(Eigen::Vector3f(pd.x, pd.y, pd.z) - c);
+              const float nn = n.norm();
+              if (nn > 1e-6f) { cos_a = std::abs((c / r).dot(n / nn)); }
+            }
+          }
+          pt.intensity = correctIntensity(pt.intensity, r, cos_a, alpha, r_ref, cos_min);
+        }
+      }
+    } else {
+      for (auto& pt : original_scan_->points) {
+        const float r = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+        pt.intensity = correctIntensity(pt.intensity, r, 1.0f, alpha, r_ref, cos_min);
+      }
+    }
+  }
 
   // Remove NaNs
   std::vector<int> idx;
   original_scan_->is_dense = false;
   pcl::removeNaNFromPointCloud(*original_scan_, *original_scan_, idx);
 
-  // Range-normalize intensity to remove distance-dependent falloff.
-  // I_corrected = clamp( I_raw * (r / r_ref)^alpha , 0, 255 )
-  // intensity_alpha_ : falloff exponent  (~2.0 for inverse-square law)
-  // intensity_r_ref_ : reference range in metres (anchor point, typically 1.0 m)
-  {
-
-  if (this->photometric_weight_ > 1e-8) {
-    const float alpha = static_cast<float>(this->intensity_alpha_);
-    const float r_ref  = static_cast<float>(this->intensity_r_ref_);
-    for (auto& pt : original_scan->points) {
-      float r = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-      if (r > 0.f) {
-        pt.intensity = std::clamp(pt.intensity * std::pow(r / r_ref, alpha), 0.f, 255.f);
-      }
-    }
-  }
-}
-
   // Crop Box Filter
   this->crop.setInputCloud(original_scan_);
   this->crop.filter(*original_scan_);
 
-  // FIX: guard against empty cloud after crop/NaN removal before indexing points[0]
-  if (original_scan_->points.empty()) {
-    RCLCPP_WARN(this->get_logger(), "Scan is empty after crop/NaN filtering, skipping.");
-    this->sensor = dlio::SensorType::UNKNOWN;
-    this->deskew_ = false;
-    this->scan_header_stamp = pc->header.stamp;
-    this->original_scan = original_scan_;
-    return;
-  }
-
   // automatically detect sensor type
-  this->sensor = dlio::SensorType::UNKNOWN;
-  for (auto &field : pc->fields) {
-    if (field.name == "t") {
-      this->sensor = dlio::SensorType::OUSTER;
-      break;
-    } else if (field.name == "time") {
-      this->sensor = dlio::SensorType::VELODYNE;
-      break;
-    } else if (field.name == "timestamp" && original_scan_->points[0].timestamp < 1e14) {
-      this->sensor = dlio::SensorType::HESAI;
-      break;
-    } else if (field.name == "timestamp" && original_scan_->points[0].timestamp > 1e14) {
-      this->sensor = dlio::SensorType::LIVOX;
-      break;
-    }
-  }
+  const bool has_points = !original_scan_->points.empty();
+  this->sensor = detectSensorType(pc->fields, has_points,
+      has_points ? original_scan_->points[0].timestamp : 0.0);
 
   if (this->sensor == dlio::SensorType::UNKNOWN) {
     this->deskew_ = false;
@@ -650,44 +1705,70 @@ void dlio::OdomNode::preprocessPoints() {
   }
 
   // Voxel Grid Filter
-if (this->vf_use_) {
-  pcl::PointCloud<PointType>::Ptr input_scan =
-      std::make_shared<pcl::PointCloud<PointType>>(*this->deskewed_scan);
-  pcl::PointCloud<PointType>::Ptr current_scan_ =
-      std::make_shared<pcl::PointCloud<PointType>>();
+  if (this->vf_use_) {
+    // Filter straight from deskewed_scan into a fresh output cloud: VoxelGrid
+    // reads its input and writes a separate output, so there is no need to
+    // deep-copy the (full-resolution) deskewed cloud first. deskewed_scan is
+    // left untouched for the dense-map publish path.
+    pcl::PointCloud<PointType>::Ptr current_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
+    this->voxel.setInputCloud(this->deskewed_scan);
+    this->voxel.filter(*current_scan_);
 
-  this->voxel.setSaveLeafLayout(true);
-  this->voxel.setInputCloud(input_scan);
-  this->voxel.filter(*current_scan_);
-
-  // Re-attach averaged intensity per output voxel (VoxelGrid only averages x,y,z).
-  std::vector<float> intensity_sum(current_scan_->size(), 0.0f);
-  std::vector<int> intensity_count(current_scan_->size(), 0);
-  for (const auto& pt : input_scan->points) {
-    const Eigen::Vector3i ijk = this->voxel.getGridCoordinates(pt.x, pt.y, pt.z);
-    const int idx = this->voxel.getCentroidIndexAt(ijk);
-    if (idx >= 0 && idx < static_cast<int>(current_scan_->size())) {
-      intensity_sum[idx] += pt.intensity;
-      intensity_count[idx] += 1;
+    // Re-attach the photometric channels VoxelGrid dropped: average each input
+    // point's reflectivity/intensity into the output voxel it fell into, using
+    // the saved leaf layout (O(N), no extra kd-tree). Without this the submap's
+    // channel is all-zero and every photometric gradient is rejected. Only the
+    // photometric GICP term and the COIN-LIO LiDAR-image term read these
+    // channels, so skip the transfer entirely in the default geometry-only path.
+    // Both channels are averaged regardless of which one is in use: the absent
+    // one is simply zero in -> zero out (the active channel is the one the term
+    // reads via photometric_use_reflectivity_), so single-channel sensors
+    // (intensity-only or reflectivity-only) are handled correctly.
+    const size_t M = current_scan_->size();
+    if (M > 0 && (this->photometric_active_ || this->lidar_image_enabled_)) {
+      std::vector<float> refl_sum(M, 0.f), int_sum(M, 0.f);
+      std::vector<int> cnt(M, 0);
+      for (const auto& p : this->deskewed_scan->points) {
+        const int idx = this->voxel.getCentroidIndex(p);
+        if (idx >= 0 && static_cast<size_t>(idx) < M) {
+          refl_sum[idx] += p.reflectivity;
+          int_sum[idx]  += p.intensity;
+          ++cnt[idx];
+        }
+      }
+      for (size_t i = 0; i < M; ++i) {
+        if (cnt[i] > 0) {
+          current_scan_->points[i].reflectivity = refl_sum[i] / cnt[i];
+          current_scan_->points[i].intensity    = int_sum[i]  / cnt[i];
+        }
+      }
     }
-  }
-  for (size_t i = 0; i < current_scan_->size(); ++i) {
-    if (intensity_count[i] > 0) {
-      current_scan_->points[i].intensity = intensity_sum[i] / intensity_count[i];
-    }
-  }
-  this->current_scan = current_scan_;
+    this->current_scan = current_scan_;
   } else {
-  this->current_scan = this->deskewed_scan;
+    this->current_scan = this->deskewed_scan;
   }
+
+  // Drop specular sub-floor "ghost" returns before registration/mapping. No-op
+  // unless enabled (off by default -> bit-identical), so it filters whichever
+  // cloud became current_scan and keeps ghosts out of the keyframe/submap too.
+  this->rejectSubFloor();
 
 }
 
 void dlio::OdomNode::deskewPointcloud() {
 
+  // an empty scan (e.g. fully cropped) would otherwise crash on the
+  // first-point/median-timestamp lookups below
+  if (this->original_scan->points.empty()) {
+    this->scan_stamp = rclcpp::Time(this->scan_header_stamp).seconds();
+    this->deskewed_scan = this->original_scan;
+    this->deskew_status = false;
+    return;
+  }
+
+  // pcl::PointCloud(width, height): N points wide, 1 row tall (unorganized)
   pcl::PointCloud<PointType>::Ptr deskewed_scan_ =
-    std::make_shared<pcl::PointCloud<PointType>>(this->original_scan->points.size(), 1);
-  deskewed_scan->points.resize(this->original_scan->points.size());
+      std::make_shared<pcl::PointCloud<PointType>>(this->original_scan->points.size(), 1);
   // individual point timestamps should be relative to this time
   double sweep_ref_time = rclcpp::Time(this->scan_header_stamp).seconds();
 
@@ -788,7 +1869,10 @@ void dlio::OdomNode::deskewPointcloud() {
   // if there are no frames between the start and end of the sweep
   // that probably means that there's a sync issue
   if (frames.size() != timestamps.size()) {
-    RCLCPP_FATAL(this->get_logger(),"Bad time sync between LiDAR and IMU!");
+    // not fatal: gracefully degrades to a rigid (non-deskewed) transform below
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "IMU data does not cover the scan period (time sync / dropout?); "
+        "skipping motion correction for this scan");
 
     this->T_prior = this->T;
     pcl::transformPointCloud (*deskewed_scan_, *deskewed_scan_, this->T_prior * this->extrinsics.baselink2lidar_T);
@@ -825,17 +1909,32 @@ void dlio::OdomNode::initializeInputTarget() {
   // keep history of keyframes
   this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
   this->keyframe_timestamps.push_back(this->scan_header_stamp);
-  // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-  // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_transformations.push_back(this->T_corr);
+
+  // Sample per-point camera reference brightness for the frame-to-map term
+  // (index-aligned with keyframes; p_kf_cam is camera-frame so it survives the
+  // later world re-transform in buildKeyframesAndSubmap untouched).
+  if (this->visual_map_enabled_) {
+    Eigen::Matrix4f T_wc = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+    Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
+    cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
+    this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+  }
+  // Keyframe-image LiDAR refs (INTENSITY_AUDIT_2026-07-09): same prior-pose
+  // convention as the visual refs -- current_scan is prior-frame world, and the
+  // scalar brightness survives the later T_corr re-transform.
+  if (this->lidar_image_refs_enabled_) {
+    Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+    Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+    cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+    this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
+  }
 
 }
 
 void dlio::OdomNode::setInputSource() {
   this->gicp.setInputSource(this->current_scan);
-  // this->gicp.calculateSourceCovariances();
 }
 
 void dlio::OdomNode::initializeDLIO() {
@@ -852,11 +1951,29 @@ void dlio::OdomNode::initializeDLIO() {
 
 void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc) {
 
+  if (!this->extrinsics_ready_.load()) { return; }  // tf extrinsics not resolved yet
+
   std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
   this->main_loop_running = true;
   lock.unlock();
 
-  double then = this->now().seconds();
+  // Join the previous scan's dashboard thread before this scan mutates any of
+  // the stats vectors it reads (comp_times / lidar_rates / metrics, all
+  // push_back + cap_history). Doing it here -- before computeMetrics below --
+  // closes the iterator-invalidation race for the scan-thread-written stats.
+  // (imu_rates is written by the IMU thread and is guarded by mtx_imu instead.)
+  if (this->debug_thread.joinable()) { this->debug_thread.join(); }
+
+  // Commit any parameters retuned via `ros2 param set` since the last scan
+  // (staged by onSetParams on the executor thread; applied here on the scan
+  // thread so gicp/observer state is only ever mutated from one thread).
+  this->applyLiveParams();
+
+  // Wall-clock start for the computation-time / CPU-starvation diagnostics.
+  // Must be a STEADY clock, not this->now(): under use_sim_time (bag replay)
+  // now() is sim time driven by /clock, so comp_time would be scaled by the
+  // playback rate (and ~0 on a paused bag) instead of measuring real CPU cost.
+  const auto cpu_t0 = std::chrono::steady_clock::now();
 
   if (this->first_scan_stamp == 0.) {
     this->first_scan_stamp = rclcpp::Time(pc->header.stamp).seconds();
@@ -878,13 +1995,18 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   }
 
   if (this->current_scan->points.size() <= this->gicp_min_num_points_) {
-    RCLCPP_FATAL(this->get_logger(), "Low number of points in the cloud!");
+    // not fatal: this scan is skipped; odometry continues on IMU propagation
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Low number of points in the cloud (%zu <= %d); skipping scan",
+        this->current_scan->points.size(), this->gicp_min_num_points_);
     return;
   }
 
-  // Compute Metrics
-  this->metrics_thread = std::thread( &dlio::OdomNode::computeMetrics, this );
-  this->metrics_thread.detach();
+  // Compute Metrics (inline: cheap relative to registration, removes the
+  // data race on original_scan/metrics vectors the old worker thread had,
+  // and setAdaptiveParams below now uses THIS scan's metrics, not the
+  // previous scan's)
+  this->computeMetrics();
 
   // Set Adaptive Parameters
   if (this->adaptive_params_) {
@@ -910,6 +2032,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // Update current keyframe poses and map
   this->updateKeyframes();
 
+  // Optionally bound the keyframe map. Only safe while the background submap
+  // thread is idle (new_submap_is_ready), since pruning re-indexes the
+  // keyframe vectors that buildKeyframesAndSubmap iterates.
+  if (this->max_keyframes_ > 0 && this->new_submap_is_ready
+      && (int)this->keyframes.size() > this->max_keyframes_) {
+    this->pruneKeyframes();
+  }
+
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
     this->main_loop_running = false;
@@ -922,11 +2052,20 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     this->submap_build_cv.notify_one();
   }
 
-  // Update trajectory
-  this->trajectory.push_back( std::make_pair(this->state.p, this->state.q) );
+  // Update distance traveled incrementally (replaces the unbounded trajectory
+  // vector that debug() used to re-integrate from scratch every scan)
+  double l = (this->state.p - this->length_prev_p).norm();
+  if (l >= 0.1) {
+    this->length_traversed += l;
+    this->length_prev_p = this->state.p;
+  }
 
-  // Update time stamps
-  this->lidar_rates.push_back( 1. / (this->scan_stamp - this->prev_scan_stamp) );
+  // Update time stamps. Capture the inter-scan period BEFORE overwriting
+  // prev_scan_stamp -- the CPU-starvation block below needs it (computing it
+  // after the overwrite made it always 0, silently killing those diagnostics).
+  const double scan_period = this->scan_stamp - this->prev_scan_stamp;
+  this->lidar_rates.push_back( 1. / scan_period );
+  cap_history(this->lidar_rates);
   this->prev_scan_stamp = this->scan_stamp;
   this->elapsed_time = this->scan_stamp - this->first_scan_stamp;
 
@@ -937,27 +2076,61 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   } else {
     published_cloud = this->deskewed_scan;
   }
+  if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
-  this->publish_thread.detach();
 
-  // Update some statistics
-  this->comp_times.push_back(this->now().seconds() - then);
+  // Update some statistics (wall-clock comp_time; see cpu_t0 above)
+  const double comp_time =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_t0).count();
+  this->comp_times.push_back(comp_time);
+  cap_history(this->comp_times);
   this->gicp_hasConverged = this->gicp.hasConverged();
 
-  // Debug statements and publish custom DLIO message
-  this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
-  this->debug_thread.detach();
+  // CPU-starvation indicator: a scan whose processing took longer than the scan
+  // period means the node cannot keep real time and WILL fall behind / drop
+  // scans under load -- the documented #1 cause of tunnel-run failures (and NOT
+  // an algorithm fault). Surface it in /diagnostics so a starved run is
+  // distinguishable from a genuine divergence at a glance. (scan_period was
+  // captured above, before prev_scan_stamp was advanced.)
+  this->last_realtime_factor_ = (scan_period > 0.0) ? (comp_time / scan_period) : 0.0;
+  if (scan_period > 0.0 && comp_time > scan_period) { ++this->compute_overruns_; }
+  // Estimate scans dropped by the transport (best-effort) when the inter-scan
+  // gap is well over the nominal period.
+  if (scan_period > 0.0 && this->prev_scan_period_ > 0.0
+      && scan_period > 1.8 * this->prev_scan_period_) {
+    this->scans_dropped_est_ += static_cast<long>(scan_period / this->prev_scan_period_) - 1;
+  }
+  if (scan_period > 0.0) { this->prev_scan_period_ = scan_period; }
 
-  this->geo.first_opt_done.store(true); // FIX: atomic store
+  // Publish /diagnostics every scan (independent of the dashboard toggle below).
+  this->publishDiagnostics();
+
+  // Terminal dashboard (odom/debug/dashboard); disable under launch files,
+  // containers, or logging setups where the ANSI clear-screen output garbles
+  // multiplexed logs.
+  if (this->dashboard_) {
+    // (previous dashboard thread already joined at the top of this callback)
+    this->debug_thread = std::thread( &dlio::OdomNode::debug, this );
+  }
+
+  this->geo.first_opt_done = true;
 
 }
 
 void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
 
+  // transformImu uses the baselink<-imu extrinsic; wait until it's resolved
+  // (tf mode). Drops the brief startup window before tf is available.
+  if (!this->extrinsics_ready_.load()) { return; }
+
   this->first_imu_received = true;
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
-  this->imu_stamp = imu->header.stamp;
+  {
+    // imu_stamp is read by publishPose (timer thread) under geo.mtx; guard the write.
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    this->imu_stamp = imu->header.stamp;
+  }
   double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
 
   Eigen::Vector3f lin_accel;
@@ -968,9 +2141,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   ang_vel[1] = imu->angular_velocity.y;
   ang_vel[2] = imu->angular_velocity.z;
 
-  lin_accel[0] = imu->linear_acceleration.x;
-  lin_accel[1] = imu->linear_acceleration.y;
-  lin_accel[2] = imu->linear_acceleration.z;
+  // Livox-style IMUs report acceleration in units of g; scale to m/s^2.
+  const float accel_scale = this->imu_normalized_ ? static_cast<float>(this->gravity_) : 1.0f;
+  lin_accel[0] = imu->linear_acceleration.x * accel_scale;
+  lin_accel[1] = imu->linear_acceleration.y * accel_scale;
+  lin_accel[2] = imu->linear_acceleration.z * accel_scale;
 
   if (this->first_imu_stamp == 0.) {
     this->first_imu_stamp = imu_stamp_secs;
@@ -979,10 +2154,12 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   // IMU calibration procedure - do for three seconds
   if (!this->imu_calibrated) {
 
-    static int num_samples = 0;
-    static Eigen::Vector3f gyro_avg (0., 0., 0.);
-    static Eigen::Vector3f accel_avg (0., 0., 0.);
-    static bool print = true;
+    // Per-instance accumulators (members; see odom.h). Bound to local names so
+    // the calibration body below is unchanged.
+    int& num_samples = this->calib_num_samples_;
+    Eigen::Vector3f& gyro_avg = this->calib_gyro_avg_;
+    Eigen::Vector3f& accel_avg = this->calib_accel_avg_;
+    bool& print = this->calib_print_;
 
     if ((imu_stamp_secs - this->first_imu_stamp) < this->imu_calib_time_) {
 
@@ -1062,13 +2239,25 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
       this->imu_calibrated = true;
 
+      // Anchor dt for the first post-calibration measurement; otherwise the
+      // first dt is computed against prev_imu_stamp = 0 (a ~1e9 s step) and
+      // poisons the IMU buffer / state propagation, causing startup drift.
+      this->prev_imu_stamp = imu_stamp_secs;
+
     }
 
   } else {
 
     double dt = imu_stamp_secs - this->prev_imu_stamp;
     if (dt == 0) { dt = 1.0/200.0; }
-    this->imu_rates.push_back( 1./dt );
+    {
+      // imu_rates is read by publishDiagnostics (scan thread, every scan) and
+      // the dashboard thread; guard the push+cap_history so the erase can't
+      // invalidate a concurrent reader's iterators.
+      std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu);
+      this->imu_rates.push_back( 1./dt );
+      cap_history(this->imu_rates);
+    }
 
     // Apply the calibrated bias to the new IMU measurements
     this->imu_meas.stamp = imu_stamp_secs;
@@ -1076,15 +2265,10 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     this->prev_imu_stamp = this->imu_meas.stamp;
 
     Eigen::Vector3f lin_accel_corrected = (this->imu_accel_sm_ * lin_accel) - this->state.b.accel;
-    Eigen::Vector3f ang_vel_corrected   = ang_vel - this->state.b.gyro;
-
-    // FIX: imu_normalized_ — scale g-unit accel to m/s² if needed. Default false.
-    if (this->imu_normalized_) {
-      lin_accel_corrected *= static_cast<float>(this->gravity_);
-    }
+    Eigen::Vector3f ang_vel_corrected = ang_vel - this->state.b.gyro;
 
     this->imu_meas.lin_accel = lin_accel_corrected;
-    this->imu_meas.ang_vel   = ang_vel_corrected;
+    this->imu_meas.ang_vel = ang_vel_corrected;
 
     // Store calibrated IMU measurements into imu buffer for manual integration later.
     this->mtx_imu.lock();
@@ -1094,13 +2278,375 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     // Notify the callbackPointCloud thread that IMU data exists for this time
     this->cv_imu_stamp.notify_one();
 
-    if (this->geo.first_opt_done.load()) { // FIX: atomic load
+    if (this->geo.first_opt_done) {
       // Geometric Observer: Propagate State
       this->propagateState();
     }
 
   }
 
+}
+
+void dlio::OdomNode::callbackImage(const sensor_msgs::msg::Image::SharedPtr img) {
+
+  if (!this->visual_enabled_) { return; }
+
+  // Convert to single-channel 8-bit (handles mono/rgb/bgr/bayer encodings).
+  cv_bridge::CvImageConstPtr cvp;
+  try {
+    cvp = cv_bridge::toCvCopy(img, sensor_msgs::image_encodings::MONO8);
+  } catch (const std::exception& e) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "cv_bridge could not convert image to mono8: %s", e.what());
+    return;
+  }
+  if (cvp->image.empty()) { return; }
+
+  // Build undistort maps once, from the configured intrinsics/distortion and
+  // the first image's size.
+  if (!this->visual_maps_ready_.load()) {
+    const auto& I = this->camera_intrinsics_;
+    cv::Mat K = (cv::Mat_<double>(3, 3) << I[0], 0.0, I[2], 0.0, I[1], I[3], 0.0, 0.0, 1.0);
+    cv::Mat D(static_cast<int>(this->camera_distortion_.size()), 1, CV_64F);
+    for (size_t i = 0; i < this->camera_distortion_.size(); ++i) { D.at<double>(static_cast<int>(i)) = this->camera_distortion_[i]; }
+    cv::initUndistortRectifyMap(K, D, cv::Mat(), K, cvp->image.size(), CV_16SC2,
+                               this->vis_map1_, this->vis_map2_);
+    this->visual_maps_ready_ = true;
+  }
+
+  cv::Mat undistorted;
+  cv::remap(cvp->image, undistorted, this->vis_map1_, this->vis_map2_, cv::INTER_LINEAR);
+
+  // Buffer the UNDISTORTED MONO8 image (1 byte/px). The single frame matched to
+  // a scan is converted to normalized float in setupVisualForScan -- storing 30
+  // full-res CV_32FC1 frames here would be ~4x the memory (hundreds of MB at 2MP).
+  const double stamp = rclcpp::Time(img->header.stamp).seconds();
+  {
+    std::lock_guard<std::mutex> lock(this->image_mtx_);
+    this->image_buffer_.emplace_back(stamp, undistorted);
+    while (this->image_buffer_.size() > 30) { this->image_buffer_.pop_front(); }
+  }
+}
+
+bool dlio::OdomNode::setupVisualForScan() {
+
+  // Default everything off for this scan; (re)enable below per term.
+  this->visual_cur_pending_valid_ = false;
+  this->last_visual_match_dt_ = -1.0;   // diagnostics: reset, set below if matched
+  this->gicp.setVisualEnabled(false);
+  this->gicp.setVisualMapWeight(0.f);
+
+  const bool want_f2f = this->visual_enabled_ && this->visual_weight_ > 0.0;
+  const bool want_f2m = this->visual_enabled_ && this->visual_map_enabled_ && this->visual_map_weight_ > 0.0;
+  if (!want_f2f && !want_f2m) { return false; }
+
+  // Pick the buffered image nearest this scan's stamp (within tolerance).
+  cv::Mat cur_mono;  // mono8 (the buffer stores 8-bit to save memory)
+  double best_dt = this->visual_max_dt_;
+  {
+    std::lock_guard<std::mutex> lock(this->image_mtx_);
+    for (const auto& kv : this->image_buffer_) {
+      const double dt = std::abs(kv.first - this->scan_stamp);
+      if (dt <= best_dt) { best_dt = dt; cur_mono = kv.second; }
+    }
+  }
+  this->last_visual_match_dt_ = cur_mono.empty() ? -1.0 : best_dt;   // diagnostics
+  if (cur_mono.empty()) { return false; }  // graceful LiDAR-only this scan
+  // Convert the single matched frame to normalized float (the residual unit).
+  cv::Mat cur_img;
+  cur_mono.convertTo(cur_img, CV_32FC1, 1.0 / 255.0);
+
+  // world -> current camera, from the prior (predicted) pose. Shared by both the
+  // frame-to-frame (raw source points) and frame-to-map (fixed map points) terms.
+  Eigen::Matrix4f T_wc_cur = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+  Eigen::Isometry3f T_cw_cur;
+  T_cw_cur.matrix() = T_wc_cur.inverse();
+
+  this->gicp.setVisualIntrinsics(
+      static_cast<float>(this->camera_intrinsics_[0]), static_cast<float>(this->camera_intrinsics_[1]),
+      static_cast<float>(this->camera_intrinsics_[2]), static_cast<float>(this->camera_intrinsics_[3]));
+  this->gicp.setVisualHuberDelta(static_cast<float>(this->visual_huber_delta_));
+  this->gicp.setVisualCurrentFrame(cur_img, T_cw_cur);
+
+  // Stash for promotion to "previous" after align() and for keyframe sampling.
+  this->visual_cur_pending_ = cur_img;
+  this->visual_cur_pending_valid_ = true;
+
+  // Frame-to-MAP term: anchors to map landmarks; works on the first frame too.
+  if (want_f2m) {
+    this->gicp.setVisualMapWeight(static_cast<float>(this->visual_map_weight_));
+    this->gicp.setVisualMapGateMaxStep(static_cast<float>(this->visual_map_gate_max_trans_),
+                                       static_cast<float>(this->visual_map_gate_max_rot_));
+    this->gicp.setVisualMapViewAngleMax(static_cast<float>(this->visual_map_view_angle_));
+  }
+
+  // Frame-to-frame term: needs a previous frame to warp against.
+  if (want_f2f) {
+    this->gicp.setVisualWeight(static_cast<float>(this->visual_weight_));
+    this->gicp.setVisualGateMaxStep(static_cast<float>(this->visual_gate_max_trans_),
+                                    static_cast<float>(this->visual_gate_max_rot_));
+    if (this->visual_has_prev_) { this->gicp.setVisualEnabled(true); }
+    this->gicp.setVisualPreviousFrame(this->visual_prev_img_, this->visual_T_cw_prev_);
+    // Dense source: project the full deskewed scan (world frame) so the narrow
+    // camera FOV stays populated as the registration cloud shrinks. Null when
+    // disabled -> the term iterates the voxelised input_ (bit-identical).
+    this->gicp.setVisualSource(
+        this->visual_dense_source_ ? this->deskewed_scan : nullptr,
+        this->visual_dense_max_);
+  }
+
+  return want_f2m || (want_f2f && this->visual_has_prev_);
+}
+
+std::shared_ptr<const nano_gicp::VisualRefList>
+dlio::OdomNode::sampleKeyframeVisualRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                                         const Eigen::Isometry3f& T_cw, const cv::Mat& img) {
+  // Always returns a list sized cloud->size() (all-invalid if no usable image),
+  // so it stays index-aligned with the keyframe cloud through submap assembly.
+  auto refs = std::make_shared<nano_gicp::VisualRefList>(cloud->size());
+  if (img.empty() || img.type() != CV_32FC1 || this->camera_intrinsics_.size() != 4) {
+    return refs;
+  }
+  const float fx = this->camera_intrinsics_[0], fy = this->camera_intrinsics_[1];
+  const float cx = this->camera_intrinsics_[2], cy = this->camera_intrinsics_[3];
+  const Eigen::Matrix3f R = T_cw.linear();
+  const Eigen::Vector3f t = T_cw.translation();
+  const float bw = 2.f;
+  const float umax = static_cast<float>(img.cols) - 1.f - bw;
+  const float vmax = static_cast<float>(img.rows) - 1.f - bw;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    const auto& p = cloud->at(i);
+    const Eigen::Vector3f Pc = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+    nano_gicp::VisualRef vr;
+    vr.valid = 0;
+    if (Pc.z() > 1e-3f) {
+      const float u = fx * Pc.x() / Pc.z() + cx;
+      const float v = fy * Pc.y() / Pc.z() + cy;
+      if (u >= bw && u <= umax && v >= bw && v <= vmax) {
+        const float gu = 0.5f * (bilinearF(img, u + 1.f, v) - bilinearF(img, u - 1.f, v));
+        const float gv = 0.5f * (bilinearF(img, u, v + 1.f) - bilinearF(img, u, v - 1.f));
+        if (std::abs(gu) > 1e-6f || std::abs(gv) > 1e-6f) {  // gradient-bearing only
+          vr.ref = bilinearF(img, u, v);
+          vr.p_kf_cam = Pc;
+          vr.valid = 1;
+        }
+      }
+    }
+    (*refs)[i] = vr;
+  }
+  return refs;
+}
+
+std::shared_ptr<const std::vector<float>>
+dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstPtr& cloud,
+                                        const Eigen::Isometry3f& T_lw, const cv::Mat& img) {
+  // Per-point brightness from this keyframe's FULL-RES reflectivity image
+  // (INTENSITY_AUDIT_2026-07-09): the reference the map term keys on, sampled
+  // BEFORE the voxel average blurs the texture away. Always returns a list sized
+  // cloud->size() (-1 = invalid) so it stays index-aligned with the keyframe
+  // cloud through submap assembly. The scalar is pose-independent, so it
+  // survives buildKeyframesAndSubmap's later T_corr re-transform untouched.
+  auto refs = std::make_shared<std::vector<float>>(cloud->size(), -1.f);
+  if (img.empty() || img.type() != CV_32FC1 || !this->lidar_proj_ready_) {
+    return refs;
+  }
+  const Eigen::Matrix3f R = T_lw.linear();
+  const Eigen::Vector3f t = T_lw.translation();
+  const float inv_az_a = 1.f / this->lidar_az_a_;
+  const float inv_el_a = 1.f / this->lidar_el_a_;
+  // MUST match the model the GICP map term projects with, or the reference is
+  // sampled at different pixels than the residual lands on. Both now read the
+  // one flag validated when the LUT was built (2026-07-26 audit: this sampler
+  // previously checked only the size, so a single NaN row -- a beam with no
+  // returns in the one scan the LUT is built from -- silently split the two
+  // sides onto different projection models and killed every reference).
+  const bool use_lut = this->lidar_el_lut_valid_
+                       && static_cast<int>(this->lidar_el_lut_.size()) == img.rows;
+  const float bw = 2.f;
+  const float umax = static_cast<float>(img.cols) - 1.f - bw;
+  const float vmax = static_cast<float>(img.rows) - 1.f - bw;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    const auto& p = cloud->at(i);
+    const Eigen::Vector3f Pl = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+    const float rxy2 = Pl.x() * Pl.x() + Pl.y() * Pl.y();
+    if (rxy2 < 1e-6f) { continue; }
+    const float az = std::atan2(Pl.y(), Pl.x());
+    const float el = std::atan2(Pl.z(), std::sqrt(rxy2));
+    const float u = (az - this->lidar_az_b_) * inv_az_a;
+    float v;
+    if (use_lut) {
+      // Shared inversion (nano_gicp/elevation_lut.h) -- the same code the map
+      // and flow terms project with. Outside the LUT's coverage -> invalid.
+      float slope;
+      const bool found = nano_gicp::rowFromElevationLut(this->lidar_el_lut_, el, v, slope);
+      if (!found) { continue; }
+    } else {
+      v = (el - this->lidar_el_b_) * inv_el_a;
+    }
+    if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }  // NaN-safe
+    (*refs)[i] = bilinearF(img, u, v);   // image is already /scale normalized
+  }
+  return refs;
+}
+
+void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::Ptr& organized,
+                                             int width, int height, int kernel) {
+  if (kernel <= 1) { return; }
+  const int half = kernel / 2;
+  const size_t n = static_cast<size_t>(width) * static_cast<size_t>(height);
+  // Snapshot the slot + validity so the blur reads pre-denoise values (a valid
+  // pixel is a real return with finite x, matching buildLidarIntensityImage).
+  std::vector<float> in(n, 0.f);
+  std::vector<uint8_t> valid(n, 0);
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);   // organized access (col, row)
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
+        in[idx] = p.reflectivity;
+        valid[idx] = 1;
+      }
+    }
+  }
+  // Box-blur over the K x K neighbourhood, valid pixels only (no-return pixels
+  // are excluded and left untouched). No azimuth wrap at the col seam: at K~5 the
+  // seam columns simply lose a couple of neighbours, which is negligible.
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      const size_t idx = static_cast<size_t>(row) * width + col;
+      if (!valid[idx]) { continue; }
+      float sum = 0.f; int cnt = 0;
+      for (int dr = -half; dr <= half; ++dr) {
+        const int r = row + dr;
+        if (r < 0 || r >= height) { continue; }
+        for (int dc = -half; dc <= half; ++dc) {
+          const int c = col + dc;
+          if (c < 0 || c >= width) { continue; }
+          const size_t nidx = static_cast<size_t>(r) * width + c;
+          if (valid[nidx]) { sum += in[nidx]; ++cnt; }
+        }
+      }
+      if (cnt > 0) { organized->at(col, row).reflectivity = sum / static_cast<float>(cnt); }
+    }
+  }
+}
+
+void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::ConstPtr& organized,
+                                              int width, int height) {
+  // Reflectivity image in native (row=ring, col=azimuth) order, normalized to
+  // the same /scale units as the residual reference (point.reflectivity/scale).
+  // Per-channel scale (odom/lidar_image/scale; default 255, bit-identical) keeps
+  // the image and the gicp map-term reference normalized identically.
+  const float inv_scale = 1.f / static_cast<float>(this->lidar_image_scale_);
+  cv::Mat img(height, width, CV_32FC1, cv::Scalar(0.f));
+  cv::Mat rng(height, width, CV_32FC1, cv::Scalar(0.f));  // range [m]; 0 = no return
+  for (int row = 0; row < height; ++row) {
+    float* dst = img.ptr<float>(row);
+    float* drng = rng.ptr<float>(row);
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);   // organized access (col, row)
+      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
+        dst[col] = p.reflectivity * inv_scale;
+        drng[col] = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+      }
+    }
+  }
+  this->lidar_refl_img_ = img;
+  this->lidar_range_img_ = rng;
+  this->lidar_img_ready_ = true;
+
+  // Azimuth-gradient energy (INTENSITY_AUDIT_2026-07-09 instrumentation): mean
+  // |dI/dcol| over valid pixel pairs, in /scale units. The column axis is
+  // azimuth ~ the along-tunnel direction on the walls, so this measures how
+  // much full-resolution texture (graffiti strokes) the image actually carries
+  // for the image-domain terms -- the signal the 0.25m voxel average destroys
+  // before the 3D photometric term sees it. Cheap (one pass, already-hot rows).
+  {
+    double e = 0.0; long n = 0;
+    for (int row = 0; row < height; ++row) {
+      const float* src = img.ptr<float>(row);
+      const float* r = rng.ptr<float>(row);
+      for (int col = 0; col + 1 < width; ++col) {
+        if (r[col] > 0.f && r[col + 1] > 0.f) {   // both real returns
+          e += std::abs(src[col + 1] - src[col]);
+          ++n;
+        }
+      }
+    }
+    this->lidar_img_az_grad_energy_ = (n > 0) ? static_cast<float>(e / n) : 0.f;
+  }
+
+  // Self-calibrate the spherical model once (sensor geometry is fixed):
+  //   el(row) ~ el_a*row + el_b   (least-squares over per-row mean elevation)
+  //   az(col) ~ az_a*col + az_b   (least-squares over one well-populated row, unwrapped)
+  if (this->lidar_proj_ready_) { return; }
+
+  // Elevation vs row (also captured as a per-row LUT for the non-uniform beams).
+  this->lidar_el_lut_.assign(height, std::numeric_limits<float>::quiet_NaN());
+  double sr = 0, se = 0, sre = 0, srr = 0; int ne = 0;
+  for (int row = 0; row < height; ++row) {
+    double accum = 0; int cnt = 0;
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);
+      const float rxy = std::sqrt(p.x * p.x + p.y * p.y);
+      if (std::isfinite(p.x) && rxy > 1e-3f) { accum += std::atan2(p.z, rxy); ++cnt; }
+    }
+    if (cnt > 0) {
+      const double el = accum / cnt;
+      sr += row; se += el; sre += row * el; srr += (double)row * row; ++ne;
+      this->lidar_el_lut_[row] = static_cast<float>(el);
+    }
+  }
+  // Azimuth vs col on the most-populated row.
+  int best_row = height / 2, best_cnt = -1;
+  for (int row = 0; row < height; ++row) {
+    int cnt = 0;
+    for (int col = 0; col < width; ++col) {
+      const auto& p = organized->at(col, row);
+      if (std::isfinite(p.x) && (p.x * p.x + p.y * p.y) > 1e-6f) { ++cnt; }
+    }
+    if (cnt > best_cnt) { best_cnt = cnt; best_row = row; }
+  }
+  double sc = 0, sa = 0, sca = 0, scc = 0; int na = 0; double prev_az = 0, unwrap = 0;
+  for (int col = 0; col < width; ++col) {
+    const auto& p = organized->at(col, best_row);
+    if (!std::isfinite(p.x) || (p.x * p.x + p.y * p.y) < 1e-6f) { continue; }
+    double az = std::atan2(p.y, p.x);
+    if (na > 0) {  // unwrap to keep the fit linear across the +/-pi seam
+      while (az - prev_az > M_PI)  az -= 2.0 * M_PI;
+      while (az - prev_az < -M_PI) az += 2.0 * M_PI;
+    }
+    prev_az = az;
+    sc += col; sa += az; sca += col * az; scc += (double)col * col; ++na;
+    (void)unwrap;
+  }
+
+  if (ne >= 2 && na >= 2) {
+    const double el_den = ne * srr - sr * sr;
+    const double az_den = na * scc - sc * sc;
+    if (std::abs(el_den) > 1e-9 && std::abs(az_den) > 1e-9) {
+      this->lidar_el_a_ = static_cast<float>((ne * sre - sr * se) / el_den);
+      this->lidar_el_b_ = static_cast<float>((se - this->lidar_el_a_ * sr) / ne);
+      this->lidar_az_a_ = static_cast<float>((na * sca - sc * sa) / az_den);
+      this->lidar_az_b_ = static_cast<float>((sa - this->lidar_az_a_ * sc) / na);
+      if (std::abs(this->lidar_el_a_) > 1e-9f && std::abs(this->lidar_az_a_) > 1e-9f) {
+        this->lidar_proj_ready_ = true;
+        // Validate the per-row LUT ONCE, here, where it is built (it is cached
+        // for the whole run). Every consumer -- the GICP map/flow terms and the
+        // keyframe-reference sampler -- gates on this single flag, so they can
+        // never disagree about which projection model is in force. A row with
+        // no returns in this one scan stays NaN forever, which is exactly the
+        // case that must fall back to the linear model everywhere at once.
+        this->lidar_el_lut_valid_ =
+            nano_gicp::elevationLutUsable(this->lidar_el_lut_, height);
+        RCLCPP_INFO(this->get_logger(),
+            "LiDAR intensity image %dx%d; spherical model el=%.5f*row%+.4f, az=%.6f*col%+.4f; "
+            "per-row elevation LUT %s",
+            width, height, this->lidar_el_a_, this->lidar_el_b_, this->lidar_az_a_, this->lidar_az_b_,
+            this->lidar_el_lut_valid_ ? "VALID (used)" : "unusable (linear model)");
+      }
+    }
+  }
 }
 
 void dlio::OdomNode::getNextPose() {
@@ -1110,32 +2656,234 @@ void dlio::OdomNode::getNextPose() {
 
   if (this->new_submap_is_ready && this->submap_hasChanged) {
 
-    // Set the current global submap as the target cloud
-    // this->gicp.registerInputTarget(this->submap_cloud);
-    // FIX: avoid feeding an empty submap into the KD-tree builder
-    if (this->submap_cloud->points.empty()) {
-      RCLCPP_WARN(this->get_logger(), "Submap cloud is empty, skipping GICP target update.");
-    } else {
-      this->gicp.setInputTarget(this->submap_cloud);
+    // Adopt the submap target prepared in the background by buildSubmap():
+    // cloud + kd-tree + photometric gradients from gicp_temp, plus the
+    // keyframe-derived covariances assembled alongside the submap. Nothing
+    // expensive is recomputed here on the registration hot path.
+    this->gicp.shareTargetDataFrom(this->gicp_temp);
+    this->gicp.setTargetCovariances(this->submap_normals);
+    if (this->visual_map_enabled_) {
+      this->gicp.setTargetVisualRefs(this->submap_visual_refs);
+    }
+    if (this->lidar_image_refs_enabled_) {
+      this->gicp.setTargetLidarRefs(this->submap_lidar_refs);
     }
 
-
-    // Set submap kdtree
-    // this->gicp.target_kdtree_ = this->submap_kdtree;
-
-    // Set target cloud's normals as submap normals
-    // this->gicp.setTargetCovariances(this->submap_normals);
-
     this->submap_hasChanged = false;
+  }
+
+  // Configure the optional direct visual term for this scan (picks the camera
+  // frame nearest scan_stamp; no-op / LiDAR-only if disabled or no image).
+  this->setupVisualForScan();
+
+  // COIN-LIO LiDAR intensity-image term: project map points into this scan's
+  // reflectivity image (world->lidar from the prior pose). No-op unless enabled
+  // and an organized image + spherical model are ready.
+  const bool lidar_map_active = this->lidar_image_enabled_ && this->lidar_image_weight_ > 0.0;
+  const bool lidar_flow_active = this->lidar_flow_enabled_ && this->lidar_flow_weight_ > 0.0;
+  if ((lidar_map_active || lidar_flow_active) &&
+      this->lidar_img_ready_ && this->lidar_proj_ready_) {
+    Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+    Eigen::Isometry3f T_lw;
+    T_lw.matrix() = T_wl.inverse();
+    this->gicp.setLidarImage(this->lidar_refl_img_);
+    this->gicp.setLidarProjection(this->lidar_az_a_, this->lidar_az_b_, this->lidar_el_a_, this->lidar_el_b_);
+    // Per-row elevation LUT (non-uniform OS beams): pass only if fully finite
+    // and strictly monotonic, else fall back to the linear el model.
+    // Validated once when the LUT was built (nano_gicp::elevationLutUsable);
+    // the keyframe-reference sampler gates on the SAME flag so both sides
+    // always project with the same model.
+    const bool lut_ok = this->lidar_el_lut_valid_
+        && this->lidar_el_lut_.size() == (size_t)this->lidar_refl_img_.rows;
+    this->gicp.setLidarElevationLut(lut_ok ? this->lidar_el_lut_ : std::vector<float>{});
+    // Range image + tolerance for the occlusion / wrong-surface rejection.
+    this->gicp.setLidarRangeImage(this->lidar_range_img_);
+    this->gicp.setLidarRangeConsistency(static_cast<float>(this->lidar_range_abs_tol_),
+                                        static_cast<float>(this->lidar_range_rel_tol_));
+    this->gicp.setLidarFrame(T_lw);
+    this->gicp.setLidarCondScale(this->lidar_cond_scale_enabled_,
+                                 static_cast<float>(this->lidar_cs_power_),
+                                 static_cast<float>(this->lidar_cs_cap_));
+    this->gicp.setLidarDirSeparate(this->lidar_dir_separated_enabled_,
+                                   static_cast<float>(this->lidar_ds_ratio_));
+    this->gicp.setLidarMapWeight(lidar_map_active ? static_cast<float>(this->lidar_image_weight_) : 0.f);
+    // Frame-to-frame flow term: hand the gicp the PREVIOUS scan's image + corrected
+    // pose (it deep-copies and snapshots them). No previous stashed yet (first
+    // scan) -> off this scan.
+    if (lidar_flow_active && this->lidar_flow_prev_valid_) {
+      this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_);
+      this->gicp.setLidarFlowMode(this->lidar_flow_image_ref_, this->lidar_flow_patch_);
+      this->gicp.setLidarFlowWeight(static_cast<float>(this->lidar_flow_weight_));
+    } else {
+      this->gicp.setLidarFlowWeight(0.f);
+    }
+  } else {
+    this->gicp.setLidarMapWeight(0.f);
+    this->gicp.setLidarFlowWeight(0.f);
   }
 
   // Align with current submap with global IMU transformation as initial guess
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
+  // Corruption telemetry (VERIFICATION_2026-06-27): an out-of-range
+  // correspondence index is impossible from the kd-tree, so a nonzero count
+  // means the correspondence buffer was scribbled by an out-of-bounds writer
+  // (the FINDINGS_2026-06-26 crash class, now survivable). Surface it loudly --
+  // this is the signal an ASan bag run should chase.
+  if (this->gicp.lastOobCorrespondences() > 0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "MEMORY-CORRUPTION SENTINEL: %ld out-of-range correspondence indices "
+        "skipped this scan (see doc/VERIFICATION_2026-06-27.md)",
+        this->gicp.lastOobCorrespondences());
+  }
+
+  // Surface degeneracy (e.g. featureless tunnel): the solver held the IMU
+  // prior along the unobservable directions; warn so the operator knows the
+  // estimate is dead-reckoning in those directions.
+  int degenerate_dirs = this->gicp.lastDegenerateDirections();
+  // Snapshot for /diagnostics (publishDiagnostics reads these on the same
+  // scan thread): directions held this scan + cumulative scans the gate fired.
+  this->loc_gate_axes_current_ = degenerate_dirs;
+  if (degenerate_dirs > 0) {
+    ++this->loc_gate_updates_cumulative_;
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Scan-to-map registration is degenerate along %d direction(s); "
+        "holding IMU prior there (geometrically self-similar environment?)",
+        degenerate_dirs);
+  }
+
   // Get final transformation in global frame
+  const Eigen::Matrix4f T_prev_governed = this->T;   // previous (governed) output pose
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
+
+  // Degeneracy GOVERNOR: cap per-scan output motion along the eigen-directions
+  // the gate held to the IMU prior, so a held axis cannot dead-reckon into the
+  // km-scale runaway. Clamps the displacement of this->T vs the previous output
+  // pose, projected onto each held world-frame direction, to a physical
+  // per-scan step; recomputes T_corr so the published cloud stays consistent.
+  // Bounding the pose pulls the velocity estimate back via updateState()'s
+  // observer. Off / 0 caps / no held dirs -> untouched (bit-identical).
+  if (this->degen_gov_enabled_ &&
+      (this->degen_gov_max_step_trans_ > 0.f || this->degen_gov_max_step_rot_ > 0.f)) {
+    const Eigen::Matrix4f T_governed = dlio::governPose(
+        T_prev_governed, this->T,
+        this->gicp.lastDegenTransDirs(), this->gicp.lastDegenRotDirs(),
+        this->degen_gov_max_step_trans_, this->degen_gov_max_step_rot_);
+    if (!T_governed.isApprox(this->T)) {
+      this->T = T_governed;
+      // keep the correction consistent with the governed pose (publish cloud,
+      // keyframe transforms downstream both use T_corr).
+      this->T_corr = this->T * this->T_prior.inverse();
+    }
+  }
+
+  // PHYSICS FUSE: clamp the TOTAL per-scan output step (any direction) to a
+  // physical bound -- the last line against takeoffs the governor's held-axis
+  // scope can't see (gate misses, unflagged axes, a diverging IMU prior). A
+  // tripped scan is physically implausible: flag it (diagnostics) and veto
+  // keyframing on it in updateKeyframes(). Same T/T_corr recompute mechanics
+  // as the governor, so downstream stays consistent. 0 caps = bit-identical.
+  this->fuse_tripped_scan_ = false;
+  if (this->fuse_max_step_trans_ > 0.0 || this->fuse_max_step_rot_ > 0.0) {
+    bool tripped = false;
+    const Eigen::Matrix4f T_fused = dlio::fusePose(
+        T_prev_governed, this->T,
+        static_cast<float>(this->fuse_max_step_trans_),
+        static_cast<float>(this->fuse_max_step_rot_), &tripped);
+    if (tripped) {
+      this->T = T_fused;
+      this->T_corr = this->T * this->T_prior.inverse();
+      this->fuse_tripped_scan_ = true;
+      ++this->fuse_trips_;
+      RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "PHYSICS FUSE: per-scan output step exceeded the physical bound "
+          "(%ld trips total) -- estimate untrustworthy, step clamped, keyframe vetoed",
+          this->fuse_trips_);
+    }
+  }
+
+  // SLOSH GUARD: feed the signed output step along the tracked weak axis to
+  // the oscillation detector. The axis is the gate's dominant held translation
+  // direction, sign-aligned scan-to-scan for a stable identity, and PERSISTS
+  // across scans the gate misses (the oscillation does too -- gate chatter is
+  // part of the loop). Engagement drives extra velocity damping in
+  // updateState() and a keyframe veto in updateKeyframes().
+  if (this->slosh_enabled_) {
+    // front() is the SMALLEST-eigenvalue held direction: the gate records in
+    // ascending eigenvalue order (SelfAdjointEigenSolver), so this is the
+    // weakest axis, not an arbitrary one.
+    constexpr float kAxisSameCos = 0.866f;   // 30 deg: same physical DOF
+    const auto& weak_dirs = this->gicp.lastDegenTransDirs();
+    bool axis_fresh = false;
+    if (!weak_dirs.empty()) {
+      Eigen::Vector3f a = weak_dirs.front().cast<float>();
+      const float n = a.norm();
+      if (n > 1e-6f) {
+        a /= n;
+        if (this->slosh_axis_valid_) {
+          if (a.dot(this->slosh_axis_) < 0.f) { a = -a; }   // sign-align first
+          // A materially different DIRECTION is a different physical DOF (the
+          // weak-axis set can change membership scan to scan). The accumulated
+          // sign history describes the old axis and would score as noise on the
+          // new one, so drop the evidence rather than mix frames.
+          if (a.dot(this->slosh_axis_) < kAxisSameCos) { this->slosh_guard_.reset(); }
+        }
+        this->slosh_axis_ = a;
+        this->slosh_axis_valid_ = true;
+        this->slosh_axis_stale_ = 0;
+        axis_fresh = true;
+      }
+    }
+    if (!axis_fresh && this->slosh_axis_valid_) {
+      // Age the axis out. It deliberately PERSISTS across the gate's misses
+      // (chatter is part of the oscillation loop), but it must not outlive the
+      // conditions that produced it: a latched stale axis would keep scoring
+      // flips on a meaningless projection and could engage the damping +
+      // keyframe veto during healthy, fully-observable operation. Going invalid
+      // also re-enables the guard's window decay (otherwise unreachable).
+      if (++this->slosh_axis_stale_ > this->slosh_axis_hold_) {
+        this->slosh_axis_valid_ = false;
+        this->slosh_axis_stale_ = 0;
+      }
+    }
+    const Eigen::Vector3f step =
+        this->T.block<3, 1>(0, 3) - T_prev_governed.block<3, 1>(0, 3);
+    this->slosh_guard_.update(
+        this->slosh_axis_valid_ ? this->slosh_axis_.dot(step) : 0.f,
+        this->slosh_axis_valid_);
+    if (this->slosh_guard_.engaged()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "SLOSH GUARD engaged: oscillation along the weak axis "
+          "(flip fraction %.2f over %d steps) -- damping velocity, vetoing keyframes",
+          this->slosh_guard_.reversalFraction(), this->slosh_guard_.activeSamples());
+    }
+  }
+
+  // Promote this scan's camera frame to "previous" for the next scan's warp,
+  // using the corrected pose (world -> camera at this->T).
+  if (this->visual_cur_pending_valid_) {
+    Eigen::Matrix4f T_wc = this->T * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+    this->visual_T_cw_prev_.matrix() = T_wc.inverse();
+    this->visual_prev_img_ = this->visual_cur_pending_;
+    this->visual_has_prev_ = true;
+    // NOTE: keep visual_cur_pending_valid_ true here so updateKeyframes() can
+    // sample this scan's image for keyframe visual refs; it is reset at the top
+    // of the next setupVisualForScan().
+  }
+
+  // Promote this scan's LiDAR image to "previous" for the next scan's flow term,
+  // tagged with the CORRECTED world->lidar pose (this->T). cv::Mat assignment is a
+  // shallow ref; the node builds a FRESH image every scan (never mutates this one
+  // in place), so the buffer stays valid, and the gicp deep-copies it at
+  // setLidarFlowPrev. Mirrors the visual stash above.
+  if (this->lidar_flow_enabled_ && this->lidar_img_ready_ && !this->lidar_refl_img_.empty()) {
+    Eigen::Matrix4f T_wl = this->T * this->extrinsics.baselink2lidar_T;
+    this->lidar_flow_T_lw_prev_.matrix() = T_wl.inverse();
+    this->lidar_flow_prev_img_ = this->lidar_refl_img_;
+    this->lidar_flow_prev_valid_ = true;
+  }
 
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
@@ -1146,30 +2894,26 @@ void dlio::OdomNode::getNextPose() {
 
 }
 
-// FIX: imuMeasFromTimeRange now copies the IMU window into a std::vector
-// under the mutex and returns the copy. The caller works on the snapshot so
-// the circular_buffer is safe to be mutated by the IMU callback thread at
-// any time — eliminating the iterator-invalidation data race.
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
-                                          std::vector<ImuMeas>& imu_meas_out) {
+                                          std::vector<ImuMeas>& imu_range) {
+
+  // Hold mtx_imu for the WHOLE operation -- the wait, the range scan, AND the
+  // copy -- so the concurrent callbackImu push_front (which can overwrite the
+  // circular buffer's oldest slot) cannot mutate the elements while we read
+  // them. The integration then runs on the private copy, lock-free.
+  std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
 
   if (this->imu_buffer.empty() || this->imu_buffer.front().stamp < end_time) {
-    std::unique_lock<decltype(mtx_imu)> lock(this->mtx_imu);
-    // FIX: bounded wait — avoid hanging the LiDAR callback thread forever if the
-    // IMU stream stalls or ends. Timeout chosen generously relative to typical
-    // scan periods; tune if your LiDAR runs slower than 2 Hz.
-    bool ok = this->cv_imu_stamp.wait_for(lock, std::chrono::milliseconds(500),
-     [this, &end_time]{
-        return this->imu_buffer.empty() ? false : this->imu_buffer.front().stamp >= end_time;
-      });
-    if (!ok) {
-      RCLCPP_WARN(this->get_logger(),
-        "Timed out waiting for IMU data to catch up to scan time — IMU stream may have stalled.");
+    bool imu_arrived = this->cv_imu_stamp.wait_for(lock, std::chrono::seconds(1),
+        [this, &end_time]{ return !this->imu_buffer.empty()
+                                  && this->imu_buffer.front().stamp >= end_time; });
+    if (!imu_arrived) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "Timed out waiting for IMU data covering the scan (IMU dropout?); "
+          "skipping IMU integration for this range");
       return false;
     }
   }
-
-  std::unique_lock<decltype(this->mtx_imu)> lock(this->mtx_imu);
 
   auto imu_it = this->imu_buffer.begin();
 
@@ -1187,25 +2931,15 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
   if (imu_it == this->imu_buffer.end()) {
     return false;
   }
-  // imu_it now points to the first sample whose stamp < start_time.
-  // The oldest sample we want is at (imu_it - 1) in forward-iterator terms,
-  // which is exactly what reverse_iterator(imu_it) dereferenced in the original.
-  // Do NOT do imu_it++ here — that was the source of the off-by-one.
+  imu_it++;
 
-  // Build a time-ordered (oldest->newest) snapshot of the window.
-  // Walk from imu_it-1 (oldest wanted) to last_imu_it (newest wanted),
-  // i.e. in reverse forward-iterator direction (newest-first buffer).
-  imu_meas_out.clear();
-  for (auto it = last_imu_it; ; ++it) {
-    imu_meas_out.push_back(*it);
-    if (it == imu_it) break; // imu_it-1 is the last element to include
-  }
-  // Remove the last-pushed element which is at imu_it (one past oldest wanted)
-  if (!imu_meas_out.empty()) imu_meas_out.pop_back();
-  std::reverse(imu_meas_out.begin(), imu_meas_out.end());
+  // Copy the range in forward-time order (reverse iterators over the
+  // newest-at-front buffer) into the caller's vector, under the lock.
+  boost::circular_buffer<ImuMeas>::reverse_iterator e(last_imu_it);
+  boost::circular_buffer<ImuMeas>::reverse_iterator b(imu_it);
+  imu_range.assign(b, e);
 
-  lock.unlock();
-  return !imu_meas_out.empty();
+  return imu_range.size() >= 2;  // need >=2 samples for the back-integration
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
@@ -1219,23 +2953,15 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
     return empty;
   }
 
-  // FIX: use vector-based imuMeasFromTimeRange — no live iterators into
-  //      the circular_buffer so the IMU callback cannot invalidate them.
-  std::vector<ImuMeas> imu_meas_window;
-  if (!this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_meas_window)) {
-    RCLCPP_WARN(this->get_logger(),
-      "integrateImu: no IMU window found for start_time=%.6f, end_time=%.6f — falling back to T_prior=T.",
-      start_time, sorted_timestamps.back());
-    return empty;
-  }
-
-  if (imu_meas_window.size() < 2) {
+  std::vector<ImuMeas> imu_range;
+  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_range) == false) {
+    // not enough IMU measurements, return empty vector
     return empty;
   }
 
   // Backwards integration to find pose at first IMU sample
-  const ImuMeas& f1 = imu_meas_window.front();
-  const ImuMeas& f2 = imu_meas_window[1];
+  const ImuMeas& f1 = imu_range[0];
+  const ImuMeas& f2 = imu_range[1];
 
   // Time between first two IMU samples
   double dt = f2.dt;
@@ -1288,15 +3014,14 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return this->integrateImuInternal(q_init, p_init, v_init, sorted_timestamps,
-                                    imu_meas_window.begin(), imu_meas_window.end());
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, this->gravity_);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
-                                     std::vector<ImuMeas>::iterator begin_imu_it,
-                                     std::vector<ImuMeas>::iterator end_imu_it) {
+                                     const std::vector<ImuMeas>& imu,
+                                     double gravity) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
 
@@ -1304,19 +3029,16 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
   Eigen::Quaternionf q = q_init;
   Eigen::Vector3f p = p_init;
   Eigen::Vector3f v = v_init;
-  Eigen::Vector3f a = q._transformVector(begin_imu_it->lin_accel);
-  a[2] -= this->gravity_;
+  Eigen::Vector3f a = q._transformVector(imu[0].lin_accel);
+  a[2] -= gravity;
 
-  // Iterate over IMU measurements and timestamps
-  auto prev_imu_it = begin_imu_it;
-  auto imu_it = prev_imu_it + 1;
-
+  // Iterate over IMU measurements (forward in time) and timestamps
   auto stamp_it = sorted_timestamps.begin();
 
-  for (; imu_it != end_imu_it; imu_it++) {
+  for (size_t k = 1; k < imu.size(); ++k) {
 
-    const ImuMeas& f0 = *prev_imu_it;
-    const ImuMeas& f = *imu_it;
+    const ImuMeas& f0 = imu[k-1];
+    const ImuMeas& f = imu[k];
 
     // Time between IMU samples
     double dt = f.dt;
@@ -1328,7 +3050,14 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Average angular velocity
     Eigen::Vector3f omega = f0.ang_vel + 0.5*alpha_dt;
 
-    // Orientation
+    // Orientation at f0: the interpolation below integrates forward from
+    // here with idt measured from f0.stamp, matching how position is
+    // interpolated. Using the already-advanced q double-counted one IMU
+    // sample of rotation (a constant omega*dt attitude offset on every
+    // deskewed point). Caught by test_imu_integration.
+    Eigen::Quaternionf q0 = q;
+
+    // Orientation at f
     q = Eigen::Quaternionf (
       q.w() - 0.5*( q.x()*omega[0] + q.y()*omega[1] + q.z()*omega[2] ) * dt,
       q.x() + 0.5*( q.w()*omega[0] - q.z()*omega[1] + q.y()*omega[2] ) * dt,
@@ -1340,7 +3069,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
     // Acceleration
     Eigen::Vector3f a0 = a;
     a = q._transformVector(f.lin_accel);
-    a[2] -= this->gravity_;
+    a[2] -= gravity;
 
     // Jerk
     Eigen::Vector3f j_dt = a - a0;
@@ -1354,12 +3083,12 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       // Average angular velocity
       Eigen::Vector3f omega_i = f0.ang_vel + 0.5*alpha*idt;
 
-      // Orientation
+      // Orientation (integrated forward from f0, like the position below)
       Eigen::Quaternionf q_i (
-        q.w() - 0.5*( q.x()*omega_i[0] + q.y()*omega_i[1] + q.z()*omega_i[2] ) * idt,
-        q.x() + 0.5*( q.w()*omega_i[0] - q.z()*omega_i[1] + q.y()*omega_i[2] ) * idt,
-        q.y() + 0.5*( q.z()*omega_i[0] + q.w()*omega_i[1] - q.x()*omega_i[2] ) * idt,
-        q.z() + 0.5*( q.x()*omega_i[1] - q.y()*omega_i[0] + q.w()*omega_i[2] ) * idt
+        q0.w() - 0.5*( q0.x()*omega_i[0] + q0.y()*omega_i[1] + q0.z()*omega_i[2] ) * idt,
+        q0.x() + 0.5*( q0.w()*omega_i[0] - q0.z()*omega_i[1] + q0.y()*omega_i[2] ) * idt,
+        q0.y() + 0.5*( q0.z()*omega_i[0] + q0.w()*omega_i[1] - q0.x()*omega_i[2] ) * idt,
+        q0.z() + 0.5*( q0.x()*omega_i[1] - q0.y()*omega_i[0] + q0.w()*omega_i[2] ) * idt
       );
       q_i.normalize();
 
@@ -1381,8 +3110,6 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
 
     // Velocity
     v += a0*dt + 0.5*j_dt*dt;
-
-    prev_imu_it = imu_it;
 
   }
 
@@ -1468,11 +3195,39 @@ void dlio::OdomNode::updateState() {
 
   // Construct quaternion correction
   qcorr.w() = 1 - abs(qe.w());
-  qcorr.vec() = sgn*qe.vec();
-  qcorr = qhat * qcorr;
+  Eigen::Vector3f qe_vec = sgn*qe.vec();
 
   Eigen::Vector3f err = pin - this->state.p;
   Eigen::Vector3f err_body;
+
+  // LODESTAR-flavored degeneracy-aware observer gain (default 1 = off,
+  // bit-identical). On the world-frame axes the gate flagged degenerate and HELD,
+  // attenuate the LiDAR correction so the state rides the IMU-propagated prior
+  // there instead of absorbing registration noise into the runaway -- the
+  // contracting-observer analogue of LODESTAR's reduced-gain "fixed" state
+  // (see include/dlio/degeneracy_observer.h, doc/EXPLORATION_2026-06-26.md).
+  // err (world) drives position, velocity, AND accel bias (via err_body below).
+  // Rotation: qe is a BODY-frame error quaternion and vec(qhat*p) != R(qhat)*vec(p)
+  // (Sola, arXiv:1711.02508 -- the vector part of a quaternion PRODUCT is not the
+  // rotated error vector), so attenuating the composed qcorr.vec() along world
+  // dirs mixed frames (VERIFICATION_2026-06-27). Instead rotate the held world
+  // dirs INTO the body frame (d_b = R(qhat)^T d) and attenuate qe's vector part
+  // there -- exact for the small-angle error the observer integrates. The held
+  // dirs are read from gicp on this scan thread, same as the cov inflation below.
+  if (this->geo_degen_obs_gain_ < 1.0) {
+    const float g = static_cast<float>(this->geo_degen_obs_gain_);
+    err = dlio::attenuateAlongHeldAxes(err, this->gicp.lastDegenTransDirs(), g);
+    std::vector<Eigen::Vector3d> rot_dirs_body;
+    rot_dirs_body.reserve(this->gicp.lastDegenRotDirs().size());
+    for (const auto& d : this->gicp.lastDegenRotDirs()) {
+      rot_dirs_body.push_back(
+          qhat.conjugate()._transformVector(d.cast<float>()).cast<double>());
+    }
+    qe_vec = dlio::attenuateAlongHeldAxes(qe_vec, rot_dirs_body, g);
+  }
+
+  qcorr.vec() = qe_vec;
+  qcorr = qhat * qcorr;
 
   err_body = qhat.conjugate()._transformVector(err);
 
@@ -1493,6 +3248,26 @@ void dlio::OdomNode::updateState() {
   this->state.p += dt * this->geo_Kp_ * err;
   this->state.v.lin.w += dt * this->geo_Kv_ * err;
 
+  // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): along a held axis the
+  // registration supplies no correction, so the velocity state free-integrates
+  // IMU error and powers the dead-reckon runaway / sustains the slosh limit
+  // cycle. Damp the along-axis component while the axis is held (attenuate to
+  // (1-damp) per scan); cross-axis velocity untouched. 0 (default) = off.
+  if (this->geo_degen_vel_damp_ > 0.0) {
+    this->state.v.lin.w = dlio::attenuateAlongHeldAxes(
+        this->state.v.lin.w, this->gicp.lastDegenTransDirs(),
+        1.f - static_cast<float>(this->geo_degen_vel_damp_));
+  }
+  // Slosh-guard response: while the detector is engaged, damp the velocity
+  // along the TRACKED axis (persists across gate misses) -- the oscillation's
+  // energy store -- independent of whether this particular scan held it.
+  if (this->slosh_enabled_ && this->slosh_vel_damp_ > 0.0 &&
+      this->slosh_guard_.engaged() && this->slosh_axis_valid_) {
+    const float along = this->slosh_axis_.dot(this->state.v.lin.w);
+    this->state.v.lin.w -=
+        this->slosh_axis_ * (along * static_cast<float>(this->slosh_vel_damp_));
+  }
+
   this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
   this->state.q.x() += dt * this->geo_Kq_ * qcorr.x();
   this->state.q.y() += dt * this->geo_Kq_ * qcorr.y();
@@ -1504,6 +3279,31 @@ void dlio::OdomNode::updateState() {
   this->geo.prev_q = this->state.q;
   this->geo.prev_vel = this->state.v.lin.w;
 
+  // Degeneracy covariance inflation (under geo.mtx, read by publishPose): mark
+  // the held world-frame axes untrusted with a rank-1 add (covVar * d d^T) on
+  // the position / rotation blocks. Off (or no held axis) -> left zero and the
+  // base diagonal cov is published unchanged (bit-identical). The held dirs are
+  // valid on this (scan) thread until the next align().
+  if (this->degen_gov_enabled_ &&
+      (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0)) {
+    this->degen_cov_extra_.fill(0.0);
+    if (this->degen_gov_cov_pos_var_ > 0.0) {
+      for (const auto& dd : this->gicp.lastDegenTransDirs()) {
+        const Eigen::Vector3d d = dd.normalized();
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            this->degen_cov_extra_[r * 6 + c] += this->degen_gov_cov_pos_var_ * d(r) * d(c);
+      }
+    }
+    if (this->degen_gov_cov_rot_var_ > 0.0) {
+      for (const auto& dd : this->gicp.lastDegenRotDirs()) {
+        const Eigen::Vector3d d = dd.normalized();
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            this->degen_cov_extra_[(3 + r) * 6 + (3 + c)] += this->degen_gov_cov_rot_var_ * d(r) * d(c);
+      }
+    }
+  }
 }
 
 sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs::msg::Imu::SharedPtr& imu_raw) {
@@ -1514,9 +3314,11 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   imu->header = imu_raw->header;
 
   double imu_stamp_secs = rclcpp::Time(imu->header.stamp).seconds();
-  static double prev_stamp = imu_stamp_secs;
-  double dt = imu_stamp_secs - prev_stamp;
-  prev_stamp = imu_stamp_secs;
+  // First call: seed prev_stamp to the current stamp so dt -> 0 (per-instance
+  // member, not a function static -- see odom.h / transform_imu_init_).
+  if (!this->transform_imu_init_) { this->transform_prev_stamp_ = imu_stamp_secs; }
+  double dt = imu_stamp_secs - this->transform_prev_stamp_;
+  this->transform_prev_stamp_ = imu_stamp_secs;
 
   if (dt == 0) { dt = 1.0/200.0; }
 
@@ -1531,7 +3333,12 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   imu->angular_velocity.y = ang_vel_cg[1];
   imu->angular_velocity.z = ang_vel_cg[2];
 
-  static Eigen::Vector3f ang_vel_cg_prev = ang_vel_cg;
+  // First call: seed prev to current so the angular-acceleration term is 0
+  // (per-instance member). This completes transformImu's one-time init.
+  if (!this->transform_imu_init_) {
+    this->ang_vel_cg_prev_ = ang_vel_cg;
+    this->transform_imu_init_ = true;
+  }
 
   // Transform linear acceleration (need to account for component due to translational difference)
   Eigen::Vector3f lin_accel(imu_raw->linear_acceleration.x,
@@ -1541,10 +3348,10 @@ sensor_msgs::msg::Imu::SharedPtr dlio::OdomNode::transformImu(const sensor_msgs:
   Eigen::Vector3f lin_accel_cg = this->extrinsics.baselink2imu.R * lin_accel;
 
   lin_accel_cg = lin_accel_cg
-                 + ((ang_vel_cg - ang_vel_cg_prev) / dt).cross(-this->extrinsics.baselink2imu.t)
+                 + ((ang_vel_cg - this->ang_vel_cg_prev_) / dt).cross(-this->extrinsics.baselink2imu.t)
                  + ang_vel_cg.cross(ang_vel_cg.cross(-this->extrinsics.baselink2imu.t));
 
-  ang_vel_cg_prev = ang_vel_cg;
+  this->ang_vel_cg_prev_ = ang_vel_cg;
 
   imu->linear_acceleration.x = lin_accel_cg[0];
   imu->linear_acceleration.y = lin_accel_cg[1];
@@ -1561,24 +3368,28 @@ void dlio::OdomNode::computeMetrics() {
 
 void dlio::OdomNode::computeSpaciousness() {
 
-  // compute range of points
+  // compute range of points (work with SQUARED range to skip a per-point sqrt:
+  // sqrt is monotonic, so median(sqrt(.)) == sqrt(median(.)) -- one sqrt total
+  // instead of one per point on the full-resolution scan).
   std::vector<float> ds;
+  ds.reserve(this->original_scan->points.size());
 
-  for (size_t i = 0; i < this->original_scan->points.size(); i++) {
-    float d = std::sqrt(pow(this->original_scan->points[i].x, 2) +
-                        pow(this->original_scan->points[i].y, 2));
-    ds.push_back(d);
+  for (const auto& pt : this->original_scan->points) {
+    ds.push_back(pt.x * pt.x + pt.y * pt.y);
   }
 
   // median
   std::nth_element(ds.begin(), ds.begin() + ds.size()/2, ds.end());
-  float median_curr = ds[ds.size()/2];
-  static float median_prev = median_curr;
-  float median_lpf = 0.95*median_prev + 0.05*median_curr;
-  median_prev = median_lpf;
+  float median_curr = std::sqrt(ds[ds.size()/2]);
+  // Per-instance LPF state (member; seeded to the first median to match the old
+  // function-static lazy init).
+  if (!this->spaciousness_init_) { this->spaciousness_prev_ = median_curr; this->spaciousness_init_ = true; }
+  float median_lpf = 0.95f*this->spaciousness_prev_ + 0.05f*median_curr;
+  this->spaciousness_prev_ = median_lpf;
 
   // push
   this->metrics.spaciousness.push_back( median_lpf );
+  cap_history(this->metrics.spaciousness);
 
 }
 
@@ -1586,52 +3397,20 @@ void dlio::OdomNode::computeDensity() {
 
   float density;
 
-  if (!this->geo.first_opt_done.load()) { // FIX: atomic load
+  if (!this->geo.first_opt_done) {
     density = 0.;
   } else {
     density = this->gicp.source_density_;
   }
 
-  static float density_prev = density;
-  float density_lpf = 0.95*density_prev + 0.05*density;
-  density_prev = density_lpf;
+  // Per-instance LPF state (member). The first density is always 0 (first_opt_
+  // done is false on the first scan), matching the old static's first value.
+  float density_lpf = 0.95f*this->density_prev_ + 0.05f*density;
+  this->density_prev_ = density_lpf;
 
   this->metrics.density.push_back( density_lpf );
+  cap_history(this->metrics.density);
 
-}
-
-void dlio::OdomNode::pruneKeyframes() {
-  // FIX: if max_keyframes_ == 0 (default), pruning is disabled.
-  //      When enabled, remove the keyframe whose nearest neighbor is closest
-  //      (most spatially redundant) to keep the map bounded in memory.
-  if (this->max_keyframes_ <= 0 ||
-      (int)this->keyframes.size() <= this->max_keyframes_) {
-    return;
-  }
-
-  // Find the pair of keyframes with the smallest inter-distance (most redundant)
-  int remove_idx = -1;
-  float min_dist = std::numeric_limits<float>::infinity();
-
-  // NOTE: called while keyframes_mutex is already held by updateKeyframes() —
-  //       do NOT acquire the mutex here.
-  for (int i = 0; i < (int)this->keyframes.size(); i++) {
-    for (int j = i + 1; j < (int)this->keyframes.size(); j++) {
-      float d = (this->keyframes[i].first.first - this->keyframes[j].first.first).norm();
-      if (d < min_dist) {
-        min_dist = d;
-        // remove the later one (j) to preserve the older anchor
-        remove_idx = j;
-      }
-    }
-  }
-
-  if (remove_idx >= 0) {
-    this->keyframes.erase(this->keyframes.begin() + remove_idx);
-    this->keyframe_timestamps.erase(this->keyframe_timestamps.begin() + remove_idx);
-    this->keyframe_normals.erase(this->keyframe_normals.begin() + remove_idx);
-    this->keyframe_transformations.erase(this->keyframe_transformations.begin() + remove_idx);
-  }
 }
 
 void dlio::OdomNode::computeConvexHull() {
@@ -1720,9 +3499,10 @@ void dlio::OdomNode::updateKeyframes() {
   for (const auto& k : this->keyframes) {
 
     // calculate distance between current pose and pose in keyframes
-    float delta_d = sqrt( pow(this->state.p[0] - k.first.first[0], 2) +
-                          pow(this->state.p[1] - k.first.first[1], 2) +
-                          pow(this->state.p[2] - k.first.first[2], 2) );
+    const float kdx = this->state.p[0] - k.first.first[0];
+    const float kdy = this->state.p[1] - k.first.first[1];
+    const float kdz = this->state.p[2] - k.first.first[2];
+    float delta_d = std::sqrt(kdx*kdx + kdy*kdy + kdz*kdz);
 
     // count the number nearby current pose
     if (delta_d <= this->keyframe_thresh_dist_ * 1.5){
@@ -1744,9 +3524,10 @@ void dlio::OdomNode::updateKeyframes() {
   Eigen::Quaternionf closest_pose_r = this->keyframes[closest_idx].first.second;
 
   // calculate distance between current pose and closest pose from above
-  float dd = sqrt( pow(this->state.p[0] - closest_pose[0], 2) +
-                   pow(this->state.p[1] - closest_pose[1], 2) +
-                   pow(this->state.p[2] - closest_pose[2], 2) );
+  const float cdx = this->state.p[0] - closest_pose[0];
+  const float cdy = this->state.p[1] - closest_pose[1];
+  const float cdz = this->state.p[2] - closest_pose[2];
+  float dd = std::sqrt(cdx*cdx + cdy*cdy + cdz*cdz);
 
   // calculate difference in orientation using SLERP
   Eigen::Quaternionf dq;
@@ -1763,6 +3544,13 @@ void dlio::OdomNode::updateKeyframes() {
   double theta_deg = theta_rad * (180.0/M_PI);
 
   // update keyframes
+  // Decision table of the cascade below (D = distance > threshD,
+  // R = rotation > threshR, N = num_nearby <= 1):
+  //   D                    -> new keyframe (regardless of R)
+  //   !D &&  R &&  N       -> new keyframe (pure rotation in an uncrowded spot)
+  //   !D &&  R && !N       -> no  (rotation trigger suppressed near other kfs)
+  //   !D && !R             -> no
+  // i.e. the rotation criterion only applies inside the num_nearby carve-out.
   bool newKeyframe = false;
 
   if (abs(dd) > this->keyframe_thresh_dist_ || abs(theta_deg) > this->keyframe_thresh_rot_) {
@@ -1777,22 +3565,103 @@ void dlio::OdomNode::updateKeyframes() {
     newKeyframe = true;
   }
 
+  // Degeneracy gate (tunnel-slosh fix): while the registration is holding
+  // degenerate axes, the pose is dead-reckoning/oscillating along them --
+  // inserting a keyframe at such a pose plants duplicated wall structure in the
+  // submap ("map-lock" aliasing), which feeds the oscillation back (the
+  // self-contamination loop; cf. DLIOM's accurate-state keyframe selection,
+  // arXiv:2305.01843). Veto keyframe creation until observability returns.
+  // Default off -> bit-identical.
+  if (newKeyframe && this->keyframe_degen_gate_ &&
+      this->gicp.lastDegenerateDirections() > 0) {
+    newKeyframe = false;
+  }
+
+  // Runtime-guard vetoes (doc/RUNTIME_GUARDS.md): a fuse-tripped scan is
+  // physically implausible and must never be planted in the map; a scan taken
+  // while the slosh guard is engaged is mid-oscillation (the map-contamination
+  // loop the degenGate above targets, caught by the output-domain detector).
+  if (newKeyframe && (this->fuse_tripped_scan_ ||
+      (this->slosh_enabled_ && this->slosh_guard_.engaged()))) {
+    newKeyframe = false;
+  }
+
   if (newKeyframe) {
 
     // update keyframe vector
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
     this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
     this->keyframe_timestamps.push_back(this->scan_header_stamp);
-    // this->keyframe_normals.push_back(this->gicp.getSourceCovariances());
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
-    // this->keyframe_normals.push_back(std::make_shared<const CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_transformations.push_back(this->T_corr);
-    // FIX: prune most spatially redundant keyframe when max_keyframes_ > 0.
-    this->pruneKeyframes();
+    if (this->visual_map_enabled_) {
+      Eigen::Matrix4f T_wc = this->T_prior * this->extrinsics.baselink2lidar_T * this->cam2lidar_T_;
+      Eigen::Isometry3f T_cw; T_cw.matrix() = T_wc.inverse();
+      cv::Mat img = this->visual_cur_pending_valid_ ? this->visual_cur_pending_ : cv::Mat();
+      this->keyframe_visual_refs.push_back(this->sampleKeyframeVisualRefs(this->current_scan, T_cw, img));
+    }
+    if (this->lidar_image_refs_enabled_) {
+      Eigen::Matrix4f T_wl = this->T_prior * this->extrinsics.baselink2lidar_T;
+      Eigen::Isometry3f T_lw; T_lw.matrix() = T_wl.inverse();
+      cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
+      this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
+    }
     lock.unlock();
 
   }
+
+}
+
+void dlio::OdomNode::pruneKeyframes() {
+
+  // Bound the keyframe map by removing the most spatially redundant keyframe:
+  // the one with the smallest distance to its nearest neighbor. The first
+  // keyframe (origin anchor) and the most recent ones (likely in the current
+  // submap neighborhood) are never removed. Caller guarantees the background
+  // submap thread is idle -- pruning re-indexes the vectors it iterates.
+  std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
+
+  const int keep_recent = 10;
+
+  while ((int)this->keyframes.size() > this->max_keyframes_) {
+
+    // candidates: processed keyframes only, excluding the anchor and the tail
+    int last_candidate = std::min(this->num_processed_keyframes,
+                                  (int)this->keyframes.size() - keep_recent);
+    if (last_candidate <= 1) { break; }
+
+    int prune_idx = -1;
+    float min_nn_dist = std::numeric_limits<float>::max();
+    for (int i = 1; i < last_candidate; i++) {
+      float nn = std::numeric_limits<float>::max();
+      for (int j = 0; j < (int)this->keyframes.size(); j++) {
+        if (j == i) { continue; }
+        float d = (this->keyframes[i].first.first - this->keyframes[j].first.first).norm();
+        nn = std::min(nn, d);
+      }
+      if (nn < min_nn_dist) {
+        min_nn_dist = nn;
+        prune_idx = i;
+      }
+    }
+    if (prune_idx < 0) { break; }
+
+    this->keyframes.erase(this->keyframes.begin() + prune_idx);
+    this->keyframe_timestamps.erase(this->keyframe_timestamps.begin() + prune_idx);
+    this->keyframe_normals.erase(this->keyframe_normals.begin() + prune_idx);
+    this->keyframe_transformations.erase(this->keyframe_transformations.begin() + prune_idx);
+    if (this->visual_map_enabled_ && prune_idx < (int)this->keyframe_visual_refs.size()) {
+      this->keyframe_visual_refs.erase(this->keyframe_visual_refs.begin() + prune_idx);
+    }
+    if (this->lidar_image_refs_enabled_ && prune_idx < (int)this->keyframe_lidar_refs.size()) {
+      this->keyframe_lidar_refs.erase(this->keyframe_lidar_refs.begin() + prune_idx);
+    }
+    --this->num_processed_keyframes;
+  }
+
+  // indices into the keyframe vectors are no longer valid; force the next
+  // submap build to start fresh
+  this->submap_kf_idx_prev.clear();
 
 }
 
@@ -1859,11 +3728,13 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
   std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
   std::vector<float> ds;
   std::vector<int> keyframe_nn;
+  ds.reserve(this->num_processed_keyframes);
+  keyframe_nn.reserve(this->num_processed_keyframes);
   for (int i = 0; i < this->num_processed_keyframes; i++) {
-    float d = sqrt( pow(vehicle_state.p[0] - this->keyframes[i].first.first[0], 2) +
-                    pow(vehicle_state.p[1] - this->keyframes[i].first.first[1], 2) +
-                    pow(vehicle_state.p[2] - this->keyframes[i].first.first[2], 2) );
-    ds.push_back(d);
+    const float dx = vehicle_state.p[0] - this->keyframes[i].first.first[0];
+    const float dy = vehicle_state.p[1] - this->keyframes[i].first.first[1];
+    const float dz = vehicle_state.p[2] - this->keyframes[i].first.first[2];
+    ds.push_back(std::sqrt(dx*dx + dy*dy + dz*dz));
     keyframe_nn.push_back(i);
   }
   lock.unlock();
@@ -1914,27 +3785,74 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // reinitialize submap cloud and normals
     pcl::PointCloud<PointType>::Ptr submap_cloud_ = std::make_shared<pcl::PointCloud<PointType>>();
     std::shared_ptr<nano_gicp::CovarianceList> submap_normals_ (std::make_shared<nano_gicp::CovarianceList>());
+    // Concatenate the per-point visual refs in the SAME order as the cloud so
+    // indices line up with the target points (only when the map term is on and
+    // the refs are index-aligned with the keyframes).
+    //
+    // Locked: keyframes.size()/keyframe_{visual,lidar}_refs.size() read here
+    // race updateKeyframes()'s locked push_back on these same vectors on the
+    // main thread (2026-07-09 crash hunt, dliio lidar_image std::out_of_range
+    // combo crash) -- a push_back-triggered reallocation mid-read can produce
+    // a torn/garbage size compare, silently flipping build_lidar_refs or
+    // desyncing it from the keyframe count the per-`k` loop below later reads
+    // under its own lock. Cheap (two size() calls), so lock just for this.
+    lock.lock();
+    const bool build_visual_refs = this->visual_map_enabled_
+        && this->keyframe_visual_refs.size() == this->keyframes.size();
+    const bool build_lidar_refs = this->lidar_image_refs_enabled_
+        && this->keyframe_lidar_refs.size() == this->keyframes.size();
+    lock.unlock();
+    std::shared_ptr<nano_gicp::VisualRefList> submap_visual_refs_ =
+        build_visual_refs ? std::make_shared<nano_gicp::VisualRefList>() : nullptr;
+    std::shared_ptr<std::vector<float>> submap_lidar_refs_ =
+        build_lidar_refs ? std::make_shared<std::vector<float>>() : nullptr;
 
     for (auto k : this->submap_kf_idx_curr) {
 
-      // create current submap cloud
+      // Copy the cloud + per-keyframe shared_ptrs (normals, visual refs) under
+      // the lock: the main thread's updateKeyframes() push_back can REALLOCATE
+      // these vectors, so reading element [k] unlocked races a concurrent
+      // reallocation (use-after-free). shared_ptr copies are cheap; the heavy
+      // insert() work is done after unlocking.
       lock.lock();
-      *submap_cloud_ += *this->keyframes[k].second;
+      pcl::PointCloud<PointType>::ConstPtr kf_cloud = this->keyframes[k].second;
+      std::shared_ptr<const nano_gicp::CovarianceList> kf_normals = this->keyframe_normals[k];
+      std::shared_ptr<const nano_gicp::VisualRefList> kf_refs =
+          build_visual_refs ? this->keyframe_visual_refs.at(k) : nullptr;
+      // .at(), not [k]: fail loud with a precise (small, sane) index/size pair
+      // right here if build_lidar_refs's earlier size compare was ever wrong,
+      // instead of silently reading past the end and propagating a garbage
+      // shared_ptr downstream (2026-07-09 crash hunt).
+      std::shared_ptr<const std::vector<float>> kf_lrefs =
+          build_lidar_refs ? this->keyframe_lidar_refs.at(k) : nullptr;
       lock.unlock();
 
-      // grab corresponding submap cloud's normals
+      *submap_cloud_ += *kf_cloud;
       submap_normals_->insert( std::end(*submap_normals_),
-          std::begin(*(this->keyframe_normals[k])), std::end(*(this->keyframe_normals[k])) );
+          std::begin(*kf_normals), std::end(*kf_normals) );
+      if (build_visual_refs && kf_refs) {
+        submap_visual_refs_->insert( std::end(*submap_visual_refs_),
+            std::begin(*kf_refs), std::end(*kf_refs) );
+      }
+      if (build_lidar_refs && kf_lrefs) {
+        submap_lidar_refs_->insert( std::end(*submap_lidar_refs_),
+            std::begin(*kf_lrefs), std::end(*kf_lrefs) );
+      }
     }
 
     this->submap_cloud = submap_cloud_;
     this->submap_normals = submap_normals_;
+    this->submap_visual_refs = submap_visual_refs_;
+    this->submap_lidar_refs = submap_lidar_refs_;
 
     // Pause to prevent stealing resources from the main loop if it is running.
     this->pauseSubmapBuildIfNeeded();
 
-    this->gicp_temp.setInputTarget(this->submap_cloud);
-    // this->submap_kdtree = this->gicp_temp.target_kdtree_;
+    // Prepare the new target in the background: builds the kd-tree and the
+    // photometric gradients without blocking the main loop. Covariances come
+    // from the keyframe normals assembled above (submap_normals), shared with
+    // the registration instance in getNextPose().
+    this->gicp_temp.registerInputTarget(this->submap_cloud);
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }
@@ -1961,15 +3879,15 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
   std::transform(raw_covariances->begin(), raw_covariances->end(), transformed_covariances->begin(),
                [&Tf](const Eigen::Matrix4f& cov) { return Tf * cov * Tf.transpose(); });
 
-
+    
     ++this->num_processed_keyframes;
 
     lock.lock();
     this->keyframes[i].second = transformed_keyframe;
     this->keyframe_normals[i] = transformed_covariances;
 
+    if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
     this->publish_keyframe_thread = std::thread( &dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i] );
-    this->publish_keyframe_thread.detach();
   }
 
   lock.unlock();
@@ -1985,31 +3903,176 @@ void dlio::OdomNode::pauseSubmapBuildIfNeeded() {
   this->submap_build_cv.wait(lock, [this]{ return !this->main_loop_running; });
 }
 
+void dlio::OdomNode::publishDiagnostics() {
+
+  // Computation time (ms): last / avg / max over the retained window.
+  double comp_last = 0.0, comp_avg = 0.0, comp_max = 0.0;
+  if (!this->comp_times.empty()) {
+    comp_last = this->comp_times.back() * 1000.;
+    comp_avg = std::accumulate(this->comp_times.begin(), this->comp_times.end(), 0.0)
+               / this->comp_times.size() * 1000.;
+    comp_max = *std::max_element(this->comp_times.begin(), this->comp_times.end()) * 1000.;
+  }
+
+  // Sensor rates (Hz), averaged over the most recent window (mirrors debug()).
+  const int win = 100;
+  auto avg_tail = [win](const std::vector<double>& v) -> double {
+    if (v.empty()) return 0.0;
+    if ((int)v.size() < win) return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+    return std::accumulate(v.end() - win, v.end(), 0.0) / win;
+  };
+  double imu_rate;
+  { std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu); imu_rate = avg_tail(this->imu_rates); }
+  double lidar_rate = avg_tail(this->lidar_rates);
+
+  // RAM (resident set, MB) from /proc/self/stat.
+  double resident_mb = 0.0;
+  {
+    std::ifstream stat_stream("/proc/self/stat", std::ios_base::in);
+    std::string ignore;
+    unsigned long vsize = 0; long rss = 0;
+    // fields: pid comm state ppid pgrp session tty_nr tpgid flags minflt
+    //         cminflt majflt cmajflt utime stime cutime cstime priority
+    //         nice num_threads itrealvalue starttime vsize rss
+    for (int i = 0; i < 22; ++i) stat_stream >> ignore;
+    stat_stream >> vsize >> rss;
+    long page_kb = sysconf(_SC_PAGE_SIZE) / 1024;
+    resident_mb = (rss * page_kb) / 1000.;
+  }
+
+  // CPU utilization since the previous diagnostics publish (own baseline so it
+  // does not consume debug()'s since-last-call window).
+  double cpu_percent = 0.0, cores = 0.0;
+  {
+    struct tms t; clock_t now = times(&t);
+    if (this->lastCPU_diag_ != (clock_t)-1 && now > this->lastCPU_diag_ &&
+        t.tms_stime >= this->lastSysCPU_diag_ && t.tms_utime >= this->lastUserCPU_diag_) {
+      cpu_percent = (double)((t.tms_stime - this->lastSysCPU_diag_) +
+                             (t.tms_utime - this->lastUserCPU_diag_));
+      cpu_percent /= (now - this->lastCPU_diag_);
+      cpu_percent /= this->numProcessors;
+      cpu_percent *= 100.;
+      cores = (cpu_percent / 100.) * this->numProcessors;
+    }
+    this->lastCPU_diag_ = now;
+    this->lastSysCPU_diag_ = t.tms_stime;
+    this->lastUserCPU_diag_ = t.tms_utime;
+  }
+
+  diagnostic_msgs::msg::DiagnosticArray arr;
+  arr.header.stamp = this->scan_header_stamp;
+  arr.header.frame_id = this->odom_frame;
+
+  diagnostic_msgs::msg::DiagnosticStatus st;
+  st.name = "DLIO Odometry";          // capture tooling filters on substring "DLIO"
+  st.hardware_id = "DLIO";
+
+  auto kv = [&st](const std::string& key, const std::string& value) {
+    diagnostic_msgs::msg::KeyValue pair;
+    pair.key = key; pair.value = value;
+    st.values.push_back(pair);
+  };
+  auto fnum = [](double v, int prec = 3) {
+    std::ostringstream os; os << std::fixed << std::setprecision(prec) << v; return os.str();
+  };
+
+  // Health: WARN while the degeneracy gate is active or the per-scan budget
+  // (the LiDAR period) is blown; ERROR if GICP failed to converge.
+  double scan_period_ms = (lidar_rate > 0.0) ? 1000.0 / lidar_rate : 0.0;
+  if (!this->gicp_hasConverged.load()) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    st.message = "GICP did not converge";
+  } else if (this->loc_gate_axes_current_ > 0) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    st.message = "Degenerate along " + std::to_string(this->loc_gate_axes_current_) +
+                 " direction(s); holding IMU prior";
+  } else if (scan_period_ms > 0.0 && comp_last > scan_period_ms) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    st.message = "Computation time exceeds scan period";
+  } else {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    st.message = "OK";
+  }
+
+  kv("Computation Time (ms)", fnum(comp_last, 2));
+  kv("Avg Computation Time (ms)", fnum(comp_avg, 2));
+  kv("Max Computation Time (ms)", fnum(comp_max, 2));
+  kv("CPU Load (%)", fnum(cpu_percent, 1));
+  kv("Cores Utilized", fnum(cores, 2));
+  kv("RAM Allocation (MB)", fnum(resident_mb, 1));
+  kv("LiDAR Rate (Hz)", fnum(lidar_rate, 2));
+  kv("IMU Rate (Hz)", fnum(imu_rate, 2));
+  kv("Distance Traveled (m)", fnum(this->length_traversed, 3));
+  kv("Keyframes", std::to_string(this->keyframes.size()));
+  kv("Deskewed Points", std::to_string(this->deskew_size.load()));
+  kv("Sub-floor Points Rejected", std::to_string(this->last_subfloor_rejected_));
+  kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
+  // CPU starvation: realtime factor (>1 = slower than real time), cumulative
+  // compute overruns, and an estimate of transport-dropped scans.
+  kv("Realtime Factor", fnum(this->last_realtime_factor_, 2));
+  kv("CPU Starved", (this->last_realtime_factor_ > 1.0) ? "1" : "0");
+  kv("Compute Overruns (cumulative)", std::to_string(this->compute_overruns_.load()));
+  kv("Scans Dropped est (cumulative)", std::to_string(this->scans_dropped_est_.load()));
+  kv("Degenerate Directions (current)", std::to_string(this->loc_gate_axes_current_));
+  kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
+  // Per-term trust telemetry (read-only; what an adaptive weighting policy would
+  // key on). Geometric: weakest-axis margin vs the gate threshold (>1 trusted,
+  // <1 held, ~1 marginal; -1 = gate off). Each term also reports count + RMS.
+  kv("Geo Rot Trust Margin", fnum(this->gicp.lastGeoRotMargin(), 4));
+  kv("Geo Trans Trust Margin", fnum(this->gicp.lastGeoTransMargin(), 4));
+  kv("Photometric Active", this->photometric_active_ ? "1" : "0");
+  kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
+  kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
+  kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
+  kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));
+  kv("Photometric Kernel Scale", fnum(this->gicp.lastKernelScale(), 4));
+  kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");
+  kv("Visual Points", std::to_string(this->gicp.lastVisualCount()));
+  kv("Visual Residual RMS", fnum(this->gicp.lastVisualRms(), 4));
+  // Why "Visual Points" might be 0: image match dt (-1 = no camera frame paired),
+  // and the per-gate reject breakdown when a frame did pair (behind camera / out
+  // of image bounds / ~zero gradient) -> pinpoints match vs projection failure.
+  kv("Visual Match dt (s)", fnum(this->last_visual_match_dt_, 4));
+  kv("Visual Rejects (behind/oob/grad)",
+     std::to_string(this->gicp.lastVisualRejBehind()) + "/" +
+     std::to_string(this->gicp.lastVisualRejOob()) + "/" +
+     std::to_string(this->gicp.lastVisualRejGrad()));
+  kv("Visual Rescued Axes", std::to_string(this->gicp.lastVisualRescuedDirections()));
+  kv("Visual Map Active", (this->visual_map_enabled_ && this->gicp.lastVisualMapCount() > 0) ? "1" : "0");
+  kv("Visual Map Points", std::to_string(this->gicp.lastVisualMapCount()));
+  kv("Visual Map RMS", fnum(this->gicp.lastVisualMapRms(), 4));
+  kv("Lidar Map Active", (this->lidar_image_enabled_ && this->gicp.lastLidarMapCount() > 0) ? "1" : "0");
+  kv("Lidar Map Points", std::to_string(this->gicp.lastLidarMapCount()));
+  kv("Lidar Map RMS", fnum(this->gicp.lastLidarMapRms(), 4));
+  // Intensity-channel instrumentation (INTENSITY_AUDIT_2026-07-09): is the flow
+  // term actually engaging, and does the full-res image carry texture? Az-grad
+  // energy ~0 = channel information-poor at full res (image terms can't help);
+  // healthy graffiti walls give O(0.01-0.1) in /scale units.
+  kv("Lidar Flow Active", (this->lidar_flow_enabled_ && this->gicp.lastLidarFlowCount() > 0) ? "1" : "0");
+  kv("Lidar Flow Points", std::to_string(this->gicp.lastLidarFlowCount()));
+  kv("Lidar Flow RMS", fnum(this->gicp.lastLidarFlowRms(), 4));
+  kv("Lidar Image Az-Grad Energy", fnum(this->lidar_img_az_grad_energy_, 5));
+  // Runtime guards (doc/RUNTIME_GUARDS.md): trips/engagement are the operator's
+  // signal that the estimate is being actively bounded rather than trusted.
+  kv("Physics Fuse Trips (cumulative)", std::to_string(this->fuse_trips_));
+  kv("Slosh Guard Engaged", (this->slosh_enabled_ && this->slosh_guard_.engaged()) ? "1" : "0");
+  kv("Slosh Reversal Fraction", fnum(this->slosh_guard_.reversalFraction(), 3));
+  kv("Slosh Guard Activations (cumulative)", std::to_string(this->slosh_guard_.activations()));
+  kv("Elapsed Time (s)", fnum(this->elapsed_time, 2));
+
+  arr.status.push_back(st);
+  this->diag_pub->publish(arr);
+}
+
 void dlio::OdomNode::debug() {
 
-  // Total length traversed
-  double length_traversed = 0.;
-  Eigen::Vector3f p_curr = Eigen::Vector3f(0., 0., 0.);
-  Eigen::Vector3f p_prev = Eigen::Vector3f(0., 0., 0.);
-  for (const auto& t : this->trajectory) {
-    if (p_prev == Eigen::Vector3f(0., 0., 0.)) {
-      p_prev = t.first;
-      continue;
-    }
-    p_curr = t.first;
-    double l = sqrt(pow(p_curr[0] - p_prev[0], 2) + pow(p_curr[1] - p_prev[1], 2) + pow(p_curr[2] - p_prev[2], 2));
+  // Snapshot the geo-protected state once under the lock; the IMU thread writes
+  // it via propagateState/updateState under geo.mtx. (dashboard read only.)
+  State dbg_state;
+  { std::lock_guard<std::mutex> lock(this->geo.mtx); dbg_state = this->state; }
 
-    if (l >= 0.1) {
-      length_traversed += l;
-      p_prev = p_curr;
-    }
-  }
-  this->length_traversed = length_traversed;
-
-  // FIX: cap_history prevents unbounded growth of stats vectors on long runs.
-  this->cap_history(this->comp_times, 1000);
-  this->cap_history(this->imu_rates, 1000);
-  this->cap_history(this->lidar_rates, 1000);
+  // Total length traversed is maintained incrementally in callbackPointCloud
+  double length_traversed = this->length_traversed;
 
   // Average computation time
   double avg_comp_time =
@@ -2019,12 +4082,15 @@ void dlio::OdomNode::debug() {
   int win_size = 100;
   double avg_imu_rate;
   double avg_lidar_rate;
-  if (this->imu_rates.size() < win_size) {
-    avg_imu_rate =
-      std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size();
-  } else {
-    avg_imu_rate =
-      std::accumulate(this->imu_rates.end()-win_size, this->imu_rates.end(), 0.0) / win_size;
+  {
+    std::lock_guard<decltype(this->mtx_imu)> rlk(this->mtx_imu);
+    if ((int)this->imu_rates.size() < win_size) {
+      avg_imu_rate = this->imu_rates.empty() ? 0.0 :
+        std::accumulate(this->imu_rates.begin(), this->imu_rates.end(), 0.0) / this->imu_rates.size();
+    } else {
+      avg_imu_rate =
+        std::accumulate(this->imu_rates.end()-win_size, this->imu_rates.end(), 0.0) / win_size;
+    }
   }
   if (this->lidar_rates.size() < win_size) {
     avg_lidar_rate =
@@ -2071,6 +4137,7 @@ void dlio::OdomNode::debug() {
   this->lastSysCPU = timeSample.tms_stime;
   this->lastUserCPU = timeSample.tms_utime;
   this->cpu_percents.push_back(cpu_percent);
+  cap_history(this->cpu_percents);
   double avg_cpu_usage =
     std::accumulate(this->cpu_percents.begin(), this->cpu_percents.end(), 0.0) / this->cpu_percents.size();
 
@@ -2126,35 +4193,35 @@ void dlio::OdomNode::debug() {
   std::cout << "|===================================================================|" << std::endl;
 
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Position     {W}  [xyz] :: " + to_string_with_precision(this->state.p[0], 4) + " "
-                                + to_string_with_precision(this->state.p[1], 4) + " "
-                                + to_string_with_precision(this->state.p[2], 4)
+    << "Position     {W}  [xyz] :: " + to_string_with_precision(dbg_state.p[0], 4) + " "
+                                + to_string_with_precision(dbg_state.p[1], 4) + " "
+                                + to_string_with_precision(dbg_state.p[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Orientation  {W} [wxyz] :: " + to_string_with_precision(this->state.q.w(), 4) + " "
-                                + to_string_with_precision(this->state.q.x(), 4) + " "
-                                + to_string_with_precision(this->state.q.y(), 4) + " "
-                                + to_string_with_precision(this->state.q.z(), 4)
+    << "Orientation  {W} [wxyz] :: " + to_string_with_precision(dbg_state.q.w(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.x(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.y(), 4) + " "
+                                + to_string_with_precision(dbg_state.q.z(), 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Lin Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.lin.b[0], 4) + " "
-                                + to_string_with_precision(this->state.v.lin.b[1], 4) + " "
-                                + to_string_with_precision(this->state.v.lin.b[2], 4)
+    << "Lin Velocity {B}  [xyz] :: " + to_string_with_precision(dbg_state.v.lin.b[0], 4) + " "
+                                + to_string_with_precision(dbg_state.v.lin.b[1], 4) + " "
+                                + to_string_with_precision(dbg_state.v.lin.b[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Ang Velocity {B}  [xyz] :: " + to_string_with_precision(this->state.v.ang.b[0], 4) + " "
-                                + to_string_with_precision(this->state.v.ang.b[1], 4) + " "
-                                + to_string_with_precision(this->state.v.ang.b[2], 4)
+    << "Ang Velocity {B}  [xyz] :: " + to_string_with_precision(dbg_state.v.ang.b[0], 4) + " "
+                                + to_string_with_precision(dbg_state.v.ang.b[1], 4) + " "
+                                + to_string_with_precision(dbg_state.v.ang.b[2], 4)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Accel Bias        [xyz] :: " + to_string_with_precision(this->state.b.accel[0], 8) + " "
-                                + to_string_with_precision(this->state.b.accel[1], 8) + " "
-                                + to_string_with_precision(this->state.b.accel[2], 8)
+    << "Accel Bias        [xyz] :: " + to_string_with_precision(dbg_state.b.accel[0], 8) + " "
+                                + to_string_with_precision(dbg_state.b.accel[1], 8) + " "
+                                + to_string_with_precision(dbg_state.b.accel[2], 8)
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
-    << "Gyro Bias         [xyz] :: " + to_string_with_precision(this->state.b.gyro[0], 8) + " "
-                                + to_string_with_precision(this->state.b.gyro[1], 8) + " "
-                                + to_string_with_precision(this->state.b.gyro[2], 8)
+    << "Gyro Bias         [xyz] :: " + to_string_with_precision(dbg_state.b.gyro[0], 8) + " "
+                                + to_string_with_precision(dbg_state.b.gyro[1], 8) + " "
+                                + to_string_with_precision(dbg_state.b.gyro[2], 8)
     << "|" << std::endl;
 
   std::cout << "|                                                                   |" << std::endl;
@@ -2164,9 +4231,9 @@ void dlio::OdomNode::debug() {
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
     << "Distance to Origin :: "
-      + to_string_with_precision( sqrt(pow(this->state.p[0]-this->origin[0],2) +
-                                       pow(this->state.p[1]-this->origin[1],2) +
-                                       pow(this->state.p[2]-this->origin[2],2)), 4) + " meters"
+      + to_string_with_precision( sqrt(pow(dbg_state.p[0]-this->origin[0],2) +
+                                       pow(dbg_state.p[1]-this->origin[1],2) +
+                                       pow(dbg_state.p[2]-this->origin[2],2)), 4) + " meters"
     << "|" << std::endl;
   std::cout << "| " << std::left << std::setfill(' ') << std::setw(66)
     << "Registration       :: keyframes: " + std::to_string(this->keyframes.size()) + ", "

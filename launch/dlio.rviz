@@ -96,13 +96,17 @@ Visualization Manager:
           Min Intensity: 0
           Name: Deskewed Scan
           Position Transformer: XYZ
-          Queue Size: 10
           Selectable: true
           Size (Pixels): 2
           Size (m): 0.009999999776482582
           Style: Points
-          Topic: /dlio/odom_node/pointcloud/deskewed
-          Unreliable: false
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/odom_node/pointcloud/deskewed
           Use Fixed Frame: true
           Use rainbow: true
           Value: true
@@ -126,13 +130,17 @@ Visualization Manager:
           Min Intensity: 0
           Name: Dense Map
           Position Transformer: XYZ
-          Queue Size: 10
           Selectable: true
           Size (Pixels): 1
           Size (m): 0.009999999776482582
           Style: Points
-          Topic: /dlio/odom_node/pointcloud/deskewed
-          Unreliable: false
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/odom_node/pointcloud/deskewed
           Use Fixed Frame: true
           Use rainbow: true
           Value: true
@@ -156,13 +164,17 @@ Visualization Manager:
           Min Intensity: 0
           Name: Sparse Map
           Position Transformer: XYZ
-          Queue Size: 1000
           Selectable: true
           Size (Pixels): 1
           Size (m): 0.05000000074505806
           Style: Points
-          Topic: /dlio/map_node/map
-          Unreliable: false
+          Topic:
+            Depth: 100
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/map_node/map
           Use Fixed Frame: true
           Use rainbow: true
           Value: false
@@ -191,7 +203,6 @@ Visualization Manager:
           Keep: 1
           Name: Pose
           Position Tolerance: 0.009999999776482582
-          Queue Size: 1000
           Shape:
             Alpha: 1
             Axes Length: 1
@@ -202,8 +213,13 @@ Visualization Manager:
             Shaft Length: 1
             Shaft Radius: 0.05000000074505806
             Value: Axes
-          Topic: /dlio/odom_node/odom
-          Unreliable: false
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/odom_node/odom
           Value: false
         - Alpha: 1
           Arrow Length: 0.30000001192092896
@@ -215,12 +231,16 @@ Visualization Manager:
           Head Length: 0.07000000029802322
           Head Radius: 0.029999999329447746
           Name: Keyframes
-          Queue Size: 10
           Shaft Length: 0.23000000417232513
           Shaft Radius: 0.009999999776482582
           Shape: Axes
-          Topic: /dlio/odom_node/keyframes
-          Unreliable: false
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/odom_node/keyframes
           Value: false
         - Alpha: 1
           Buffer Length: 1
@@ -239,12 +259,16 @@ Visualization Manager:
             Z: 0
           Pose Color: 255; 85; 255
           Pose Style: None
-          Queue Size: 10
           Radius: 0.029999999329447746
           Shaft Diameter: 0.10000000149011612
           Shaft Length: 0.10000000149011612
-          Topic: /dlio/odom_node/path
-          Unreliable: false
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /dlio/odom_node/path
           Value: true
       Enabled: true
       Name: Odometry
@@ -263,15 +287,30 @@ Visualization Manager:
     - Class: rviz_default_plugins/FocusCamera
     - Class: rviz_default_plugins/Measure
     - Class: rviz_default_plugins/SetInitialPose
-      Theta std deviation: 0.2617993950843811
-      Topic: /initialpose
-      X std deviation: 0.5
-      Y std deviation: 0.5
+      Covariance x: 0.25
+      Covariance y: 0.25
+      Covariance yaw: 0.06853891909122467
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
     - Class: rviz_default_plugins/SetGoal
-      Topic: /move_base_simple/goal
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
     - Class: rviz_default_plugins/PublishPoint
       Single click: true
-      Topic: /clicked_point
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /clicked_point
   Value: true
   Views:
     Current:

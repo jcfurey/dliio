@@ -1,0 +1,73 @@
+# EXAMPLE: Ouster in a tunnel / geometrically self-similar environment.
+#
+# ⚠️ photometricWeight is now 0.0 (2026-07-09, doc/INTENSITY_AUDIT_2026-07-09.md):
+# the 3D photometric term reads the VOXEL-AVERAGED (0.25m leaf) reflectivity of
+# current_scan/submap points, and its kNN gradient support spans ~0.5-1m -- the
+# 5-30cm graffiti strokes that carry the along-tunnel signal are blurred away
+# before the term ever sees them. What remains is low-frequency shading that
+# aliases along the tunnel axis; the 2026-07-08 X-ICP runaway analysis showed
+# this drive both lifts the weak axis into the partial band AND supplies the
+# pull (doc/FUSION_ARCHITECTURE.md). The image-domain terms
+# (odom/lidar_image/*, flow/imageRef, imageRefs -- see ouster_tunnel_lidarimg.yaml
+# and ouster_tunnel_flow.yaml) are the successors that keep full-resolution
+# texture. The n=24 X-ICP validation (ouster_tunnel_xicp.yaml) ran on the
+# near-IR substrate whose overlay already forced photometricWeight 0, so this
+# change MATCHES the validated configuration rather than invalidating it.
+#
+# Historical evidence for the old 0.3 (kept for provenance; n=3, and BOTH
+# verdicts pre-date the 2026-06-17 extrinsic + dead-channel fixes, so the
+# sweep's "0.1 diverges / 0.3 stable" split is confounded -- re-derive at n>=24
+# before resurrecting a nonzero weight):
+#   photometricWeight 0.1 -> diverged 2/3 (11 km, 9 km, ok)
+#   photometricWeight 0.3 -> stable 3/3, repeatable ~100 m path
+#   photometricWeight 0.5 -> bounded 3/3 but less repeatable (one ~570 m run)
+#   photometricWeight 1.0 -> regresses 1/3 (over-trusts intensity)
+# See the resple_test_ws benchmark notes (results/dliio_tunnel_sweep/NOTES.md)
+# and doc/FINDINGS_2026-06-17.md.
+#
+# Self-contained "tunnel mode" overlay: plane regularization + the degeneracy
+# gate + the per-scan correction clamp.
+#
+# Usage (overlay on top of params.yaml; later files win):
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+#     pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu \
+#     params_file:=$(ros2 pkg prefix direct_lidar_inertial_odometry)/share/direct_lidar_inertial_odometry/cfg/params.yaml
+#   # then append this overlay:
+#   #   --ros-args --params-file .../cfg/examples/ouster_tunnel.yaml
+#
+# Requires the driver to publish the 'reflectivity' point field (ouster-ros does
+# by default). Supersedes ouster_reflectivity.yaml for tunnel deployments.
+
+/**:
+  ros__parameters:
+    # Reflectivity photometric channel (range-normalized by the sensor; the
+    # software range correction is skipped automatically). Channel/scale kept so
+    # the reflectivity field is populated for the image-domain terms.
+    odom/gicp/photometricChannel: reflectivity
+    # Ouster calibrated reflectivity: 0-100 diffuse %, 101-255 retroreflective.
+    odom/gicp/photometricScale: 255.0
+    # OFF: the 3D term reads voxel-averaged reflectivity with ~0.5-1m gradient
+    # support -- aliased along-tunnel drive, implicated in the 2026-07-08 X-ICP
+    # runaway (see header). Use the image-domain terms instead.
+    odom/gicp/photometricWeight: 0.0
+
+    # Plane regularization gives the sharpest degeneracy discrimination, and the
+    # gate holds the IMU prior along the (still-detected) degenerate axis.
+    odom/gicp/regularizationMethod: plane
+    odom/gicp/degeneracyThreshRatio: 0.005
+
+    # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
+    # the IMU-prior initial guess). The degeneracy gate only holds the prior on
+    # the axes it flags, on the ~71-80% of scans it fires; on the scans it
+    # misses, a map-lock "jump" otherwise runs away unbounded and seeds a full
+    # collapse. Over a ~0.1s scan the IMU prior is high-confidence, so the
+    # correction (NOT the motion -- the prior already contains the motion) is
+    # tiny; these caps bound the runaway. Starting values; tune in the bench
+    # harness (results/dliio_tunnel_bench/). 0 disables each. Default off
+    # everywhere else (params.yaml), so non-tunnel runs are unaffected.
+    odom/gicp/maxCorrTrans: 0.30   # [m]   per scan
+    odom/gicp/maxCorrRot: 0.05     # [rad] per scan
+
+    # The OS-series integrated IMU offset (from the Ouster datasheet); replace
+    # with your unit's calibration if available.
+    extrinsics/baselink2imu/t: [ 0.006253, -0.011775, 0.007645 ]

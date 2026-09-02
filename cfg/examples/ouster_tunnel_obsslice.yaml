@@ -1,0 +1,26 @@
+# EXAMPLE: LODESTAR-flavored degeneracy-aware observer gain (EXPLORATION #3, the
+# cheap estimator-level complement to the governor). Default-off elsewhere.
+# (2026-06-26, doc/EXPLORATION_2026-06-26.md Part 1.)
+#
+# Premise: LODESTAR gives degenerate "fixed" states reduced Kalman gain. DLIO's
+# back-end is a contracting observer with scalar gains, not a covariance filter,
+# so the tractable slice is: on the gate's held-degenerate axes, scale the LiDAR
+# pose correction by degenObsGain so the state rides the IMU-propagated prior
+# there instead of absorbing registration noise. It acts INSIDE the observer,
+# EARLIER than the governor — it stops the unreliable correction from entering the
+# velocity/bias states in the first place (attenuate at the source), where the
+# governor only clamps the OUTPUT pose after the runaway has grown. The two stack.
+# gain=1 -> bit-identical; gain=0 -> axis fully frozen to the prior.
+#
+# Overlay ON TOP of ouster_tunnel.yaml + ouster_06042026_extrinsics.yaml +
+# ouster_tunnel_xicp.yaml [+ ouster_tunnel_governor.yaml to test the stack].
+#
+# UNVALIDATED. Sweep gain via EXTRA_PARAMS; 0.5 is the cautious first try, 0.0 the
+# full freeze (the gate's held set is conservative so 0 should be safe):
+#   EXTRA_PARAMS="odom/geo/degenObsGain=0.5"   (then 0.0)
+# Watch for over-freezing on legitimately-marginal motion. The doc's full matrix
+# is gain {1.0,0.5,0.0} x governor on/off x X-ICP on/off (2x2x3) at n>=24.
+
+/**:
+  ros__parameters:
+    odom/geo/degenObsGain: 0.5      # held-axis correction scale; sweep {0.5, 0.0}

@@ -1,0 +1,38 @@
+# EXAMPLE: degeneracy GOVERNOR fail-safe for the tunnel (06042026), default-off
+# elsewhere. (2026-06-23, doc/FINDINGS_2026-06-22.md Part 7.)
+#
+# Premise: the 06042026 conduit's degenerate (along-tunnel / yaw) axis is
+# provably unobservable with this sensor suite -- every auxiliary observation
+# term (camera f2f/f2m, LiDAR reflectivity, near-IR, +condScale) was A/B'd and
+# none re-constrains it (Parts 1-6). So the goal is NOT to track the axis (you
+# cannot) but to make the failure SAFE: bound the held-prior runaway and signal
+# the lost observability honestly.
+#
+# What it does: the degeneracy gate holds the IMU prior on the unobservable
+# eigen-directions; that prior then dead-reckons (accel/gyro bias double-
+# integrates) into the km-scale divergence the bench sees as DIV. The governor
+# caps per-scan OUTPUT motion along those held world-frame directions to a
+# physical per-scan step, vs the previous pose. Bounding the pose feeds the
+# velocity estimate back down through the geometric observer (updateState:
+# err = lidarPose - state -> Kv), so it bounds the RATE, not just one scan, and
+# breaks the runaway -> correspondences-project-out -> deg=6 collapse feedback.
+# Plus covariance inflation so a downstream consumer de-weights the held axes.
+#
+# Overlay ON TOP of ouster_tunnel.yaml (+ ouster_06042026_extrinsics.yaml). The
+# caps are physical: maxStepTrans 0.15 m/scan ~ 1.5 m/s at 10 Hz (above the
+# platform's real speed, well below the 140 m/s runaway); maxStepRot 0.05
+# rad/scan ~ 0.5 rad/s. Tune to the platform, not the bag.
+#
+# 0.15 is the n=24-VALIDATED value (2026-06-24): on the near-IR substrate it cut
+# the catastrophic deg=6 runaway from 6/24 reps (worst 35 km) to 0/24 (worst 270 m,
+# a bounded slosh), with no regression on healthy reps. In the n=4 cap screen a
+# looser 0.30 left a 654 m outlier and a tighter 0.10 was WORSE (non-monotonic).
+# See results/SESSION_2026-06-24_governor_validated_n24.md (top-level test harness).
+
+/**:
+  ros__parameters:
+    odom/degenGov/enabled: true
+    odom/degenGov/maxStepTrans: 0.15   # [m]   per-scan cap along a held translation axis (n=24-validated)
+    odom/degenGov/maxStepRot: 0.05     # [rad] per-scan cap about a held rotation axis
+    odom/degenGov/covPosVar: 100.0     # [m^2]   ~10 m std on a held position axis (untrusted)
+    odom/degenGov/covRotVar: 1.0       # [rad^2] held rotation axis untrusted

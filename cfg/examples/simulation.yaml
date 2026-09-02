@@ -1,0 +1,21 @@
+# EXAMPLE: simulation (Gazebo / rosbag replay).
+#
+# use_sim_time is normally set by the launch argument:
+#   ros2 launch direct_lidar_inertial_odometry dlio.launch.py use_sim_time:=true
+# This overlay exists for `ros2 run` users and documents typical sim tweaks.
+#
+# Remember to play bags with --clock:
+#   ros2 bag play my_bag --clock
+
+/**:
+  ros__parameters:
+    use_sim_time: true
+
+    # Simulated IMUs are usually bias-free and start level: skip the 3-second
+    # stationary calibration for faster startup. Re-enable on hardware.
+    imu/calibration: false
+    odom/imu/approximateGravity: false
+
+    # Ideal simulated extrinsics (sensors at base_link).
+    extrinsics/baselink2imu/t: [ 0.0, 0.0, 0.0 ]
+    extrinsics/baselink2lidar/t: [ 0.0, 0.0, 0.0 ]

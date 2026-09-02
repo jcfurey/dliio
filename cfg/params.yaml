@@ -10,58 +10,503 @@
 #                                                         #
 ###########################################################
 
+# ALGORITHM PARAMETERS
+# Environment- and tuning-related settings shared by both nodes. Per-robot
+# settings (extrinsics, IMU intrinsics) live in dlio.yaml. Example overlays
+# for common setups: cfg/examples/.
+
 /**:
   ros__parameters:
-    use_sim_time: true
+    # Simulation time is controlled by the launch argument
+    # use_sim_time:=true|false (default false). Keep false here: with no
+    # /clock publisher the node clock stays at zero and timestamps and
+    # statistics are wrong.
+    use_sim_time: false
+
+    # TF frame names. odom -> baselink is published per scan; baselink ->
+    # lidar/imu are latched once on /tf_static from the extrinsics.
     frames/odom: odom
     frames/baselink: base_link
     frames/lidar: lidar
     frames/imu: imu
+    # Camera frame, only used to look up the lidar->camera extrinsic when
+    # extrinsics/source: tf and odom/visual/enabled (see dlio.yaml).
+    frames/camera: camera
 
+    # Map node: delay publishing until the robot has moved 0.1 m; publish the
+    # unfiltered (dense) or voxelized clouds; sparse map voxel size [m].
     map/waitUntilMove: true
     map/dense/filtered: false
     map/sparse/leafSize: 0.25
+    # Map republish rate [Hz] (0 disables). The map node accumulates every
+    # keyframe but only republishes the whole map on this timer, and only when a
+    # consumer (RViz/Foxglove) is subscribed -- keeps the heaviest output off the
+    # estimation critical path. Latched (transient_local), so late subscribers
+    # still get the current map.
+    map/publishRate: 1.0
 
+    # Gravity magnitude [m/s^2].
     odom/gravity: 9.80665
+    # Estimate a constant LiDAR<->IMU clock offset from the first scan.
     odom/computeTimeOffset: true
 
+    # IMU startup calibration (robot must be stationary for `time` seconds).
+    # approximateGravity also estimates the initial attitude from the
+    # gravity direction (leave false if the robot starts level).
     odom/imu/approximateGravity: false
     odom/imu/calibration/gyro: true
     odom/imu/calibration/accel: true
     odom/imu/calibration/time: 3.0
+    # IMU ring-buffer length [samples]; must cover at least one scan period
+    # plus scheduling jitter (5000 @ 500 Hz = 10 s).
     odom/imu/bufferSize: 5000
 
+    # Preprocessing: remove points within a cube of +/- size [m] around the
+    # sensor (robot body returns), then voxel-downsample at res [m].
     odom/preprocessing/cropBoxFilter/size: 1.0
     odom/preprocessing/voxelFilter/res: 0.25
 
+    # Sub-floor reject (specular ghost removal). Drops "ghost" returns that a
+    # mirror-like surface (a floor water pool / wet patch) plants BELOW the real
+    # floor, which otherwise drag the pose/map down. Per 2D cell it estimates the
+    # floor as the lowest dense z-bin (robust to the sparse ghosts and to
+    # slope/curvature) and rejects points more than `margin` below it; if the
+    # reject would exceed `maxRejectFrac` it is skipped (the floor estimate, not
+    # the scan, is suspect). OFF by default -> bit-identical. Requires a
+    # gravity-aligned odom frame (odom/imu/approximateGravity: true, the default),
+    # since it keys on world +Z = up. Watch the `Sub-floor Points Rejected`
+    # /diagnostics key: it should be ~0 in clean tracking and spike only at the
+    # reflective surface. Caveat: a genuine deep negative obstacle below the floor
+    # would also be rejected, so keep this off outside specular environments.
+    odom/preprocessing/subFloorReject/enabled: false
+    odom/preprocessing/subFloorReject/margin: 0.30        # [m] reject below cell floor
+    odom/preprocessing/subFloorReject/radius: 8.0         # [m] horizontal window analyzed
+    odom/preprocessing/subFloorReject/cell: 1.0           # [m] per-cell floor grid
+    odom/preprocessing/subFloorReject/zBin: 0.10          # [m] floor histogram bin
+    odom/preprocessing/subFloorReject/minBinCount: 8      # min points to count as floor
+    odom/preprocessing/subFloorReject/maxRejectFrac: 0.15 # safety: skip above this fraction
+
+    # Keyframe creation thresholds: distance [m] and rotation [deg].
+    # With adaptive: true (dlio.yaml) threshD is scaled by spaciousness.
     odom/keyframe/threshD: 1.0
     odom/keyframe/threshR: 45.0
+    # Tunnel-slosh fix: veto keyframe creation while the degeneracy gate holds
+    # axes -- a sloshing pose plants duplicated wall structure in the submap
+    # ("map-lock" aliasing) that feeds the oscillation back (cf. DLIOM's
+    # accurate-state keyframe selection). Default off (bit-identical).
+    odom/keyframe/degenGate: false
+    # Bound on the keyframe map (0 = unlimited). When exceeded, the most
+    # spatially redundant keyframe is removed (the origin anchor and recent
+    # keyframes are kept). Bounds long-run memory at the cost of map detail
+    # in revisited areas.
+    odom/keyframe/maxKeyframes: 0
 
+    # Submap construction: K nearest keyframes + K convex-hull + K
+    # concave-hull keyframes (from DLO).
     odom/submap/keyframe/knn: 10
     odom/submap/keyframe/kcv: 10
     odom/submap/keyframe/kcc: 10
-    odom/gicp/minNumPoints: 64
-    odom/gicp/kCorrespondences: 16
-    odom/gicp/maxCorrespondenceDistance: 0.5
+
+    # GICP scan-to-map registration.
+    odom/gicp/minNumPoints: 64            # skip scans smaller than this
+    odom/gicp/kCorrespondences: 16        # neighbors per covariance estimate
+    odom/gicp/maxCorrespondenceDistance: 0.5  # [m]; adapted when adaptive: true
     odom/gicp/maxIterations: 32
-    odom/gicp/transformationEpsilon: 0.01
-    odom/gicp/rotationEpsilon: 0.01
-    odom/gicp/initLambdaFactor: 1e-9
+    odom/gicp/transformationEpsilon: 0.01 # translation step convergence [m]
+    odom/gicp/rotationEpsilon: 0.01       # rotation step convergence [rad]
+    odom/gicp/initLambdaFactor: 1.0e-9      # Hessian diagonal regularization
 
+    # GICP covariance regularization:
+    #   min_eig (default)  - clamp small covariance singular values: this
+    #                        fork's historical behavior (was mislabeled
+    #                        "plane" internally)
+    #   plane              - true GICP plane-to-plane (fixed 1,1,1e-3 discs;
+    #                        scale-free, recommended for tunnel/degenerate
+    #                        environments together with the gate below)
+    #   normalized_min_eig | frobenius | none
+    odom/gicp/regularizationMethod: min_eig
+
+    # Degeneracy gate (solution remapping) for geometrically self-similar
+    # environments such as featureless tunnels/conduits: the rotation and
+    # translation blocks of the GICP Hessian are eigen-analyzed separately and
+    # the update is projected off directions with eigenvalue below
+    # ratio * block_lambda_max, holding the IMU prior along unobservable
+    # directions instead of amplifying noise. Raise (e.g. 0.02) to gate
+    # earlier/more aggressively. The integration default is 0.0 (disabled) to
+    # preserve feature/intensity-dev behavior until bag validation; the tunnel
+    # and reflectivity example overlays opt in at 0.005.
+    # Most discriminative with regularizationMethod: plane.
+    odom/gicp/degeneracyThreshRatio: 0.0
+
+    # Soft degeneracy gate: instead of toggling each eigen-direction between
+    # full-trust (above the threshold) and full prior-hold (below it), ramp the
+    # kept fraction smoothly with a smoothstep across the band
+    # [thresh/(1+softness), thresh*(1+softness)] in eigenvalue. This removes the
+    # scan-to-scan chatter when an eigenvalue hovers near the threshold (a
+    # documented divergence seed in the chaotic tunnel basin). 0.0 (default) is
+    # the original binary gate, bit-identical; ~0.5-1.0 is a gentle band. The
+    # threshold itself is still degeneracyThreshRatio above. Live-tunable.
+    odom/gicp/degeneracySoftness: 0.0
+
+    # Probabilistic degeneracy gate -- adaptation of Hatleskog & Alexis,
+    # "Probabilistic Degeneracy Detection for Point-to-Plane Error Minimization,"
+    # IEEE RA-L 2024 (arXiv:2410.10784). Instead of holding the prior on
+    # eigen-directions below ratio*lambda_max, the per-direction hold strength
+    # becomes the confidence that the eigenvalue exceeds an ABSOLUTE noise floor
+    # by a factor confidenceS: p = Phi(ln(eigval/(s*floor))/spread). Because the
+    # floor is a sensor-noise quantity (not a ratio of the per-scan max
+    # eigenvalue), the observability test transfers across scenes/sensors -- the
+    # documented weakness of the Zhang single-threshold gate. Set noiseFloorRot
+    # [rad^2] / noiseFloorTrans [m^2] from the sensor's propagated point/normal
+    # noise; 0 falls back to the ratio threshold (a probit-shaped soft gate).
+    # NOTE: the paper auto-propagates noise to a PER-DIRECTION variance; here the
+    # floor is a configured per-block scalar (the faithful extension is deferred).
+    # OFF by default -> the ratio/smoothstep gate above is used, bit-identical.
+    odom/gicp/probGate/enabled: false
+    odom/gicp/probGate/noiseFloorRot: 0.0     # [rad^2] 0 = use ratio threshold
+    odom/gicp/probGate/noiseFloorTrans: 0.0   # [m^2]   0 = use ratio threshold
+    odom/gicp/probGate/confidenceS: 1.0       # signal must exceed s * noise floor
+    odom/gicp/probGate/spread: 1.0            # probit width (log-eigenvalue units)
+
+    # Per-scan IMU-consistency clamp on the TOTAL GICP correction (final pose vs
+    # the IMU-prior initial guess). Complements the degeneracy gate: the gate
+    # only holds the prior on the eigen-directions it flags (and only on the
+    # scans it fires), so on the scans it misses a map-lock "jump" runs away
+    # unbounded. Over one scan the IMU prior is high-confidence, so the
+    # correction (not the motion -- the prior already contains the motion) is
+    # tiny; these caps bound the runaway. 0.0 disables each (default). See
+    # cfg/examples/ouster_tunnel.yaml for tunnel values.
+    odom/gicp/maxCorrTrans: 0.0          # [m]   per-scan correction cap; 0 = off
+    odom/gicp/maxCorrRot: 0.0            # [rad] per-scan correction cap; 0 = off
+
+    # Margin-adaptive clamp: make the caps above TIGHTEN as the geometric trust
+    # margin (Geo Rot/Trans Trust Margin in /diagnostics) degrades, so the
+    # correction is bounded toward the IMU prior exactly where observability
+    # collapses -- e.g. a specular floor dropout removing the vertical/pitch
+    # constraint (the "lean on the IMU when the floor drops" response). The rot
+    # margin scales the rot cap, the trans margin the trans cap. Effective cap =
+    # base * f(margin): f = 1 at margin >= marginHi (healthy), f = floor at
+    # margin <= marginLo (degenerate; margin ~1 is the gate boundary), linear
+    # between. OFF by default -> base caps unchanged (bit-identical). REQUIRES a
+    # base cap (>0 above) and the degeneracy gate on (for the margins).
+    odom/gicp/adaptiveClamp/enabled: false
+    odom/gicp/adaptiveClamp/marginLo: 1.0   # fully tightened at/below this margin
+    odom/gicp/adaptiveClamp/marginHi: 3.0   # base cap at/above this margin
+    odom/gicp/adaptiveClamp/floor: 0.25     # tightest cap fraction at full degeneracy
+
+    # Degeneracy GOVERNOR (fail-safe for the held-prior runaway). The gate above
+    # holds the IMU prior on unobservable eigen-directions; on a long featureless
+    # tunnel that prior dead-reckons (accel/gyro bias double-integrates) into a
+    # km-scale divergence that maxCorrection does NOT catch (it bounds the GICP
+    # correction, not the prior). The governor caps per-scan OUTPUT motion along
+    # the held world-frame directions vs the previous pose to a physical step;
+    # bounding the pose pulls the velocity back through the geometric observer.
+    # maxStep* are per-scan caps (~ platform max speed / scan rate, e.g. 3 m/s at
+    # 10 Hz -> 0.30 m). enabled false / 0 caps -> bit-identical (no behavior change).
+    odom/degenGov/enabled: false
+    odom/degenGov/maxStepTrans: 0.0   # [m]   max per-scan motion along a held trans axis; 0 = off
+    odom/degenGov/maxStepRot: 0.0     # [rad] max per-scan motion about a held rot axis;   0 = off
+    # Covariance inflation: add variance along the held axes so a downstream
+    # consumer de-weights the dead-reckoned directions. 0 = publish the constant
+    # base cov unchanged.
+    odom/degenGov/covPosVar: 0.0      # [m^2]   added along a held position axis
+    odom/degenGov/covRotVar: 0.0      # [rad^2] added along a held rotation axis
+
+    # PHYSICS FUSE (doc/RUNTIME_GUARDS.md): clamp the TOTAL per-scan output step
+    # in ANY direction to a physical bound. The governor above only acts along
+    # axes the gate flagged; the fuse catches gate misses, runaway on an
+    # unflagged axis, and a diverging IMU prior (bad deskew / bias runaway).
+    # With maxStepTrans 1.0 at 10 Hz the published pose can never exceed 10 m/s
+    # -- a takeoff is impossible at the output level by construction. A tripped
+    # scan is flagged in /diagnostics ("Physics Fuse Trips") and vetoes
+    # keyframing. 0 (default) = off, bit-identical.
+    odom/fuse/maxStepTrans: 0.0       # [m]   max per-scan output translation; ~max speed/scan rate
+    odom/fuse/maxStepRot: 0.0         # [rad] max per-scan output rotation
+
+    # SLOSH GUARD (doc/RUNTIME_GUARDS.md): online corkscrew/oscillation detector
+    # -- the offline harness's reversal verdict moved into the estimator. Tracks
+    # the signed per-scan output step along the weak (gate-held) translation
+    # axis; when the sign-flip fraction over the last `window` active steps
+    # crosses engageFrac, the guard engages: extra velocity damping along that
+    # axis (velDamp, the oscillation's flywheel) + keyframe veto, until the
+    # fraction falls below disengageFrac (hysteresis). The tracked axis persists
+    # across scans the gate misses (gate chatter is part of the loop).
+    # /diagnostics: "Slosh Guard Engaged/Reversal Fraction/Activations".
+    # enabled false (default) = bit-identical.
+    odom/slosh/enabled: false
+    odom/slosh/window: 20             # active steps considered
+    odom/slosh/deadband: 0.02         # [m] ignore steps below this (stationary noise)
+    odom/slosh/engageFrac: 0.5        # engage at/above this flip fraction
+    odom/slosh/disengageFrac: 0.25    # disengage at/below this (hysteresis)
+    odom/slosh/minActive: 8           # min active steps before engagement
+    odom/slosh/velDamp: 0.5           # velocity damping along the axis while engaged
+    # Scans the tracked axis survives without the gate flagging one. It must
+    # persist across gate misses (chatter is part of the oscillation), but must
+    # not outlive them: a latched stale axis keeps scoring flips on a
+    # meaningless projection and could engage during healthy operation. Past
+    # this, the axis goes invalid and the evidence window drains one sample per
+    # scan. A materially different axis (>30 deg) resets the evidence outright.
+    odom/slosh/axisHoldScans: 20
+
+    # Term mass-normalization (opt-in). Each residual term accumulates into a
+    # shared information-form Hessian (H += weight * J^T J); for the photometric
+    # and camera terms the accumulated "mass" scales with how many points happen
+    # to be valid that scan, so the tuned weight drifts with scan density and is
+    # not comparable across terms. Setting a RefCount > 0 scales that term's
+    # total mass to a nominal reference count (the same trick the LiDAR-image
+    # term uses internally), making the weight count-independent and stable
+    # run-to-run -- the precondition for comparing/auto-balancing the terms.
+    # 0.0 (default) = OFF (raw mass, bit-identical to before).
+    # IMPORTANT: enabling a RefCount RE-SCALES that term's effective weight
+    # (weight * ref/count), so a previously tuned weight must be re-derived once.
+    # A good starting reference is roughly the term's typical valid-point count
+    # (photometric: ~1000-3000 valid-gradient matches; camera terms: far fewer).
+    odom/gicp/photometricRefCount: 0.0   # photometric term; live-tunable; 0 = off
+    odom/gicp/visualRefCount: 0.0        # frame-to-frame camera term;     0 = off
+    odom/gicp/visualMapRefCount: 0.0     # frame-to-map camera term;       0 = off
+
+    # Photometric (intensity-aided) GICP term. Weight of the photometric
+    # residual relative to the geometric term; 0.0 disables. The channel is
+    # normalized by photometricScale, so the weight is dimensionless. In
+    # featureless environments a higher weight is preferred.
     odom/gicp/photometricWeight: 0.1
+    # Neighbors used to estimate the spatial channel gradient on the submap.
     odom/gicp/gradientKNeighbors: 10
+    # Huber threshold on the normalized photometric residual: residuals beyond
+    # this are downweighted (robust to specular/wet-surface outliers).
+    # 0.05 = ~13 intensity counts at photometricScale 255. <= 0 disables.
+    odom/gicp/photometricHuberDelta: 0.05
 
+    # Adaptive robust kernel on the photometric residual -- Barron, "A General and
+    # Adaptive Robust Loss Function," CVPR 2019 (arXiv:1701.03077), with the
+    # per-iteration shape fit of Chebrolu, Laebe, Vysotska, Behley & Stachniss,
+    # "Adaptive Robust Kernels for Non-Linear Least Squares Problems," IEEE RA-L
+    # 2021 (arXiv:2004.14938). Replaces the fixed Huber above with Barron's loss
+    # whose shape alpha is re-fit each iteration to the residual distribution by
+    # minimizing its negative log-likelihood -- so there is NO hand-tuned kernel
+    # (the original motivation: stop tuning photometric robustness per scene).
+    # alpha is restricted to (0,2]: 2 = L2 (clean), 1 = pseudo-Huber, ->0 = Cauchy
+    # (heavy outliers); the fitted value is published as "Photometric Kernel
+    # Alpha". The Barron weight is FLOORED by the fixed Huber above, so enabling
+    # the kernel can only ADD robustness, never strip it (it falls back to exactly
+    # the Huber at alpha=2). scale is Barron's c: 0 = DATA-DRIVEN (1.4826*MAD of
+    # the residuals each scan, published as "Photometric Kernel Scale"); >0 = a
+    # fixed c. OFF by default -> the fixed Huber, bit-identical. (alpha<0
+    # truncated-loss extension deferred.)
+    # NOTE (2026-06-18 bench): an EARLIER version replaced the Huber and used a
+    # fixed c=photometricHuberDelta > the residual bulk, so alpha pinned at L2 and
+    # stripped protection (-> divergence). The Huber floor + MAD scale above fix
+    # both; still UNBENCHED on the bag after the fix.
+    odom/gicp/adaptiveKernel/enabled: false
+    odom/gicp/adaptiveKernel/alphaLo: 0.5   # most-robust shape the fit may pick
+    odom/gicp/adaptiveKernel/alphaHi: 2.0   # least-robust shape (2 = L2)
+    odom/gicp/adaptiveKernel/scale: 0.0     # Barron c; 0 = data-driven (1.4826*MAD)
+
+    # Photometric channel:
+    #   intensity    - raw return strength (range-dependent); uses the range
+    #                  correction below.
+    #   reflectivity - calibrated reflectivity (e.g. Ouster), already range-
+    #                  normalized; the range correction is skipped automatically.
+    # If the chosen field is absent from the cloud, the node falls back to the
+    # other channel automatically (logged once); the photometric term is disabled
+    # only if neither field is present.
+    odom/gicp/photometricChannel: intensity
+
+    # Full-scale of the photometric channel; the channel is divided by this so
+    # photometricWeight is sensor-independent. 255 covers 8-bit intensity and
+    # Ouster calibrated reflectivity; use 65535 for raw 16-bit channels.
+    odom/gicp/photometricScale: 255.0
+
+    # Intensity range correction (only applied when photometricChannel: intensity)
+    # I_corrected = clamp(I * (r / rRef)^alpha, 0, 255)
+    # intensityAlpha : falloff exponent (2.0 = inverse-square; tune per sensor;
+    #                  the inverse-square model is poor below ~10 m)
+    # intensityRRef  : reference range in metres (anchor; 1.0 is a safe default)
+    odom/preprocessing/intensityAlpha: 2.0
+    odom/preprocessing/intensityRRef: 1.0
+    # Incidence-angle correction (Kashani radiometric model): additionally divide
+    # intensity by max(|beam . surface_normal|, cosMin). Corrects the grazing-angle
+    # darkening of distant ground/wall points that the range model alone leaves
+    # (and which otherwise looks like spurious intensity gradients). Organized
+    # scans only (uses the native grid for cheap normals); off by default.
+    # cosMin floors the divisor to avoid blow-up at grazing angles (0.2 ~= 78 deg).
+    odom/preprocessing/intensityIncidence: false
+    odom/preprocessing/intensityCosMin: 0.2
+
+    # Direct visual (camera) photometric term. Frame-to-frame direct image
+    # alignment using LiDAR depth: constrains the along-axis translation a
+    # featureless tunnel leaves LiDAR-degenerate (re-opens the degeneracy gate
+    # on that axis). OFF by default; needs a camera topic, intrinsics, and the
+    # cam2lidar extrinsic (see dlio.yaml). enabled controls subscription too.
+    odom/visual/enabled: false
+    odom/visual/weight: 0.0          # relative to the geometric GICP term
+    odom/visual/huberDelta: 0.05     # Huber on the normalized residual (<=0 off)
+    odom/visual/maxTimeDiff: 0.05    # max |image - scan| stamp gap to pair [s]
+    # Dense source for the frame-to-frame term: project the full deskewed scan
+    # (strided to maxPoints) instead of the sparse voxelised registration cloud,
+    # to keep a narrow camera FOV populated. OFF -> iterate the registration
+    # cloud (bit-identical). BENCH (2026-06-22, n=12): raised peak population 2.4x
+    # but the camera term is FOV-limited, not density-limited on the 06042026 rig
+    # (median/p90 visual points stayed 0/1), so it did NOT help the tunnel. Kept
+    # as a de-starvation lever for a forward/wide camera. See FINDINGS_2026-06-22.
+    odom/visual/denseSource/enabled: false
+    odom/visual/denseSource/maxPoints: 4000   # stride the dense source down to <= this
+    # Gate safety floor: the gate still detects LiDAR degeneracy from geometry
+    # alone; on a degenerate axis the visual term may drive motion only if it
+    # stiffened that axis, and its total deviation from the IMU prior there is
+    # bounded to these PER-SCAN budgets (summed over LM iterations) so a wrong/
+    # biased constraint can neither diverge nor inflate the path (axes vision
+    # doesn't rescue stay held to the IMU prior).
+    odom/visual/gateMaxStepTrans: 0.3   # [m] per scan
+    odom/visual/gateMaxStepRot: 0.05    # [rad] per scan
+
+    # Frame-to-MAP camera term: anchors absolute position to map landmarks (wall
+    # texture/graffiti) by registering the current image against per-keyframe
+    # reference brightness, breaking the geometric self-similarity that drags the
+    # pose back in a tunnel. Needs odom/visual/enabled too. OFF by default.
+    odom/visual/map/enabled: false
+    odom/visual/map/weight: 0.0
+    odom/visual/map/gateMaxStepTrans: 1.0   # [m] per scan (absolute anchor: larger budget)
+    odom/visual/map/gateMaxStepRot: 0.1     # [rad] per scan
+    odom/visual/map/viewAngleMax: 0.6       # [rad] drop refs whose viewing ray moved more than this
+
+    # COIN-LIO LiDAR intensity-image term: anchors absolute position to wall
+    # texture in the LiDAR reflectivity image (360deg coverage; reuses the
+    # absolute-anchor gate budget above). Needs an organized scan. OFF by default.
+    odom/lidar_image/enabled: false
+    odom/lidar_image/weight: 0.0
+    # Keyframe-image references (doc/INTENSITY_AUDIT_2026-07-09.md): the map
+    # term's reference normally comes from the target point's .reflectivity
+    # field, which is voxel-AVERAGED (0.25m leaf) -- graffiti-scale texture is
+    # blurred away before the residual sees it. imageRefs samples each
+    # keyframe's FULL-RES image per point at keyframe creation instead.
+    # false (default) = field reference, bit-identical.
+    odom/lidar_image/imageRefs: false
+    odom/lidar_image/rangeAbsTol: 0.5   # occlusion: absolute range tol [m] for a projected map point
+    odom/lidar_image/rangeRelTol: 0.1   # occlusion: relative range tol (fraction of pixel range)
+
+    # Condition-scaled directional weighting: boost the LiDAR-map term along the
+    # geometrically-weak (degenerate) axes so it can clear the gate's rescue bar
+    # there, instead of an isotropic scalar weight (which the bench proved can
+    # never move the term's mass onto the weak axis; doc/REVIEW.md #8). OFF ->
+    # the term accumulates directly (bit-identical). BENCH (2026-06-22, n=12): the
+    # mechanism works (it rescues the axis) but on this rig it TRIPLED divergence
+    # (2->6) -- reflectivity in a uniform tunnel is along-axis aliased, so forcing
+    # the term onto the weak axis drives it WRONG. Kept as a literature-backed
+    # scaffold for a rig whose intensity image carries real along-axis texture.
+    odom/lidar_image/condScale/enabled: false
+    odom/lidar_image/condScale/power: 1.0   # exponent on (lambda_max/lambda_k) per eigen-direction
+    odom/lidar_image/condScale/cap: 50.0    # max per-direction boost (alpha)
+
+    # Direction-SEPARATED LiDAR fusion (LOFF-style; doc/EXPLORATION_2026-06-26.md
+    # #2). Restrict the LiDAR-map term to the geometrically-weak (degenerate)
+    # subspace so it can ONLY move the unobservable axis and cannot perturb the
+    # well-observed ones (the opposite knob to condScale; composes with it). A
+    # fully-observed scan suppresses the term entirely. enabled false (default) =
+    # term added in full, bit-identical.
+    odom/lidar_image/dirSeparated/enabled: false
+    odom/lidar_image/dirSeparated/ratio: 0.05   # weak-subspace bar (fraction of lambda_max, per block)
+
+    # Frame-to-FRAME LiDAR flow term (doc/EXPLORATION_2026-06-26.md #2). Registers
+    # the current scan against the PREVIOUS scan's image to observe the along-tunnel
+    # motion the frame-to-map reflectivity term can't (aliased). Pairs with
+    # dirSeparated so it only constrains the degenerate axis. weight 0 (default) =
+    # off / bit-identical.
+    odom/lidar_image/flow/enabled: false
+    odom/lidar_image/flow/weight: 0.0   # count-normalized; comparable to lidar_image/weight
+    # Flow reference mode (doc/INTENSITY_AUDIT_2026-07-09.md). imageRef true
+    # (default): the reference brightness is sampled from the CURRENT scan's
+    # full-resolution image at the point's prior-pose projection, so BOTH sides of
+    # the residual carry pre-voxel texture (the 0.25m voxel average destroys
+    # graffiti-scale strokes; the point's .reflectivity field is post-voxel).
+    # false = legacy point-field reference (bit-identical to the original term).
+    # patch: half-width of the zero-mean (2P+1)^2 window compared per point
+    # (COIN-LIO-style patches; 0 = single pixel; clamped to [0,3]).
+    odom/lidar_image/flow/imageRef: true
+    odom/lidar_image/flow/patch: 0
+
+    # GenZ-ICP adaptive point-to-plane / point-to-point blend (Lee et al., RA-L
+    # 2025). On an ill-conditioned scan (geometric translation lambda_min/lambda_max
+    # < knee) mix an isotropic point-to-point metric into the GICP cost to
+    # regularize the unconstrained tunnel axis; healthy scans stay pure
+    # point-to-plane. floor 1 (default) = blend OFF (bit-identical); ~0.5 = up to a
+    # 50/50 worst case. pointWeight [1/m^2] ~ the plane metric's typical eigenvalue.
+    odom/genz/enabled: false
+    odom/genz/floor: 1.0            # smallest point-to-plane weight alpha in [0,1] (1 = off)
+    odom/genz/knee: 0.1            # lambda_min/lambda_max below which point-to-point mixes in
+    odom/genz/pointWeight: 1.0     # isotropic point-to-point metric weight [1/m^2]
+
+    # X-ICP ternary localizability gate (Tuna et al., T-RO 2024). Adds a
+    # controlled partial-admit band between the degeneracy bar
+    # (degeneracyThreshRatio*lambda_max, prior held) and a looser localizable bar
+    # (fullRatio*lambda_max, fully trusted); in between the data update is admitted
+    # linearly. Replaces the soft/prob keep-fraction when on. enabled false
+    # (default) = the existing binary/soft gate (bit-identical).
+    odom/xicp/ternaryEnabled: false
+    odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); > degeneracyThreshRatio
+    # Partial-band admission budget (2026-07-08 runaway fix): per-scan cap on the
+    # cumulative motion the ternary gate's partial band may admit along marginal
+    # axes -- fail-bounded instead of fail-open when the marginal-band signal is
+    # dishonest (aliased photometric drive / contaminated map locks). 0 (default)
+    # = unbudgeted (pre-budget behavior). Deploy with the governor caps (~0.15/0.05).
+    odom/xicp/partialBudgetTrans: 0.0   # [m]  per scan; 0 = unbudgeted
+    odom/xicp/partialBudgetRot: 0.0     # [rad] per scan; 0 = unbudgeted
+
+    # Saliency-weighted point selection (anti-dilution). Up-weight rare salient
+    # source points (edges/ribs/corners, from the local covariance shape) by up to
+    # `boost` so the abundant planar walls don't swamp the weak along-axis DOF;
+    # planar points stay at weight 1. boost 1 (default) = off / unit weights /
+    # bit-identical (and the per-point saliency eigendecomposition is skipped).
+    # See doc/EXPLORATION_2026-06-26.md #1.
+    odom/saliency/enabled: false
+    odom/saliency/boost: 1.0       # weight of a maximally-salient point (e.g. 4 = up to 4x)
+
+    # Image channel + normalization (2026-06-22). The per-point image slot is
+    # filled from this cloud field; near-IR/ambient carries ~100x reflectivity's
+    # dynamic range (mean ~645 vs ~19) and real wall texture, but is shot-noise-
+    # dominated per pixel -> pair it with denoiseKernel. Default reflectivity +
+    # scale 255 + denoise off is bit-identical to prior behavior. BENCH
+    # (2026-06-22): denoise fixes the shot noise (temporal ratio 1.60->0.52) but
+    # the isotropic term still never rescues the axis (the binding constraint is
+    # rescue-bar dilution, not channel quality). Untested: near-IR + condScale.
+    odom/lidar_image/channel: reflectivity   # 'reflectivity' | 'intensity' | 'ambient' (near-IR)
+    odom/lidar_image/scale: 255.0            # channel full-scale (reflectivity ~255, near-IR ~thousands)
+    odom/lidar_image/denoiseKernel: 0        # KxK box-blur of the image channel (<=1 = off)
+
+    # Diagonal covariance stamped on the published nav_msgs/Odometry
+    # [x, y, z, roll, pitch, yaw] -- position [m^2], orientation [rad^2].
+    # Constant and intentionally conservative; tune for your fusion stack
+    # (robot_localization etc.).
+    odom/covariance/pose:  [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
+    odom/covariance/twist: [0.01, 0.01, 0.01, 0.0025, 0.0025, 0.0025]
+
+    # Terminal status dashboard (ANSI clear-screen UI). Disable when logs are
+    # multiplexed (ros2 launch with multiple nodes, containers, systemd).
+    # The composed launch file disables it automatically.
+    odom/debug/dashboard: true
+
+    # Hierarchical geometric observer gains (Lopez, arXiv:2303.02777):
+    # position / velocity / orientation correction gains and accel/gyro bias
+    # adaptation gains with clamps. The defaults satisfy the paper's gain
+    # hierarchy; retune as a set, not individually.
     odom/geo/Kp: 4.5
     odom/geo/Kv: 11.25
     odom/geo/Kq: 4.0
     odom/geo/Kab: 2.25
     odom/geo/Kgb: 1.0
-    odom/geo/abias_max: 5.0
-    odom/geo/gbias_max: 0.5
-
-    # Intensity range correction
-    # intensityAlpha : falloff exponent (2.0 = inverse-square; tune per sensor)
-    # intensityRRef  : reference range in metres (anchor; 1.0 is a safe default)
-    odom/preprocessing/intensityAlpha: 2.0
-    odom/preprocessing/intensityRRef: 1.0
-
+    # LODESTAR-flavored degeneracy-aware observer gain (default 1 = off). On the
+    # gate's held-degenerate axes, scale the LiDAR pose correction by this factor
+    # so the state rides the IMU prior there (0 = fully freeze the axis, the
+    # reduced-gain "fixed" state; 1 = full trust / bit-identical). Pairs with the
+    # governor cov inflation. See doc/EXPLORATION_2026-06-26.md.
+    odom/geo/degenObsGain: 1.0
+    # Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): along a held-degenerate
+    # axis the registration supplies no correction, so the observer's velocity
+    # state free-integrates IMU error and powers both the dead-reckon runaway
+    # and the slosh limit cycle (the reason dliio twist is not fused downstream,
+    # doc/FUSION_ARCHITECTURE.md). Damp the along-axis velocity component by
+    # this factor per held scan: v_along *= (1 - damp). Cross-axis velocity is
+    # untouched. 0 (default) = off, bit-identical; 1 = zero it while held.
+    odom/geo/degenVelDamp: 0.0
+    odom/geo/abias_max: 5.0   # [m/s^2]
+    odom/geo/gbias_max: 0.5   # [rad/s]

@@ -13,35 +13,62 @@
 cmake_minimum_required(VERSION 3.12.4)
 project(direct_lidar_inertial_odometry)
 
-set(CMAKE_BUILD_TYPE "Release")
+# Default to Release but respect whatever the user/colcon asked for
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
 set(CMAKE_CXX_STANDARD 17)
+
+# Reproducible sanitizer builds:  colcon build --cmake-args -DDLIIO_SANITIZE=address
+# Accepts: address (ASan+UBSan), thread (TSan), or undefined (UBSan only).
+# For TSan, also force single-threaded OpenMP at runtime (OMP_NUM_THREADS=1) to
+# avoid false positives from the OpenMP runtime; the node's own callback threads
+# are what TSan should observe.
+set(DLIIO_SANITIZE "" CACHE STRING "Sanitizer: address|thread|undefined (empty=off)")
+if(DLIIO_SANITIZE STREQUAL "address")
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,undefined)
+elseif(DLIIO_SANITIZE STREQUAL "thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=thread)
+elseif(DLIIO_SANITIZE STREQUAL "undefined")
+  add_compile_options(-fsanitize=undefined -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=undefined)
+endif()
 set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 
-# Find packages first
+# ROS deps are pulled from package.xml; non-ROS deps found explicitly below.
+find_package(ament_cmake_auto REQUIRED)
+# VTK::jsoncpp (pulled transitively via PCL/pcl_ros) lists JsonCpp::JsonCpp in its
+# link interface but VTK doesn't find_package(jsoncpp) itself — define the imported
+# target first so VTK-targets.cmake resolves it.
+find_package(jsoncpp REQUIRED)
+ament_auto_find_build_dependencies()
+
 find_package(rosidl_default_generators REQUIRED)
-find_package(ament_cmake REQUIRED)
-find_package(rclcpp REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
-find_package(pcl_ros REQUIRED)
-find_package(tf2_ros REQUIRED)
-find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io registration kdtree search features surface filters)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
+# OpenCV: direct visual photometric residual (nano_gicp) + image undistort (odom)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 
-# OpenMP
-include(FindOpenMP)
-if(OPENMP_FOUND)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-  set(OpenMP_LIBS gomp)
+# Optional: raw Livox CustomMsg ingestion. Only built when livox_ros_driver2 is
+# present in the workspace; without it the node consumes Livox data already in
+# PointCloud2 form (the default), so this is NOT a required build dependency.
+find_package(livox_ros_driver2 QUIET)
+if(livox_ros_driver2_FOUND)
+  message(STATUS "livox_ros_driver2 found: enabling raw Livox CustomMsg ingestion.")
 else()
-  message(WARNING "OpenMP could not be found.")
+  message(STATUS "livox_ros_driver2 not found: Livox CustomMsg ingestion disabled "
+                 "(feed Livox as PointCloud2 instead).")
+endif()
+
+# OpenMP via the imported target (carries compile options and link flags to
+# every dependent instead of mutating global CMAKE_*_FLAGS)
+find_package(OpenMP)
+if(NOT OpenMP_CXX_FOUND)
+  message(WARNING "OpenMP could not be found; building single-threaded.")
 endif()
 
 # CPUID test
@@ -64,85 +91,192 @@ rosidl_generate_interfaces(
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} rosidl_typesupport_cpp)
 
-# Include directories
-include_directories(include)
+# Include directories (project headers are target-scoped; see below)
 include_directories(${PCL_INCLUDE_DIRS})
 include_directories(${EIGEN3_INCLUDE_DIR})
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 link_directories(${PCL_LIBRARY_DIRS})
 add_definitions(${PCL_DEFINITIONS})
 
 # NanoFLANN
+# (PIC: linked into the shared component library)
 add_library(nanoflann STATIC src/nano_gicp/nanoflann.cc)
+set_target_properties(nanoflann PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nanoflann PRIVATE PCL_NO_PRECOMPILE)
 target_include_directories(nanoflann PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(nanoflann PUBLIC ${PCL_LIBRARIES})
+target_link_libraries(nanoflann ${PCL_LIBRARIES})
 
 # NanoGICP
 add_library(nano_gicp STATIC
-  src/nano_gicp/lsq_registration.cc
   src/nano_gicp/nano_gicp.cc
 )
+set_target_properties(nano_gicp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nano_gicp PRIVATE PCL_NO_PRECOMPILE)
 target_include_directories(nano_gicp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(nano_gicp PUBLIC
+target_link_libraries(nano_gicp
   nanoflann
   ${PCL_LIBRARIES}
-  ${OpenMP_LIBS}
+  ${OpenCV_LIBS}
+  $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 
-# Odometry Node
-add_executable(dlio_odom_node src/dlio/odom_node.cc src/dlio/odom.cc)
-target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_odom_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_odom_node
+# Component library: both nodes, loadable into a component container for
+# intra-process communication; the classic executables link it too.
+ament_auto_add_library(dlio_components SHARED
+  src/dlio/odom.cc
+  src/dlio/map.cc
+  src/dlio/components.cc
+)
+target_compile_definitions(dlio_components PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_components
   nano_gicp
   Threads::Threads
   ${PCL_LIBRARIES}
-)
-ament_target_dependencies(dlio_odom_node
-  tf2_ros
-  pcl_ros
-  nav_msgs
-  pcl_conversions
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-)
-
-# Mapping Node
-add_executable(dlio_map_node src/dlio/map_node.cc src/dlio/map.cc)
-target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
-target_compile_options(dlio_map_node PRIVATE ${OpenMP_CXX_FLAGS})
-target_link_libraries(dlio_map_node
-  ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
 )
-ament_target_dependencies(dlio_map_node
-  tf2_ros
-  pcl_ros
-  pcl_conversions
-  rclcpp
-)
+if(livox_ros_driver2_FOUND)
+  # PRIVATE: only odom.cc compiles the Livox path; odom.h stays livox-free so the
+  # OdomNode layout is identical for every translation unit (no ODR mismatch).
+  target_compile_definitions(dlio_components PRIVATE HAVE_LIVOX_ROS_DRIVER2)
+  # ament_target_dependencies was removed in Rolling/Lyrical. livox_ros_driver2
+  # is a rosidl message package (CustomMsg/CustomPoint), so link its modern
+  # _TARGETS and include the legacy _INCLUDE_DIRS; each is a no-op when undefined,
+  # so this works Humble..Lyrical. Plain signature to match the
+  # target_link_libraries above (CMake forbids mixing keyword/plain styles).
+  target_link_libraries(dlio_components ${livox_ros_driver2_TARGETS})
+  target_include_directories(dlio_components PRIVATE ${livox_ros_driver2_INCLUDE_DIRS})
+endif()
+rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
-# Export
-ament_export_include_directories(include)
-ament_export_libraries(${PROJECT_NAME} nano_gicp nanoflann)
-ament_export_dependencies(rclcpp std_msgs sensor_msgs geometry_msgs pcl_ros)
+# Standalone executables
+ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc)
+target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_odom_node dlio_components)
 
-# Install
-install(TARGETS dlio_odom_node dlio_map_node
-  DESTINATION lib/${PROJECT_NAME}
-)
+ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc)
+target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
+target_link_libraries(dlio_map_node dlio_components)
 
 install(DIRECTORY cfg launch
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_package()
+# Tests
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
+  target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_nano_gicp
+    nano_gicp
+    ${PCL_LIBRARIES}
+  )
+
+  ament_add_gtest(test_imu_integration test/test_imu_integration.cpp)
+  target_compile_definitions(test_imu_integration PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_imu_integration
+    dlio_components
+  )
+
+  ament_add_gtest(test_kdtree test/test_kdtree.cpp)
+  target_compile_definitions(test_kdtree PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_kdtree
+    nano_gicp
+    ${PCL_LIBRARIES}
+  )
+
+  ament_add_gtest(test_degeneracy_governor test/test_degeneracy_governor.cpp)
+  target_compile_definitions(test_degeneracy_governor PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_degeneracy_governor
+    dlio_components
+  )
+
+  ament_add_gtest(test_degeneracy_observer test/test_degeneracy_observer.cpp)
+  target_compile_definitions(test_degeneracy_observer PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_degeneracy_observer
+    dlio_components
+  )
+
+  ament_add_gtest(test_elevation_lut test/test_elevation_lut.cpp)
+  target_compile_definitions(test_elevation_lut PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_elevation_lut
+    dlio_components
+  )
+
+  ament_add_gtest(test_physics_fuse test/test_physics_fuse.cpp)
+  target_compile_definitions(test_physics_fuse PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_physics_fuse
+    dlio_components
+  )
+
+  ament_add_gtest(test_slosh_guard test/test_slosh_guard.cpp)
+  target_compile_definitions(test_slosh_guard PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_slosh_guard
+    dlio_components
+  )
+
+  ament_add_gtest(test_genz_weight test/test_genz_weight.cpp)
+  target_compile_definitions(test_genz_weight PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_genz_weight
+    dlio_components
+  )
+
+  ament_add_gtest(test_xicp_localizability test/test_xicp_localizability.cpp)
+  target_compile_definitions(test_xicp_localizability PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_xicp_localizability
+    dlio_components
+  )
+
+  ament_add_gtest(test_saliency_weight test/test_saliency_weight.cpp)
+  target_compile_definitions(test_saliency_weight PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_saliency_weight
+    dlio_components
+  )
+
+  ament_add_gtest(test_intensity test/test_intensity.cpp)
+  target_compile_definitions(test_intensity PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_intensity
+    dlio_components
+  )
+
+  ament_add_gtest(test_sensor_detection test/test_sensor_detection.cpp)
+  target_compile_definitions(test_sensor_detection PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_sensor_detection
+    dlio_components
+  )
+
+  ament_add_gtest(test_visual_residual test/test_visual_residual.cpp)
+  target_compile_definitions(test_visual_residual PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_visual_residual
+    nano_gicp
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+
+  # Live-node concurrency / TSan harness (longer; generous timeout).
+  ament_add_gtest(test_node_concurrency test/test_node_concurrency.cpp TIMEOUT 120)
+  target_compile_definitions(test_node_concurrency PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_node_concurrency
+    dlio_components
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+
+  # End-to-end pipeline: accuracy regression, feature behavior, perf smoke
+  # (drives a real node; longer wall-clock, generous timeout).
+  ament_add_gtest(test_pipeline test/test_pipeline.cpp TIMEOUT 180)
+  target_compile_definitions(test_pipeline PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_pipeline
+    dlio_components
+    ${PCL_LIBRARIES}
+    ${OpenCV_LIBS}
+  )
+endif()
+
+ament_auto_package()

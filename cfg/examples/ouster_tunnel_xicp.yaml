@@ -1,0 +1,40 @@
+# EXAMPLE: X-ICP ternary localizability gate for the tunnel (06042026), the
+# n=24-VALIDATED prevention. Default-off elsewhere. (2026-06-25,
+# results/SESSION_2026-06-25_xicp_ternary_validated_n24.md in the test harness.)
+#
+# Premise: the binary degeneracy gate's on/off chatter on the marginal
+# along-tunnel / yaw axis SEEDS the deg=6 collapse. X-ICP's ternary gate adds a
+# partial-admit band between the hard-degenerate bar (degeneracyThreshRatio *
+# lambda_max = 0.005) and a looser localizable bar (fullRatio * lambda_max =
+# 0.05): inside the band the axis takes a CONTROLLED partial update instead of
+# flipping fully held/admitted, which stops the chatter that starts the runaway.
+#
+# Validated (n=24, near-IR substrate, paired fresh binary): base 7/24 DIV (deg
+# max 6, worst 11.9 km) -> X-ICP 0/23 clean DIV (deg max 1, worst 212 m slosh);
+# Fisher one-sided p=0.0055. PM reproduction on a fresh --no-cache stack came out
+# ~2/24 DIV (the "0" was somewhat lucky) but still robustly beats base 7/24 — the
+# effect is real and large. PREVENTS the collapse, vs the governor which only
+# BOUNDS it after it starts; the two compose (see ouster_tunnel_governor.yaml; the
+# partial-band-recording fix at dliio 0cac829 makes the governor cap the
+# partially-admitted axes too).
+#
+# Overlay ON TOP of ouster_tunnel.yaml (+ ouster_06042026_extrinsics.yaml, and the
+# lidarimg/near-IR overlays if matching the validated substrate). fullRatio=0.05
+# beat 0.02 in the screen (tighter worst-case, deg never exceeded 1).
+#
+# 2026-07-09: the base ouster_tunnel.yaml changed photometricWeight 0.3 -> 0.0
+# (doc/INTENSITY_AUDIT_2026-07-09.md). This MATCHES the validated substrate:
+# the n=24 runs above were on the near-IR stack, whose overlay already forced
+# photometricWeight 0 — so the validation numbers carry over unchanged.
+
+/**:
+  ros__parameters:
+    odom/xicp/ternaryEnabled: true
+    odom/xicp/fullRatio: 0.05      # localizable bar (fraction of lambda_max); n=24-validated
+    # Fail-bounded partial band (2026-07-08 runaway fix): budget the per-scan
+    # partial-band admissions to the governor's physical caps. Set to 0.0 to
+    # reproduce the pre-budget (fail-open) behavior for A/B.
+    odom/xicp/partialBudgetTrans: 0.15   # [m]  per scan
+    odom/xicp/partialBudgetRot: 0.05     # [rad] per scan
+    # Anti map-contamination (tunnel-slosh fix): don't keyframe a sloshing pose.
+    odom/keyframe/degenGate: true

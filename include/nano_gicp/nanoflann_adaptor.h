@@ -44,6 +44,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <memory>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -128,20 +129,12 @@ void KdTreeFLANN<PointT>::setSortedResults(bool sorted)
   _params.sorted = sorted;
 }
 
-template <typename PointT> inline
-void KdTreeFLANN<PointT>::setInputCloud(const KdTreeFLANN<PointT>::PointCloudConstPtr &cloud,
-                                         const IndicesConstPtr &indices)
+template<typename PointT> inline
+void KdTreeFLANN<PointT>::setInputCloud(const KdTreeFLANN::PointCloudConstPtr &cloud,
+                                        const IndicesConstPtr &indices)
 {
   _adaptor.pcl = cloud;
   _adaptor.indices = indices;
-
-  // FIX: guard against building an index over an empty cloud, which some
-  // nanoflann versions handle inconsistently and can leave the tree in an
-  // unusable state for subsequent nearestKSearch calls.
-  const size_t n = indices ? indices->size() : (cloud ? cloud->points.size() : 0);
-  if (n == 0) {
-    return;
-  }
   _kdtree.buildIndex();
 }
 
@@ -159,26 +152,24 @@ int KdTreeFLANN<PointT>::nearestKSearch(const PointT &point, int num_closest,
   return resultSet.size();
 }
 
-template <typename PointT> inline
+template<typename PointT> inline
 int KdTreeFLANN<PointT>::radiusSearch(const PointT &point, double radius,
-                                       std::vector<int> &k_indices,
-                                       std::vector<float> &k_sqr_distances) const
+                              std::vector<int> &k_indices,
+                              std::vector<float> &k_sqr_distances) const
 {
-  // FIX: was `static` — shared across all threads/calls, causing a data race
-  // if radiusSearch is ever invoked concurrently (e.g. from an OpenMP loop).
-  std::vector<std::pair<int,float>> indices_dist;
+  std::vector<std::pair<int, float> > indices_dist;
   indices_dist.reserve( 128 );
 
-  RadiusResultSet<float,int> resultSet(radius, indices_dist);
+  RadiusResultSet<float, int> resultSet(radius, indices_dist);
   const size_t nFound = _kdtree.findNeighbors(resultSet, point.data, _params);
 
   if (_params.sorted)
-    std::sort(indices_dist.begin(), indices_dist.end(), IndexDist_Sorter());
+    std::sort(indices_dist.begin(), indices_dist.end(), IndexDist_Sorter() );
 
   k_indices.resize(nFound);
   k_sqr_distances.resize(nFound);
   for (size_t i = 0; i < nFound; i++) {
-    k_indices[i] = indices_dist[i].first;
+    k_indices[i]       = indices_dist[i].first;
     k_sqr_distances[i] = indices_dist[i].second;
   }
   return nFound;
@@ -191,15 +182,16 @@ size_t KdTreeFLANN<PointT>::PointCloud_Adaptor::kdtree_get_point_count() const {
   return 0;
 }
 
-template <typename PointT> inline
+template<typename PointT> inline
 float KdTreeFLANN<PointT>::PointCloud_Adaptor::kdtree_get_pt(const size_t idx, int dim) const{
   const PointT& p = ( indices ) ? pcl->points[(*indices)[idx]] : pcl->points[idx];
   if (dim==0) return p.x;
   else if (dim==1) return p.y;
   else if (dim==2) return p.z;
-  // FIX: was silent `return 0.0` — assert instead so misconfigured
-  // dimensionality fails loudly rather than corrupting search results.
-  assert(false && "kdtree_get_pt: dim out of range, expected 0/1/2 for 3D point cloud");
+  // A 3-D adaptor is only ever queried with dim in {0,1,2}; anything else is a
+  // caller bug. Fail loudly in debug/sanitizer builds instead of silently
+  // returning 0 and corrupting the search results.
+  assert(false && "kdtree_get_pt: dim out of range, expected 0/1/2 for a 3-D point cloud");
   return 0.0;
 }
 

@@ -1,0 +1,27 @@
+# EXAMPLE: saliency-weighted point selection (anti-dilution, EXPLORATION #1, the
+# top pick). Default-off elsewhere. (2026-06-26, doc/SALIENCY_WEIGHTING.md +
+# doc/EXPLORATION_2026-06-26.md.)
+#
+# Premise: in a tunnel the geometric GICP cost is dominated by abundant, redundant
+# PLANAR WALL points whose normals are perpendicular to the tunnel axis and add
+# nothing to the along-axis DOF; the rare SALIENT points (ribs, bolts, junction
+# boxes, flanges) that actually constrain it get swamped. This up-weights salient
+# points (saliency = 1 - planarity, from the per-point covariance eigen-shape) by
+# up to `boost`, leaving planar walls at weight 1 — concentrating the term's mass
+# where the weak-axis information is. Attacks the DILUTION root cause inside the
+# geometric term itself, not via another auxiliary observation (all of which were
+# A/B-negative). boost=1 -> unit weights, bit-identical, saliency calc skipped.
+#
+# Overlay ON TOP of the validated stack (ouster_tunnel.yaml +
+# ouster_06042026_extrinsics.yaml + ouster_tunnel_xicp.yaml; the X-ICP gate
+# decides WHICH directions to trust, this decides WHICH points inform them).
+#
+# UNVALIDATED on the tunnel. Sweep boost via EXTRA_PARAMS, start low and watch for
+# over-boosting noisy/sparse salient returns:
+#   EXTRA_PARAMS="odom/saliency/boost=2.0"   (then 4.0, 8.0)
+# Read deg=6 rate and worst-case max|x| vs the X-ICP-only baseline at n>=24.
+
+/**:
+  ros__parameters:
+    odom/saliency/enabled: true
+    odom/saliency/boost: 2.0       # weight of a maximally-salient point; sweep {2,4,8}
