@@ -1,0 +1,26 @@
+# Build context for docker/Dockerfile (built from the repository root).
+.git
+.github
+.gitignore
+
+# colcon / cmake outputs from host builds
+build/
+build_*/
+install/
+install_*/
+log/
+**/CMakeCache.txt
+**/CMakeFiles/
+
+# Recorded data never belongs in the image
+**/*.bag
+**/*.db3
+**/*.mcap
+**/*.pcd
+bags/
+
+# Editor / OS noise
+**/.vscode/
+**/.idea/
+**/*.swp
+**/.DS_Store

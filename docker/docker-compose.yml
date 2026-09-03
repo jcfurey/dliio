@@ -1,0 +1,105 @@
+# docker/docker-compose.yml -- build, test, and run dliio in ROS 2 containers.
+# Run every command from the repository root:
+#
+#   docker compose -f docker/docker-compose.yml build dlio        # runtime image
+#   docker compose -f docker/docker-compose.yml build test        # build + colcon test (gate)
+#   docker compose -f docker/docker-compose.yml build asan        # ASan/UBSan subset (CI hard gate)
+#   docker compose -f docker/docker-compose.yml build tsan        # TSan concurrency harness
+#
+#   POINTCLOUD_TOPIC=/ouster/points IMU_TOPIC=/ouster/imu BAG=run_01 \
+#     docker compose -f docker/docker-compose.yml --profile bag up dlio bag
+#
+# Optional environment knobs:
+#   ROS_DISTRO (jazzy)  ROS_IMAGE_FLAVOR (ros-base|perception)  SKIP_ROSDEP (0|1)
+#   CMAKE_BUILD_TYPE (Release)  ROS_DOMAIN_ID (0)  RMW_IMPLEMENTATION (rmw_fastrtps_cpp)
+#   POINTCLOUD_TOPIC  IMU_TOPIC  USE_SIM_TIME (true)  ROBOT_CONFIG  PARAMS_FILE
+#   DLIIO_BAG_DIR (../bags)  DLIIO_OUT_DIR (../out)  BAG  BAG_RATE (1.0)
+
+x-build-args: &build-args
+  ROS_DISTRO: ${ROS_DISTRO:-jazzy}
+  ROS_IMAGE_FLAVOR: ${ROS_IMAGE_FLAVOR:-ros-base}
+  SKIP_ROSDEP: ${SKIP_ROSDEP:-0}
+  CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE:-Release}
+
+x-runtime: &runtime
+  network_mode: host   # DDS discovery/multicast with the host's ROS 2 graph
+  ipc: host            # Fast DDS shared-memory transport between host and container
+  environment:
+    ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+  volumes:
+    - ../cfg:/cfg:ro                         # edit cfg/*.yaml on the host, no rebuild
+    - ${DLIIO_BAG_DIR:-../bags}:/bags:ro     # ros2 bag directories
+    - ${DLIIO_OUT_DIR:-../out}:/out          # /save_pcd target (must be absolute in-container)
+
+services:
+
+  # --- runtime image + the odometry/map launch -------------------------------
+  dlio:
+    <<: *runtime
+    image: dliio:${ROS_DISTRO:-jazzy}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: runtime
+      args: *build-args
+    command:
+      - ros2
+      - launch
+      - direct_lidar_inertial_odometry
+      - dlio.launch.py
+      - use_sim_time:=${USE_SIM_TIME:-true}
+      - pointcloud_topic:=${POINTCLOUD_TOPIC:-/ouster/points}
+      - imu_topic:=${IMU_TOPIC:-/ouster/imu}
+      - robot_config:=${ROBOT_CONFIG:-/cfg/dlio.yaml}
+      - params_file:=${PARAMS_FILE:-/cfg/params.yaml}
+
+  # --- bag replay next to it (profile: bag) ----------------------------------
+  # ros2 bag play with --clock so the node's use_sim_time:=true clock follows the bag.
+  bag:
+    <<: *runtime
+    image: dliio:${ROS_DISTRO:-jazzy}
+    profiles: [bag]
+    depends_on: [dlio]
+    command:
+      - ros2
+      - bag
+      - play
+      - /bags/${BAG:-set_BAG_to_a_directory_under_DLIIO_BAG_DIR}
+      - --clock
+      - --rate
+      - ${BAG_RATE:-1.0}
+
+  # --- build-only services: `docker compose build <name>` runs the stage -----
+  test:
+    image: dliio:${ROS_DISTRO:-jazzy}-test
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: test
+      args: *build-args
+    command: ["colcon", "test-result", "--verbose"]
+
+  asan:
+    image: dliio:${ROS_DISTRO:-jazzy}-asan
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: sanitize
+      args:
+        <<: *build-args
+        CMAKE_BUILD_TYPE: RelWithDebInfo
+        DLIIO_SANITIZE: address
+    command: ["src/direct_lidar_inertial_odometry/docker/run-sanitized-tests.sh"]
+
+  tsan:
+    image: dliio:${ROS_DISTRO:-jazzy}-tsan
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: sanitize
+      args:
+        <<: *build-args
+        CMAKE_BUILD_TYPE: RelWithDebInfo
+        DLIIO_SANITIZE: thread
+    command: ["src/direct_lidar_inertial_odometry/docker/run-sanitized-tests.sh"]

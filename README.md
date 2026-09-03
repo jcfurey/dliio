@@ -166,6 +166,19 @@ cd ~/ros2_ws
 colcon build --symlink-install --packages-select direct_lidar_inertial_odometry
 ```
 
+#### Docker
+
+No ROS 2 on the machine? `docker/` reproduces the CI build in a container
+(`ros:jazzy-ros-base` + `rosdep` + `colcon`), including the full test suite,
+the sanitizer runs, and a compose file for bag replay:
+
+```sh
+docker build -f docker/Dockerfile --target test .          # build + colcon test
+docker compose -f docker/docker-compose.yml build dlio     # runtime image
+```
+
+See [`docker/README.md`](docker/README.md) for bag replay, build arguments, and the air-gapped (`perception` + `SKIP_ROSDEP=1`) path.
+
 ### Execution
 
 <details>

@@ -1,0 +1,43 @@
+name: Docker
+
+# Keeps docker/Dockerfile honest: builds the `test` target (colcon build +
+# colcon test inside the image). The native jobs in ci.yml remain the primary
+# gate, so this only runs when the container definition or the package's
+# build inputs change, or on demand.
+on:
+  push:
+    branches: [master, lyrical]
+    paths:
+      - 'docker/**'
+      - '.dockerignore'
+      - 'CMakeLists.txt'
+      - 'package.xml'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    paths:
+      - 'docker/**'
+      - '.dockerignore'
+      - 'CMakeLists.txt'
+      - 'package.xml'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-test-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image and run colcon test inside it
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: test
+          push: false
+          build-args: |
+            ROS_DISTRO=jazzy
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

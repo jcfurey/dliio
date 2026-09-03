@@ -1,0 +1,22 @@
+# colcon / cmake build products
+build/
+build_*/
+install/
+install_*/
+log/
+
+# Local data used by the docker compose workflow (see docker/README.md)
+bags/
+out/
+
+# Recorded data / exported maps
+*.bag
+*.db3
+*.mcap
+*.pcd
+
+# Editor & OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
