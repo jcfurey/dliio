@@ -1,6 +1,6 @@
 # 0705 tunnel texture and timing review
 
-Base: `fda3109` on `cam-dev`. Changes are isolated on `fix/ouster-field-sweep`.
+Base: `fda3109` on `cam-dev`. The reviewed changes are integrated into `cam-dev`.
 Dataset: `07052026_4_an`, OS-1-64-U13, 1024 × 64 at 10 Hz,
 `RNG19_RFL8_SIG16_NIR16`, recorded 2026-07-05.
 
@@ -73,6 +73,10 @@ The workspace helpers `scripts/dliio_ouster_cache.py`,
 `scripts/dliio_analyze_cache_sweep.py` retain the inputs, executable/library hashes,
 parameters, per-scan poses, costs, and run outcomes under
 `results/dliio_ouster_sweep_2026-09-05/`.
+
+The workspace launcher is `scripts/dliio_0705_rviz.sh start` (`stop` and `status`
+are also supported). It uses the workspace installation and stores runtime data
+under `results/dliio_0705_rviz`; no temporary checkout or overlay is required.
 
 The cache contains 5,511 complete scans and 69,062 IMU samples. Fifteen partial
 frames are recorded as excluded. A decoded frame matched a ROS-driver capture
