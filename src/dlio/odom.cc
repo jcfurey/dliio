@@ -2756,7 +2756,7 @@ void dlio::OdomNode::getNextPose() {
   // fusion. A successfully rescued axis is not dead-reckoning on the IMU.
   int degenerate_dirs = this->gicp.lastDegenerateDirections();
   // Snapshot for /diagnostics (publishDiagnostics reads these on the same
-  // scan thread): directions held this scan + cumulative scans the gate fired.
+  // scan thread): geometrically weak directions + cumulative gate activations.
   this->loc_gate_axes_current_ = degenerate_dirs;
   if (degenerate_dirs > 0) {
     ++this->loc_gate_updates_cumulative_;
@@ -4024,13 +4024,17 @@ void dlio::OdomNode::publishDiagnostics() {
   // Health: WARN while the degeneracy gate is active or the per-scan budget
   // (the LiDAR period) is blown; ERROR if GICP failed to converge.
   double scan_period_ms = (lidar_rate > 0.0) ? 1000.0 / lidar_rate : 0.0;
+  const size_t held_dirs = this->gicp.lastDegenTransDirs().size() +
+                           this->gicp.lastDegenRotDirs().size();
   if (!this->gicp_hasConverged.load()) {
     st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     st.message = "GICP did not converge";
   } else if (this->loc_gate_axes_current_ > 0) {
     st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-    st.message = "Degenerate along " + std::to_string(this->loc_gate_axes_current_) +
-                 " direction(s); holding IMU prior";
+    st.message = "Geometry weak along " + std::to_string(this->loc_gate_axes_current_) +
+                 " direction(s); texture rescued up to " +
+                 std::to_string(this->gicp.lastVisualRescuedDirections()) +
+                 ", holding the prior along " + std::to_string(held_dirs);
   } else if (scan_period_ms > 0.0 && comp_last > scan_period_ms) {
     st.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
     st.message = "Computation time exceeds scan period";
@@ -4061,10 +4065,11 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Compute Overruns (cumulative)", std::to_string(this->compute_overruns_.load()));
   kv("Scans Dropped est (cumulative)", std::to_string(this->scans_dropped_est_.load()));
   kv("Degenerate Directions (current)", std::to_string(this->loc_gate_axes_current_));
+  kv("Held Directions (current)", std::to_string(held_dirs));
   kv("Loc Gate Updates (cumulative)", std::to_string(this->loc_gate_updates_cumulative_));
   // Per-term trust telemetry (read-only; what an adaptive weighting policy would
   // key on). Geometric: weakest-axis margin vs the gate threshold (>1 trusted,
-  // <1 held, ~1 marginal; -1 = gate off). Each term also reports count + RMS.
+  // <1 geometrically weak, ~1 marginal; -1 = gate off). Each term reports count + RMS.
   kv("Geo Rot Trust Margin", fnum(this->gicp.lastGeoRotMargin(), 4));
   kv("Geo Trans Trust Margin", fnum(this->gicp.lastGeoTransMargin(), 4));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");
