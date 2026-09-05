@@ -1,6 +1,6 @@
 # Standalone handoff
 
-This repository supplies the estimator, current map preview, launch files,
+This repository supplies the estimator, persistent mapper and map preview, launch files,
 profiles, RViz configuration, and replay/verification tools. The Ouster workflow
 starts only dliio components and, for packet input, the Ouster cloud component.
 An optional ROS bag player supplies recorded data and `/clock`; RViz is optional.
@@ -105,8 +105,11 @@ then starts playback at **1×**. It applies the recorded sensor extrinsics,
 reflectivity registration, and raw-signal image-flow profile. This calibration
 is specific to the 0705 sensor mounting; use your own YAML for other hardware.
 
-`rviz:=false` runs headless. `map:=false` omits the accumulated-map preview.
-The map is not a dedicated mapping backend and has no loop closure. See the
+`rviz:=false` runs headless. `map:=false` omits mapping. The original launch
+defaults to the accumulated-map preview. For bounded submaps, persistent local
+keyframes, save/reload, and full PCD export, use `dlio_mapping.launch.py` or add
+`mapper:=persistent`. See [MAPPING_NODE.md](MAPPING_NODE.md) for its services and
+limits. Loop closure is not implemented yet. See the
 [mapping contract](MAPPING_INTERFACE.md) before consuming registered clouds.
 
 For an external player, supply `mode:=packets metadata:=/path/sensor.json`,

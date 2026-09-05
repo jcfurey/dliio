@@ -46,6 +46,11 @@ def build_actions(args, package):
         raise ValueError('mode must be points (existing Ouster driver) or packets (recorded Ouster packets)')
     if profile not in ('generic', '0705'):
         raise ValueError('profile must be generic or 0705')
+    if args['mapper'] not in ('preview', 'persistent'):
+        raise ValueError('mapper must be preview or persistent')
+    mapping_config = Path(args['mapping_config']).expanduser() if args['mapping_config'] else package / 'cfg/mapping.yaml'
+    if args['mapper'] == 'persistent' and not mapping_config.is_file():
+        raise ValueError(f'Mapping configuration does not exist: {mapping_config}')
     rate = float(args['rate'])
     if not math.isfinite(rate) or rate <= 0:
         raise ValueError('rate must be finite and positive')
@@ -110,7 +115,7 @@ def build_actions(args, package):
             ('kf_pose', '/dlio/odom_node/keyframes'), ('kf_pose_stamped', '/dlio/odom_node/keyframe_pose'),
             ('kf_cloud', '/dlio/odom_node/pointcloud/keyframe'),
             ('deskewed', '/dlio/odom_node/pointcloud/deskewed')], extra_arguments=intra))
-    if boolean(args['map']):
+    if boolean(args['map']) and args['mapper'] == 'preview':
         components.append(ComposableNode(
             package='direct_lidar_inertial_odometry', plugin='dlio::MapNode', name='dlio_map_node',
             parameters=params, remappings=[('keyframes', '/dlio/odom_node/pointcloud/keyframe'),
@@ -119,6 +124,15 @@ def build_actions(args, package):
         name='dlio_ouster_container', namespace='', package='rclcpp_components',
         executable='component_container_mt', parameters=[{'thread_num': 6}],
         composable_node_descriptions=components, output='screen')]
+    if boolean(args['map']) and args['mapper'] == 'persistent':
+        directory = (Path(args['archive_directory']).expanduser() if args['archive_directory'] else
+                     Path(args['run_dir']).expanduser() / 'mapping')
+        actions.append(Node(package='direct_lidar_inertial_odometry', executable='dlio_mapping_node.py',
+            name='dlio_mapping_node', parameters=[*params, str(mapping_config),
+                {'mapping/storage_directory': str(directory.resolve()), 'mapping/load_path': ''}],
+            remappings=[('keyframes', '/dlio/odom_node/pointcloud/keyframe'),
+                        ('keyframe_pose', '/dlio/odom_node/keyframe_pose'), ('map', '/dlio/map_node/map')],
+            output='screen'))
     if boolean(args['rviz']):
         actions.append(Node(package='rviz2', executable='rviz2', name='dlio_rviz',
             arguments=['-d', str(package / 'launch/dlio_0705_texture.rviz')],
@@ -137,6 +151,7 @@ def build_actions(args, package):
 DEFAULTS = {
     'mode': 'points', 'profile': 'generic', 'bag': '', 'metadata': '', 'rate': '1.0',
     'rviz': 'false', 'map': 'true', 'use_sim_time': 'auto', 'robot_config': '', 'params_file': '',
+    'mapper': 'preview', 'mapping_config': '', 'archive_directory': '',
     'pointcloud_topic': '/ouster/points', 'imu_topic': '/ouster/imu',
     'run_dir': str(Path.cwd() / 'dliio_run'),
 }

@@ -1,8 +1,8 @@
 # Mapping input contract
 
 This contract describes the output after the 2026-09-05 correctness pass on
-`cam-dev`. It prepares a separate mapping backend while retaining `MapNode` as
-the current accumulated-cloud preview.
+`cam-dev`. The [persistent mapper](MAPPING_NODE.md) now consumes this interface;
+`MapNode` remains available as the legacy accumulated-cloud preview.
 
 ## Frames and measurement times
 
@@ -93,11 +93,11 @@ copies still scale with message size. Caching retains one additional serialized
 map in memory. PCD export performs the existing global voxel averaging and
 requires a finite positive leaf size.
 
-## Next backend
+## Persistent backend and next interface
 
-A dedicated mapper should introduce a keyframe record with session ID, stable
-keyframe ID, scan reference stamp, registered pose, local deskewed cloud, and
-registration quality/observability. A single message or acknowledged archive
+The persistent mapper archives a session ID, stable keyframe ID, scan reference
+stamp, registered pose, and local deskewed cloud. Registration quality and
+observability still need an extended frontend interface. A single message or acknowledged archive
 would make pose/cloud delivery and replay explicit. Reported registration
 Hessians and default odometry covariances are not calibrated independent sensor
 uncertainties.

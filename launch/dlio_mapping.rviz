@@ -1,0 +1,57 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 25; 25; 25
+    Fixed Frame: map
+    Frame Rate: 20
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 100
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Map signal
+      Enabled: true
+      Topic:
+        Value: /dlio/map_node/map
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        Depth: 1
+      Size (m): 0.07
+      Style: Flat Squares
+      Position Transformer: XYZ
+      Color Transformer: Intensity
+      Channel Name: intensity
+      Autocompute Intensity Bounds: true
+      Use rainbow: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Map reflectivity
+      Enabled: false
+      Topic:
+        Value: /dlio/map_node/map
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        Depth: 1
+      Size (m): 0.07
+      Style: Flat Squares
+      Position Transformer: XYZ
+      Color Transformer: Intensity
+      Channel Name: reflectivity
+      Autocompute Intensity Bounds: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 60
+      Pitch: 0.6
+      Yaw: 0.7
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+Window Geometry:
+  Width: 1400
+  Height: 900

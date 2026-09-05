@@ -1,0 +1,14 @@
+/**:
+  ros__parameters:
+    frames/map: map
+    # Full keyframes/poses remain on disk. These bounds apply to the live map window.
+    mapping/voxel_size: 0.2
+    mapping/submap_keyframes: 20
+    mapping/resident_submaps: 8
+    mapping/max_voxels: 100000
+    mapping/max_input_points: 200000
+    mapping/max_cloud_bytes: 16777216
+    mapping/pending_pairs: 8
+    mapping/pair_timeout: 2.0
+    mapping/worker_queue: 4
+    mapping/publish_rate: 1.0

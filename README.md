@@ -1,7 +1,7 @@
 # dliio: standalone LiDAR–inertial odometry
 
-The Ouster workflow is contained in this repository: odometry, accumulated-map
-preview, calibrated 0705 profiles, packet replay, RViz configuration, and
+The Ouster workflow is contained in this repository: odometry, persistent
+mapping, calibrated 0705 profiles, packet replay, RViz configuration, and
 validation tools. It needs no other estimator, camera, fusion, or TF helper
 node. Ouster supplies the sensor driver; RViz and the bag player are optional.
 
@@ -13,15 +13,16 @@ enables its raw `CustomMsg` adapter; PointCloud2 support is always available.
 After building dliio and the pinned Ouster driver, the complete 0705 command is:
 
 ```bash
-ros2 launch direct_lidar_inertial_odometry dlio_ouster.launch.py \
+ros2 launch direct_lidar_inertial_odometry dlio_mapping.launch.py \
   mode:=packets profile:=0705 bag:=/absolute/path/07052026_4_an \
   rviz:=true rate:=1.0
 ```
 
 The dataset is supplied separately. The 0705 calibration is specific to that
-recording. The current map is a preview; the interface for the forthcoming
-mapping and loop-closure backend is documented in
-[Mapping input contract](doc/MAPPING_INTERFACE.md).
+recording. The [persistent mapper](doc/MAPPING_NODE.md) retains local keyframes
+and poses, limits the live submap window, and supports archive save/reload and
+full PCD export. Loop closure is the next stage. The original
+`dlio_ouster.launch.py` retains the legacy accumulated-map preview by default.
 
 # Modifications
 

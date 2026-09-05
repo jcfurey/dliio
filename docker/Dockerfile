@@ -96,6 +96,7 @@ RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
     && colcon test --event-handlers console_cohesion+ \
     && colcon test-result --verbose \
     && ros2 run direct_lidar_inertial_odometry verify_install.py \
+    && ros2 run direct_lidar_inertial_odometry verify_mapping.py \
     && cmake -S src/direct_lidar_inertial_odometry/test/installed_consumer -B consumer_build \
     && cmake --build consumer_build --parallel 2 \
     && ./consumer_build/consumer

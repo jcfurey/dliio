@@ -84,6 +84,7 @@ endif()
 rosidl_generate_interfaces(
     ${PROJECT_NAME}
         srv/SavePCD.srv
+        srv/MapArchive.srv
     DEPENDENCIES
 )
 
@@ -170,7 +171,11 @@ install(DIRECTORY cfg launch doc
 install(FILES README.md ouster.repos LICENSE THIRD_PARTY_LICENSES.md
   DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
+  scripts/dlio_mapping_node.py scripts/mapping_archive.py scripts/verify_mapping.py
+  scripts/verify_mapping_replay.py
   DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY scripts/dliio_mapping DESTINATION lib/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY scripts DESTINATION share/${PROJECT_NAME})
 
 # Tests
@@ -178,6 +183,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_handoff_launch test/test_handoff_launch.py TIMEOUT 60)
+  ament_add_pytest_test(test_mapping_core test/test_mapping_core.py TIMEOUT 60)
+  ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
   ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
   target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_nano_gicp

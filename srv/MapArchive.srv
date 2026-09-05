@@ -1,0 +1,7 @@
+# Absolute destination filename for save_map/export_pcd, or a sealed archive for load_map.
+string path
+---
+bool success
+string message
+uint64 keyframes
+uint64 submaps

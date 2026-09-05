@@ -21,8 +21,17 @@ def test_points_mode_requires_only_dliio():
     assert len(actions_without_map) == 1
 
 
+def test_persistent_mapper_is_a_separate_process(tmp_path):
+    from launch_ros.actions import Node
+    actions = handoff.build_actions(dict(handoff.DEFAULTS, mapper='persistent', run_dir=str(tmp_path)), PACKAGE)
+    assert len(actions) == 2
+    assert isinstance(actions[1], Node)
+    assert len(handoff.build_actions(dict(handoff.DEFAULTS, mapper='persistent', map='false'), PACKAGE)) == 1
+
+
 @pytest.mark.parametrize('key,value', [('mode', 'wrong'), ('profile', 'wrong'), ('rate', '0'),
-                                    ('rate', 'nan'), ('rate', 'inf'), ('use_sim_time', 'maybe')])
+                                    ('rate', 'nan'), ('rate', 'inf'), ('use_sim_time', 'maybe'),
+                                    ('mapper', 'wrong'), ('mapper', '')])
 def test_invalid_configuration_fails_before_starting_nodes(key, value):
     with pytest.raises(ValueError):
         handoff.build_actions(dict(handoff.DEFAULTS, **{key: value}), PACKAGE)
