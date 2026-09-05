@@ -14,7 +14,7 @@ Visualization Manager:
       Cell Size: 1
       Plane Cell Count: 100
     - Class: rviz_default_plugins/PointCloud2
-      Name: Map signal
+      Name: Map intensity
       Enabled: false
       Topic:
         Value: /dlio/map_node/map
@@ -27,7 +27,9 @@ Visualization Manager:
       Position Transformer: XYZ
       Color Transformer: Intensity
       Channel Name: intensity
-      Autocompute Intensity Bounds: true
+      Autocompute Intensity Bounds: false
+      Min Intensity: 0
+      Max Intensity: 4096
       Use rainbow: false
     - Class: rviz_default_plugins/PointCloud2
       Name: Map reflectivity
@@ -46,6 +48,12 @@ Visualization Manager:
       Autocompute Intensity Bounds: false
       Min Intensity: 0
       Max Intensity: 100
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
   Views:
     Current:
       Class: rviz_default_plugins/Orbit

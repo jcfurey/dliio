@@ -45,6 +45,21 @@ or pose correction. Sparse views and view-dependent reflectivity can still
 produce visible patches; the grid alone did not eliminate them on 0705.
 Original individual returns remain available in the archive.
 
+Inspect both **raw intensity** and **reflectivity** when judging color and
+texture. The packet-replay RViz profile includes `Map — Raw Intensity` alongside
+`Map — Reflectivity`; the archive viewer has `Map intensity` and
+`Map reflectivity`. Enable one coloring at a time. Intensity starts with fixed
+0–4096 bounds and reflectivity with 0–100, so moving or loading another view
+does not silently rescale the colors. These are display bounds, not data clips
+or universal sensor maxima; adjust them for a different sensor/profile.
+
+The 0705 frontend already uses intensity for inter-frame LiDAR-image flow and
+reflectivity for spatial photometric gradients. Its `lidar_intensity` field
+contains the selected intensity image channel after the configured 3×3 spatial
+denoising. In this profile `intensity_corrected` equals raw intensity: the
+optional radiometric correction path runs when the spatial photometric channel
+selects intensity. Do not count these derived fields as independent sensors.
+
 Independent controls are available:
 
 - `map/observation/distance`, `map/observation/rotation`, and
@@ -67,6 +82,12 @@ The live grid updates incrementally and subtracts evicted submaps' contributions
 Freed accumulator slots are reused. Snapshot preparation is limited by
 `mapping/publish_rate`, independently of observation ingestion. Fusion does not
 normalize reflectivity by incidence angle or infer unobserved surface samples.
+
+The optional frontend `odom/preprocessing/subFloorReject/*` heuristic is
+disabled by default and is not a water classifier. The 0705 offline check
+rejected some points along apparent walls/edges and missed a dense synthetic
+lower layer. A height histogram alone does not establish a trustworthy floor;
+see the water-reflection limits in [DENSE_MAPPING_VALIDATION.md](DENSE_MAPPING_VALIDATION.md).
 
 Dense maps use more memory, disk space, and DDS bandwidth. The live window is
 bounded by submap and point limits below; saved archives and full exports
@@ -251,12 +272,18 @@ quality and calibrated pose uncertainty also need a richer future input message.
 ROS_DOMAIN_ID=157 ros2 run direct_lidar_inertial_odometry verify_mapping.py
 # Real packet input, forced submap eviction, and complete export/reload comparison:
 ROS_DOMAIN_ID=157 ros2 run direct_lidar_inertial_odometry verify_mapping_replay.py \
-  /absolute/path/07052026_4_an --full --rviz \
+  /absolute/path/07052026_4_an --full --require-eviction --rviz \
   --output /absolute/path/new-run/mapping-replay.json
 ```
 
-The second check uses a 100-observation/four-submap window; a full run exercises eviction.
-Without `--full` it takes a 75-second sample. `--keep-running` leaves a successful
+The second check uses the default 100-observation/eight-submap window and
+requires that the bag actually exceeds that window. `--resident-submaps` and
+`--submap-keyframes` allow smaller windows for a deliberate eviction test.
+`--mapping-input keyframes` compares odometry-keyframe input; it may not fill
+the default window, so omit `--require-eviction` unless testing that explicitly.
+Without `--full` the check takes a 75-second sample, then pauses playback before
+save/export. Each run preserves `mapping-diagnostics.jsonl`, a progress JSON,
+and sampled resource peaks alongside the final report. `--keep-running` leaves a successful
 launch open and records its PID beside the report. Tests verify mapping logic
 and runtime delivery; they do not establish trajectory accuracy without ground
 truth. Loop-closure work can build on local keyframes and stable archive IDs,

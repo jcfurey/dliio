@@ -29,6 +29,10 @@ def main():
     parser.add_argument('bag', type=Path)
     parser.add_argument('--seconds', type=float, default=75., help='Sample duration after the first scan')
     parser.add_argument('--mapping-input', choices=('observations', 'keyframes'), default='observations')
+    parser.add_argument('--resident-submaps', type=int, default=8)
+    parser.add_argument('--submap-keyframes', type=int, default=100)
+    parser.add_argument('--require-eviction', action='store_true',
+                        help='Fail unless the replay exceeds the resident submap window')
     parser.add_argument('--full', action='store_true', help='Wait for the complete bag player to exit')
     parser.add_argument('--rviz', action='store_true')
     parser.add_argument('--keep-running', action='store_true', help='Keep the successful launch open for viewing')
@@ -36,6 +40,10 @@ def main():
     args = parser.parse_args()
     if not math.isfinite(args.seconds) or args.seconds < 10:
         parser.error('--seconds must be finite and at least 10')
+    try:
+        limits = Limits(resident_submaps=args.resident_submaps, submap_keyframes=args.submap_keyframes)
+    except ValueError as error:
+        parser.error(str(error))
     args.output = args.output.resolve()
     run = args.output.parent
     run.mkdir(parents=True, exist_ok=True)
@@ -55,6 +63,14 @@ def main():
     map_peak = [0]
     point_counts = {name: {} for name in ('deskewed', 'keyframe', 'mapping')}
     field_hashes = {}
+    started = time.monotonic()
+    history = (run / 'mapping-diagnostics.jsonl').open('w')
+    peaks = {}
+
+    def stage(name):
+        progress = dict(stage=name, elapsed_seconds=time.monotonic() - started)
+        args.output.with_suffix('.progress.json').write_text(json.dumps(progress) + '\n')
+        print(json.dumps(progress), flush=True)
 
     def collect(name, message):
         counts[name] += 1
@@ -76,6 +92,15 @@ def main():
     def diagnostic(target, message):
         for status in message.status:
             target.update({value.key: value.value for value in status.values})
+        if target is mapping:
+            history.write(json.dumps(dict(elapsed_seconds=time.monotonic() - started,
+                                          values=dict(target))) + '\n')
+            history.flush()
+            for name in ('resident_submaps', 'resident_points', 'resident_array_bytes',
+                         'fusion_array_bytes', 'cached_map_bytes', 'published_points',
+                         'rss_peak_kib', 'queue_depth', 'pending_pairs'):
+                if name in target:
+                    peaks[name] = max(peaks.get(name, 0), int(target[name]))
 
     def until(predicate, timeout):
         deadline = time.monotonic() + timeout
@@ -114,11 +139,10 @@ def main():
             lambda message: diagnostic(mapping, message), 10),
         node.create_subscription(DiagnosticArray, '/diagnostics',
             lambda message: diagnostic(odometry, message), qos_profile_sensor_data)]
-    # A four-submap window forces eviction on a full bag, without changing
-    # the frontend profile or the mapper's voxel/input capacity.
     config = run / 'mapping-check.yaml'
-    config.write_text('/**:\n  ros__parameters:\n    mapping/submap_keyframes: 100\n'
-                      '    mapping/resident_submaps: 4\n')
+    config.write_text('/**:\n  ros__parameters:\n'
+                      f'    mapping/submap_keyframes: {args.submap_keyframes}\n'
+                      f'    mapping/resident_submaps: {args.resident_submaps}\n')
     try:
         discovery = time.monotonic() + 1
         while time.monotonic() < discovery:
@@ -126,6 +150,7 @@ def main():
         if {'dlio_odom_node', 'dlio_mapping_node'} & set(node.get_node_names()):
             raise RuntimeError('dliio already running; use a separate ROS_DOMAIN_ID')
         with args.output.with_suffix('.log').open('w') as log:
+            stage('starting')
             process = subprocess.Popen(['ros2', 'launch', 'direct_lidar_inertial_odometry',
                 'dlio_mapping.launch.py', 'mode:=packets', 'profile:=0705', 'rate:=1.0',
                 f'bag:={args.bag.resolve()}', f'run_dir:={run}', f'mapping_config:={config}',
@@ -133,6 +158,7 @@ def main():
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             (run / 'launch.pid').write_text(str(process.pid) + '\n')
             until(lambda: first_scan[0] is not None and 'session_id' in mapping, 45)
+            stage('playing')
             if args.full:
                 # Launch logs the player's completion on all supported distros.
                 metadata = (args.bag / 'metadata.yaml').read_text()
@@ -156,6 +182,7 @@ def main():
                       int(mapping.get('pending_pairs', -1)) == 0 and int(mapping.get('queue_depth', -1)) == 0, 15)
             required_stamps = set(stamps[frame])
             required_scan_stamps = set(stamps['scan_pose'])
+            stage('draining')
             # Freeze the live sample boundary before waiting for separately
             # delivered clouds. Checking a continuously advancing pose set at
             # service completion can mistake an in-flight cloud for a loss.
@@ -164,9 +191,12 @@ def main():
             # Separate cloud/pose callbacks and 1 Hz diagnostics can lag the
             # probe even when no input is lost.
             until(lambda: int(mapping.get('last_stamp_ns', 0)) >= max(required_stamps), 15)
+            stage('saving')
             response = request('save_map', run / 'saved.dliomap')
+            stage('exporting')
             request('export_pcd', run / 'all.pcd')
-            archived = Store(run / 'saved.dliomap', Limits(resident_submaps=4))
+            stage('validating_archive')
+            archived = Store(run / 'saved.dliomap', limits)
             try:
                 archived_stamps = {row[0] for row in archived.db.execute('SELECT stamp_ns FROM keyframes')}
                 assert archived_stamps <= stamps[frame] & stamps[pose_name]
@@ -175,9 +205,12 @@ def main():
                     assert archived_stamps == stamps[frame] == stamps[pose_name]
                 assert archived.meta['calibration']['frames/baselink'] == 'dliio_base_link'
                 assert archived.meta['keyframes'] == response.keyframes > 0
-                assert archived.meta['submaps'] > 4 if args.full else archived.meta['submaps'] > 0
-                assert archived.stats()['resident_submaps'] <= 4
-                assert len(archived.snapshot()) <= 4 * archived.limits.max_voxels
+                assert archived.meta['submaps'] > 0
+                if args.require_eviction:
+                    assert archived.meta['submaps'] > args.resident_submaps, 'Replay did not exercise eviction'
+                assert archived.stats()['resident_submaps'] <= args.resident_submaps
+                assert peaks['resident_submaps'] <= args.resident_submaps
+                assert len(archived.snapshot()) <= args.resident_submaps * archived.limits.max_voxels
                 assert archived.limits.voxel_size == 0., 'Default mapping must retain individual returns'
                 archived_input_points = 0
                 for stamp, count, blob, crc in archived.db.execute('SELECT stamp_ns,count,points,crc FROM keyframes'):
@@ -226,6 +259,9 @@ def main():
                                                                  max=max(ratios), pairs=len(ratios))
             result = dict(passed=True, ros_distro=os.environ.get('ROS_DISTRO'), rate=1., full_bag=args.full,
                 density=density, archived_input_points=archived_input_points, fusion_size=fusion_size,
+                configured_limits=dict(resident_submaps=args.resident_submaps,
+                    submap_keyframes=args.submap_keyframes), mapping_peaks=peaks,
+                eviction_exercised=archive_stats['submaps'] > args.resident_submaps,
                 sampled_scan_pairs=len(required_scan_stamps), mapping_input=args.mapping_input,
                 counts=dict(counts), timestamp_pairs={name: len(values) for name, values in stamps.items()},
                 archive=archive_stats, mapping_diagnostics=mapping, odometry_diagnostics=odometry,
@@ -235,14 +271,17 @@ def main():
             args.output.write_text(json.dumps(result, indent=2) + '\n')
             print(json.dumps(result, indent=2))
             passed = True
+            stage('passed')
     except BaseException as error:
         args.output.write_text(json.dumps(dict(passed=False, error=str(error),
             counts=dict(counts), mapping_diagnostics=mapping, odometry_diagnostics=odometry,
+            mapping_peaks=peaks,
             missing_scan_cloud_stamps=sorted(stamps['scan_pose'] - stamps['deskewed']),
             missing_mapping_cloud_stamps=sorted(stamps[pose_name] - stamps[frame]),
             missing_mapping_pose_stamps=sorted(stamps[frame] - stamps[pose_name])), indent=2) + '\n')
         raise
     finally:
+        history.close()
         if process and process.poll() is None and not (passed and args.keep_running):
             os.killpg(process.pid, signal.SIGINT)
             try:
