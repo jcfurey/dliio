@@ -4,6 +4,14 @@
 # See doc/REVIEW_2026-09-05_tunnel_texture.md for measured limits and replay setup.
 /**:
   ros__parameters:
+    frames/lidar: os_lidar
+    frames/imu: os_imu
+    # Match the tested replay: use the stationary opening to align gravity.
+    odom/imu/approximateGravity: true
+    odom/debug/dashboard: false
+    map/dense/filtered: true
+    map/publishRate: 0.5
+    map/waitUntilMove: false
     # Calibrated reflectivity supplies the spatial map gradient. Signal supplies
     # full-resolution inter-frame texture; their weights are tuned together.
     odom/gicp/photometricChannel: reflectivity
