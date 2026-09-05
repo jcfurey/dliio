@@ -37,6 +37,8 @@ public:
 
 private:
 
+  friend struct MapNodeTestAccess;
+
   void getParams();
 
   void callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& keyframe);
@@ -54,7 +56,6 @@ private:
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
   std::mutex map_mutex;  // guards dlio_map across callbackKeyframe / publishMap / savePCD
-  pcl::VoxelGrid<PointType> voxelgrid;
 
   std::string odom_frame;
 

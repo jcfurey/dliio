@@ -3,12 +3,35 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
 #include <numeric>
 
+#include "dlio/map.h"
 #include "dlio/odom.h"
 #include "dlio/pointcloud_fields.h"
 
 namespace dlio {
+struct MapNodeTestAccess {
+  static void ingest(MapNode& node, const pcl::PointCloud<PointType>& cloud) {
+    auto msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(cloud, *msg);
+    node.callbackKeyframe(msg);
+  }
+  static const pcl::PointCloud<PointType>& cloud(const MapNode& node) {
+    return *node.dlio_map;
+  }
+  static bool save(MapNode& node, const std::string& directory, float leaf_size) {
+    using Service = direct_lidar_inertial_odometry::srv::SavePCD;
+    auto request = std::make_shared<Service::Request>();
+    auto response = std::make_shared<Service::Response>();
+    request->save_path = directory;
+    request->leaf_size = leaf_size;
+    node.savePCD(request, response);
+    return response->success;
+  }
+};
+
 struct OdomNodeTestAccess {
   static void ingest(OdomNode& node, const sensor_msgs::msg::PointCloud2& msg) {
     node.getScanFromROS(std::make_shared<sensor_msgs::msg::PointCloud2>(msg));
@@ -87,6 +110,56 @@ protected:
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+pcl::PointCloud<PointType> mapChannelCloud() {
+  pcl::PointCloud<PointType> cloud;
+  for (int i = 0; i < 4; ++i) {
+    PointType p;
+    p.x = i < 2 ? 0.1f + 0.1f * i : 0.6f + 0.1f * (i - 2);
+    p.y = p.z = 0.1f;
+    p.intensity = 1000.f + 2000.f * i;
+    p.reflectivity = 10.f + 20.f * i;
+    p.intensity_corrected = 10000.f + 20000.f * i;
+    p.lidar_intensity = 3000.f + 6000.f * i;
+    p.timestamp = 0.0;
+    cloud.push_back(p);
+  }
+  return cloud;
+}
+
+TEST_F(PointCloudChannels, AccumulatedMapPreservesRawAndDerivedChannels) {
+  using MapAccess = dlio::MapNodeTestAccess;
+  dlio::MapNode node;
+  MapAccess::ingest(node, mapChannelCloud());
+  const auto& cloud = MapAccess::cloud(node);
+  ASSERT_EQ(cloud.size(), 2u);
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_FLOAT_EQ(cloud[i].intensity, 2000.f + 4000.f * i);
+    EXPECT_FLOAT_EQ(cloud[i].reflectivity, 20.f + 40.f * i);
+    EXPECT_FLOAT_EQ(cloud[i].intensity_corrected, 20000.f + 40000.f * i);
+    EXPECT_FLOAT_EQ(cloud[i].lidar_intensity, 6000.f + 12000.f * i);
+  }
+}
+
+TEST_F(PointCloudChannels, SavedPcdPreservesChannelsAfterCoarserVoxelization) {
+  using MapAccess = dlio::MapNodeTestAccess;
+  dlio::MapNode node;
+  MapAccess::ingest(node, mapChannelCloud());
+  char directory[] = "/tmp/dliio-map-channels-XXXXXX";
+  ASSERT_NE(mkdtemp(directory), nullptr);
+  const auto path = std::string(directory) + "/dlio_map.pcd";
+  const bool saved = MapAccess::save(node, directory, 1.0f);
+  pcl::PointCloud<PointType> reloaded;
+  const int loaded = saved ? pcl::io::loadPCDFile(path, reloaded) : -1;
+  std::filesystem::remove_all(directory);
+  ASSERT_TRUE(saved);
+  ASSERT_EQ(loaded, 0);
+  ASSERT_EQ(reloaded.size(), 1u);
+  EXPECT_FLOAT_EQ(reloaded[0].intensity, 4000.f);
+  EXPECT_FLOAT_EQ(reloaded[0].reflectivity, 40.f);
+  EXPECT_FLOAT_EQ(reloaded[0].intensity_corrected, 40000.f);
+  EXPECT_FLOAT_EQ(reloaded[0].lidar_intensity, 12000.f);
+}
 
 TEST_F(PointCloudChannels, OriginalOusterPreservesBothFieldsWithTermsOff) {
   dlio::OdomNode node(options());

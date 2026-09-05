@@ -44,3 +44,20 @@ pipeline suites, azimuth-seam regression, and PCL grid-overflow fallback.
 Modified YAML parses, the sanitizer runner passes `bash -n`, and
 `git diff --check` is clean. The CI sanitizer subset now includes intensity and
 wire-format channel tests; sanitizers were not run locally for this review.
+
+The subsequent `07052026_4_an` RViz replay exposed another channel-loss path:
+the scan output retained reflectivity, but the map node's second typed PCL
+voxel filter reset every map reflectivity value to zero. The same filter also
+affected PCD export. Both now use field-aware voxel averaging for XYZ and the
+four scalar channels, excluding the scan-only timestamp union. Regression
+cases check accumulated map values and a saved/reloaded PCD after additional
+coarse downsampling.
+The follow-up Release build and all 17 channel tests passed, including the two
+new map/PCD regressions.
+
+For this raw-packet bag, composing OusterCloud, OdomNode, and MapNode with
+intra-process communication resolved missing large-cloud delivery between
+separate processes on the local machine. At half-speed playback, a 15-second
+check then received all 75 registered scans, reported zero estimated scan
+drops, and confirmed an active reflectivity residual with 1,200 contributing
+points. This establishes pipeline operation, not trajectory accuracy.

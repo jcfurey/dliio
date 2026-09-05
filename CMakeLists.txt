@@ -245,7 +245,10 @@ if(BUILD_TESTING)
     dlio_components
   )
 
-  ament_add_gtest(test_pointcloud_channels test/test_pointcloud_channels.cpp)
+  # MapNode creates SavePCD; make its generated runtime type support available
+  # even when testing the build tree before installation.
+  ament_add_gtest(test_pointcloud_channels test/test_pointcloud_channels.cpp
+    APPEND_LIBRARY_DIRS "${CMAKE_CURRENT_BINARY_DIR}")
   target_compile_definitions(test_pointcloud_channels PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_pointcloud_channels dlio_components)
 

@@ -17,6 +17,33 @@
 #include <filesystem>
 #include <system_error>
 
+namespace {
+// The typed VoxelGrid centroid only accumulates PCL's built-in fields. Use
+// the field-aware blob filter so custom raw/derived channels survive both
+// the published map and its final PCD export.
+pcl::PointCloud<PointType>::Ptr voxelizeMap(
+    const pcl::PointCloud<PointType>::ConstPtr& input, float leaf_size) {
+  auto blob = std::make_shared<pcl::PCLPointCloud2>();
+  pcl::toPCLPointCloud2(*input, *blob);
+  // Per-scan timestamps have no meaning once keyframes are accumulated.
+  // Their overlapping uint32/float/double union is also unsuitable for PCL's
+  // generic scalar averaging; pass only XYZ and the four float channels.
+  blob->fields.erase(std::remove_if(blob->fields.begin(), blob->fields.end(),
+      [](const pcl::PCLPointField& field) {
+        return field.name == "t" || field.name == "time" || field.name == "timestamp";
+      }), blob->fields.end());
+  pcl::VoxelGrid<pcl::PCLPointCloud2> filter;
+  filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+  filter.setDownsampleAllData(true);
+  filter.setInputCloud(blob);
+  pcl::PCLPointCloud2 filtered;
+  filter.filter(filtered);
+  auto output = std::make_shared<pcl::PointCloud<PointType>>();
+  pcl::fromPCLPointCloud2(filtered, *output);
+  return output;
+}
+}  // namespace
+
 dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
     : Node("dlio_map_node", options) {
 
@@ -78,9 +105,7 @@ void dlio::MapNode::callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstS
   pcl::fromROSMsg(*keyframe, *keyframe_pcl);
 
   // voxel filter
-  this->voxelgrid.setLeafSize(this->leaf_size_, this->leaf_size_, this->leaf_size_);
-  this->voxelgrid.setInputCloud(keyframe_pcl);
-  this->voxelgrid.filter(*keyframe_pcl);
+  keyframe_pcl = voxelizeMap(keyframe_pcl, this->leaf_size_);
 
   // Accumulate into the map; publishing happens on the low-rate timer below.
   // (lock: savePCD and publishMap run in other callback groups and may read.)
@@ -143,10 +168,7 @@ void dlio::MapNode::savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv:
               m->size(), p.c_str(), leaf_size);
 
   // voxelize map
-  pcl::VoxelGrid<PointType> vg;
-  vg.setLeafSize(leaf_size, leaf_size, leaf_size);
-  vg.setInputCloud(m);
-  vg.filter(*m);
+  m = voxelizeMap(m, leaf_size);
 
   // save map
   int ret = pcl::io::savePCDFileBinary(p + "/dlio_map.pcd", *m);

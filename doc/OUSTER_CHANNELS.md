@@ -2,7 +2,8 @@
 
 DLIIO decodes both sensor measurements independently, preserves them through
 deskewing and voxel averaging, and supplies separate derived channels to the
-photometric and LiDAR-image residuals.
+photometric and LiDAR-image residuals. Published maps and PCD exports also
+preserve all four scalar channels through their additional voxel filtering.
 
 | Measurement | Original Ouster cloud | Native Ouster cloud | Internal field |
 |---|---|---|---|
@@ -68,7 +69,8 @@ an enabled parameter alone does not establish that usable texture was found.
 
 `test_pointcloud_channels` exercises the node's actual intake, deskew, and voxel
 path with binary Ouster original/native layouts, row padding, separate channels,
-flow-only denoising, missing fields, and live enabling. Registration tests cover
+flow-only denoising, missing fields, live enabling, map accumulation, and PCD
+export with a coarser voxel size. Registration tests cover
 corrected intensity, gradient refresh after live changes, and independent
 image-channel references in both map and flow residuals.
 
