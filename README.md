@@ -104,6 +104,7 @@ Wiring into a fusion/navigation stack: feed `dlio/odom_node/odom` to `robot_loca
 ## Notes & findings
 
 - `doc/VISUAL_TERM.md` — design of the optional direct-photometric anchors (camera frame-to-frame / frame-to-map, and the COIN-LIO LiDAR intensity-image term), the degeneracy-gate safety floor, parameters, and tests.
+- `doc/MAPPING_INTERFACE.md` — registered cloud/pose timestamps, frames, Ouster fields, preview-map behavior, and the boundary for a dedicated mapping backend.
 - `doc/TUNNEL_FINDINGS.md` — consolidated empirical findings from the `resple_test_ws` harness on the 06042026 tunnel: the degeneracy-gate and reflectivity-weight sweeps, the visual-term A/Bs, the COIN-LIO results, recommended configs, the chaotic-basin / co-scheduling caveats, and open next steps.
 
 ---

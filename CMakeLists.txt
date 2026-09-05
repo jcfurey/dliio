@@ -252,6 +252,11 @@ if(BUILD_TESTING)
   target_compile_definitions(test_pointcloud_channels PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_pointcloud_channels dlio_components)
 
+  ament_add_gtest(test_output_contract test/test_output_contract.cpp
+    APPEND_LIBRARY_DIRS "${CMAKE_CURRENT_BINARY_DIR}" TIMEOUT 60)
+  target_compile_definitions(test_output_contract PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_output_contract dlio_components)
+
   ament_add_gtest(test_sensor_detection test/test_sensor_detection.cpp)
   target_compile_definitions(test_sensor_detection PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_sensor_detection

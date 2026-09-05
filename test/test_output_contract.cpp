@@ -1,0 +1,327 @@
+// Regression coverage for consumers that build maps from registered scans.
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <limits>
+#include <thread>
+#include <tf2_msgs/msg/tf_message.hpp>
+
+#include "dlio/map.h"
+#include "dlio/odom.h"
+#include "dlio/pointcloud_fields.h"
+
+namespace dlio {
+struct OdomNodeTestAccess {
+  using Output = OdomNode::ScanOutput;
+  static Output capture(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr cloud) {
+    n.scan_stamp = 10.05;
+    n.scan_header_stamp = rclcpp::Time(10, 0, RCL_ROS_TIME);
+    n.lidarPose.p = Eigen::Vector3f(3, 4, 5);
+    n.lidarPose.q.setIdentity();
+    n.T_corr.setIdentity(); n.T_corr(0, 3) = 2.f;
+    n.wait_until_move_ = true; n.length_traversed = 1.;
+    return n.snapshotScanOutput(cloud);
+  }
+  static void advance(OdomNode& n) {
+    n.scan_stamp = 20.05;
+    n.scan_header_stamp = rclcpp::Time(20, 0, RCL_ROS_TIME);
+    n.lidarPose.p.setConstant(100.f); n.T_corr(0, 3) = 50.f;
+    n.state.p.setConstant(200.f); n.imu_stamp = rclcpp::Time(21, 0, RCL_ROS_TIME);
+    n.length_traversed = 0.;
+  }
+  static bool scanConnected(OdomNode& n) {
+    return n.deskewed_pub->get_subscription_count() && n.scan_pose_pub->get_subscription_count();
+  }
+  static bool keyframeConnected(OdomNode& n) {
+    return n.kf_cloud_pub->get_subscription_count() && n.kf_stamped_pose_pub->get_subscription_count();
+  }
+  static void publish(OdomNode& n, Output out) { n.publishToROS(std::move(out)); }
+  static const nav_msgs::msg::Path& path(OdomNode& n) { return n.path_ros; }
+  static void keyframe(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr cloud) {
+    n.publishKeyframe({{Eigen::Vector3f(7, 8, 9), Eigen::Quaternionf::Identity()}, cloud},
+                      rclcpp::Time(11, 50000000, RCL_ROS_TIME));
+  }
+  static void observer(OdomNode& n) {
+    n.geo.first_opt_done = true;
+    n.imu_stamp = rclcpp::Time(12, 300000000, RCL_ROS_TIME);
+    n.state.p = Eigen::Vector3f(4, 5, 6);
+    n.state.q = Eigen::Quaternionf(Eigen::AngleAxisf(M_PI_2, Eigen::Vector3f::UnitZ()));
+    n.state.v.lin.w = Eigen::Vector3f(1, 2, 3);
+    n.state.v.lin.b.setConstant(99.f); // deliberately stale cached body velocity
+    n.state.v.ang.b = Eigen::Vector3f(.1f, .2f, .3f);
+    n.publishPose();
+  }
+  static void scan(OdomNode& n, sensor_msgs::msg::PointCloud2::SharedPtr msg) { n.callbackPointCloud(msg); }
+  static void running(OdomNode& n, bool value) { n.setMainLoopRunning(value); }
+  static bool running(OdomNode& n) {
+    std::lock_guard<std::mutex> lock(n.main_loop_running_mutex);
+    return n.main_loop_running;
+  }
+  static void waitSubmap(OdomNode& n) { n.pauseSubmapBuildIfNeeded(); }
+  static int64_t lastScan(OdomNode& n) { return n.last_scan_input_ns_; }
+  static void imu(OdomNode& n, int64_t ns) {
+    auto msg = std::make_shared<sensor_msgs::msg::Imu>();
+    msg->header.stamp = rclcpp::Time(ns, RCL_ROS_TIME);
+    msg->linear_acceleration.z = 9.80665;
+    n.callbackImu(msg);
+  }
+  static size_t imuCount(OdomNode& n) { return n.imu_buffer.size(); }
+  static double imuDt(OdomNode& n) { return n.imu_buffer.front().dt; }
+  static double imuTime(OdomNode& n) { return n.imu_buffer.front().stamp; }
+  static void select(OdomNode& n, float lidar_x, float observer_x) {
+    n.lidarPose.p = Eigen::Vector3f(lidar_x, 0, 0);
+    n.state.p = Eigen::Vector3f(observer_x, 0, 0);
+    n.scan_stamp = 10.05;
+    n.keyframe_thresh_dist_ = 1.; n.keyframe_thresh_rot_ = 45.;
+    if (n.keyframes.empty()) {
+      n.keyframes.push_back({{Eigen::Vector3f::Zero(), Eigen::Quaternionf::Identity()}, n.current_scan});
+    }
+    n.updateKeyframes();
+  }
+  static size_t keyframeCount(OdomNode& n) { return n.keyframes.size(); }
+  static double keyframeTime(OdomNode& n) { return n.keyframe_timestamps.back().seconds(); }
+};
+struct MapNodeTestAccess {
+  static void ingest(MapNode& n, sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { n.callbackKeyframe(msg); }
+  static sensor_msgs::msg::PointCloud2::ConstSharedPtr message(MapNode& n) { return n.mapMessage(); }
+  static bool save(MapNode& n, float leaf) {
+    using Service = direct_lidar_inertial_odometry::srv::SavePCD;
+    auto req = std::make_shared<Service::Request>();
+    auto res = std::make_shared<Service::Response>();
+    req->leaf_size = leaf; n.savePCD(req, res); return res->success;
+  }
+};
+} // namespace dlio
+
+namespace {
+using Access = dlio::OdomNodeTestAccess;
+using MapAccess = dlio::MapNodeTestAccess;
+using Cloud = sensor_msgs::msg::PointCloud2;
+using Pose = geometry_msgs::msg::PoseStamped;
+using namespace std::chrono_literals;
+
+rclcpp::NodeOptions options() {
+  rclcpp::NodeOptions opts;
+  opts.append_parameter_override("odom/debug/dashboard", false);
+  opts.append_parameter_override("imu/calibration", false);
+  opts.append_parameter_override("pointcloud/deskew", false);
+  return opts;
+}
+pcl::PointCloud<PointType>::Ptr cloud() {
+  auto out = std::make_shared<pcl::PointCloud<PointType>>();
+  PointType p;
+  p.x = 1.f; p.y = 2.f; p.z = 3.f;
+  p.intensity = 1000.f; p.reflectivity = 42.f;
+  p.intensity_corrected = 1500.f; p.lidar_intensity = 900.f;
+  p.timestamp = 123.; out->push_back(p);
+  return out;
+}
+Cloud::SharedPtr message(int sec = 10) {
+  auto out = std::make_shared<Cloud>();
+  pcl::toROSMsg(*cloud(), *out);
+  out->header.frame_id = "odom"; out->header.stamp.sec = sec;
+  return out;
+}
+bool waitFor(rclcpp::Executor& exec, const std::function<bool()>& done) {
+  const auto end = std::chrono::steady_clock::now() + 3s;
+  while (!done() && std::chrono::steady_clock::now() < end) {
+    exec.spin_some(); std::this_thread::sleep_for(2ms);
+  }
+  return done();
+}
+void checkChannels(const Cloud& msg) {
+  for (const auto& field : msg.fields) {
+    EXPECT_NE(field.name, "t"); EXPECT_NE(field.name, "time"); EXPECT_NE(field.name, "timestamp");
+  }
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(msg, {"intensity"})[0], 1000.f);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(msg, {"reflectivity"})[0], 42.f);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(msg, {"intensity_corrected"})[0], 1500.f);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(msg, {"lidar_intensity"})[0], 900.f);
+}
+class OutputContract : public ::testing::Test {
+protected:
+  static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
+  static void TearDownTestSuite() { rclcpp::shutdown(); }
+};
+
+TEST_F(OutputContract, ScanCloudPoseAndPathRemainPairedAfterNextScanAdvances) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("scan_output_sink");
+  Cloud::ConstSharedPtr received;
+  Pose::ConstSharedPtr pose;
+  auto sub = sink->create_subscription<Cloud>("deskewed", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("scan_pose", 10, [&](Pose::ConstSharedPtr m) { pose = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::scanConnected(node); }));
+  auto output = Access::capture(node, cloud());
+  Access::advance(node);
+  Access::publish(node, output);
+  ASSERT_TRUE(waitFor(exec, [&] { return received && pose; }));
+  EXPECT_EQ(received->header, pose->header);
+  EXPECT_EQ(received->header.frame_id, "odom");
+  EXPECT_EQ(received->header.stamp.sec, 10);
+  EXPECT_EQ(received->header.stamp.nanosec, 50000000u);
+  EXPECT_DOUBLE_EQ(pose->pose.position.x, 3.);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"x"})[0], 3.f);
+  ASSERT_EQ(Access::path(node).poses.size(), 1u);
+  EXPECT_EQ(Access::path(node).poses.front(), *pose);
+  checkChannels(*received);
+}
+
+TEST_F(OutputContract, KeyframeCloudHasItsOwnStampedPoseAndPreservesChannels) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("keyframe_output_sink");
+  Cloud::ConstSharedPtr received;
+  Pose::ConstSharedPtr pose;
+  auto sub = sink->create_subscription<Cloud>("kf_cloud", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("kf_pose_stamped", 10, [&](Pose::ConstSharedPtr m) { pose = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node); }));
+  Access::keyframe(node, cloud());
+  ASSERT_TRUE(waitFor(exec, [&] { return received && pose; }));
+  EXPECT_EQ(received->header, pose->header);
+  EXPECT_EQ(pose->header.stamp.sec, 11);
+  EXPECT_EQ(pose->header.stamp.nanosec, 50000000u);
+  EXPECT_DOUBLE_EQ(pose->pose.position.x, 7.);
+  checkChannels(*received);
+}
+
+TEST_F(OutputContract, OdometryTwistIsBodyFrameAndTfMatchesObserverSnapshot) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("observer_output_sink");
+  nav_msgs::msg::Odometry::ConstSharedPtr odom;
+  tf2_msgs::msg::TFMessage::ConstSharedPtr tf;
+  auto sub = sink->create_subscription<nav_msgs::msg::Odometry>("odom", 10,
+      [&](nav_msgs::msg::Odometry::ConstSharedPtr m) { odom = m; });
+  auto tsub = sink->create_subscription<tf2_msgs::msg::TFMessage>("/tf", 100,
+      [&](tf2_msgs::msg::TFMessage::ConstSharedPtr m) { tf = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { Access::observer(node); return odom && tf; }));
+  EXPECT_NEAR(odom->twist.twist.linear.x, 2., 1e-6);
+  EXPECT_NEAR(odom->twist.twist.linear.y, -1., 1e-6);
+  EXPECT_NEAR(odom->twist.twist.linear.z, 3., 1e-6);
+  EXPECT_NEAR(odom->twist.twist.angular.z, .3, 1e-6);
+  ASSERT_EQ(tf->transforms.size(), 1u);
+  const auto& transform = tf->transforms.front();
+  EXPECT_EQ(transform.header, odom->header);
+  EXPECT_EQ(transform.child_frame_id, odom->child_frame_id);
+  EXPECT_DOUBLE_EQ(transform.transform.translation.x, odom->pose.pose.position.x);
+  EXPECT_EQ(transform.transform.rotation, odom->pose.pose.orientation);
+}
+
+TEST_F(OutputContract, KeyframeSelectionUsesRegisteredPoseInsteadOfLaterObserver) {
+  dlio::OdomNode node(options());
+  Access::select(node, .1f, 10.f);
+  EXPECT_EQ(Access::keyframeCount(node), 1u);
+  Access::select(node, 2.f, .1f);
+  EXPECT_EQ(Access::keyframeCount(node), 2u);
+  EXPECT_NEAR(Access::keyframeTime(node), 10.05, 1e-9);
+}
+
+TEST_F(OutputContract, SkippedScanReleasesSubmapAndRejectsTimeReversal) {
+  dlio::OdomNode node(options());
+  Access::running(node, true);
+  auto worker = std::async(std::launch::async, [&] { Access::waitSubmap(node); });
+  Access::scan(node, message()); // no IMU; returns before creating a target
+  EXPECT_FALSE(Access::running(node));
+  const bool released = worker.wait_for(1s) == std::future_status::ready;
+  Access::running(node, false); // keep test teardown safe on regression
+  EXPECT_TRUE(released);
+  worker.get();
+  Access::scan(node, message(9));
+  Access::scan(node, message(10));
+  EXPECT_EQ(Access::lastScan(node), 10000000000LL);
+  Access::scan(node, message(11));
+  EXPECT_EQ(Access::lastScan(node), 11000000000LL);
+}
+
+TEST_F(OutputContract, ImuStartupDuplicatesAndTimeReversalDoNotInventIntegrationTime) {
+  dlio::OdomNode node(options());
+  Access::imu(node, 10000000000LL);
+  EXPECT_EQ(Access::imuCount(node), 0u);
+  Access::imu(node, 10010000000LL);
+  ASSERT_EQ(Access::imuCount(node), 1u);
+  EXPECT_NEAR(Access::imuDt(node), .01, 1e-9);
+  Access::imu(node, 10010000000LL);
+  Access::imu(node, 10000000000LL);
+  EXPECT_EQ(Access::imuCount(node), 1u);
+  Access::imu(node, 10020000000LL);
+  EXPECT_EQ(Access::imuCount(node), 2u);
+  EXPECT_NEAR(Access::imuDt(node), .01, 1e-9);
+  EXPECT_NEAR(Access::imuTime(node), 10.02, 1e-9);
+}
+
+TEST_F(OutputContract, MapRejectsWrongFramesMalformedCloudsAndInvalidTimes) {
+  dlio::MapNode node;
+  auto wrong = message(); wrong->header.frame_id = "lidar";
+  MapAccess::ingest(node, wrong);
+  auto short_data = message(); short_data->data.pop_back();
+  MapAccess::ingest(node, short_data);
+  auto no_x = message(); no_x->fields.erase(no_x->fields.begin());
+  MapAccess::ingest(node, no_x);
+  auto bad_time = message(); bad_time->header.stamp.nanosec = 1000000000;
+  EXPECT_NO_THROW(MapAccess::ingest(node, bad_time));
+  EXPECT_FALSE(MapAccess::message(node));
+  MapAccess::ingest(node, message());
+  ASSERT_TRUE(MapAccess::message(node));
+  checkChannels(*MapAccess::message(node));
+}
+
+TEST_F(OutputContract, MapSnapshotsKeepMeasurementTimeAndRejectDuplicateKeyframes) {
+  dlio::MapNode node;
+  MapAccess::ingest(node, message());
+  const auto first = MapAccess::message(node);
+  ASSERT_TRUE(first);
+  const auto old_data = first->data;
+  EXPECT_EQ(first, MapAccess::message(node));
+  MapAccess::ingest(node, message(9));
+  MapAccess::ingest(node, message(10));
+  EXPECT_EQ(first, MapAccess::message(node));
+  MapAccess::ingest(node, message(11));
+  const auto second = MapAccess::message(node);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(second->width, 2u);
+  EXPECT_EQ(second->header.stamp.sec, 11);
+  EXPECT_EQ(first->header.stamp.sec, 10);
+  EXPECT_EQ(first->data, old_data);
+  EXPECT_EQ(first->width, 1u);
+}
+
+TEST_F(OutputContract, MapDecodesBigEndianPaddedRowsAndDropsNonfiniteGeometry) {
+  auto msg = message();
+  // Remove the overlapping time union before byte-swapping scalar fields.
+  dlio::stripAcquisitionTimeFields(msg->fields);
+  msg->height = 2; msg->row_step += 8;
+  const auto first = msg->data;
+  msg->data.resize(2 * msg->row_step, 0);
+  std::copy(first.begin(), first.end(), msg->data.begin() + msg->row_step);
+  const float invalid = std::numeric_limits<float>::quiet_NaN();
+  std::memcpy(msg->data.data() + msg->row_step, &invalid, sizeof(float));
+  for (size_t row = 0; row < 2; ++row) {
+    for (const auto& field : msg->fields) {
+      auto begin = msg->data.begin() + row * msg->row_step + field.offset;
+      std::reverse(begin, begin + sizeof(float));
+    }
+  }
+  msg->is_bigendian = true;
+  dlio::MapNode node; MapAccess::ingest(node, msg);
+  auto output = MapAccess::message(node);
+  ASSERT_TRUE(output);
+  EXPECT_EQ(output->width, 1u);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*output, {"x"})[0], 1.f);
+  checkChannels(*output);
+}
+
+TEST_F(OutputContract, MapRejectsInvalidVoxelSizesAtStartupAndExport) {
+  for (double leaf : {0., -1., std::numeric_limits<double>::infinity(),
+                      std::numeric_limits<double>::quiet_NaN(), 1e-45}) {
+    rclcpp::NodeOptions opts; opts.append_parameter_override("map/sparse/leafSize", leaf);
+    EXPECT_THROW(dlio::MapNode node(opts), std::invalid_argument);
+  }
+  dlio::MapNode node;
+  EXPECT_FALSE(MapAccess::save(node, 0.f));
+  EXPECT_FALSE(MapAccess::save(node, std::numeric_limits<float>::quiet_NaN()));
+}
+} // namespace

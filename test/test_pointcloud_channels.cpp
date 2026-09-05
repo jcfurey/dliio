@@ -16,6 +16,8 @@ struct MapNodeTestAccess {
   static void ingest(MapNode& node, const pcl::PointCloud<PointType>& cloud) {
     auto msg = std::make_shared<sensor_msgs::msg::PointCloud2>();
     pcl::toROSMsg(cloud, *msg);
+    msg->header.frame_id = "odom";
+    msg->header.stamp.sec = 10;
     node.callbackKeyframe(msg);
   }
   static const pcl::PointCloud<PointType>& cloud(const MapNode& node) {

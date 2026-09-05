@@ -28,6 +28,7 @@
 
 #include "rclcpp/qos.hpp"
 #include "rclcpp/create_timer.hpp"
+#include "rcpputils/scope_exit.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <cv_bridge/cv_bridge.hpp>
@@ -403,6 +404,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
 
   this->odom_pub     = this->create_publisher<nav_msgs::msg::Odometry>("odom", 1);
   this->pose_pub     = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", 1);
+  this->scan_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("scan_pose", 10);
+  this->kf_stamped_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("kf_pose_stamped", 10);
   this->path_pub     = this->create_publisher<nav_msgs::msg::Path>("path", 1);
   this->kf_pose_pub  = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
@@ -1046,9 +1049,11 @@ void dlio::OdomNode::publishPose() {
   this->odom_ros.pose.pose.orientation.y = st.q.y();
   this->odom_ros.pose.pose.orientation.z = st.q.z();
 
-  this->odom_ros.twist.twist.linear.x = st.v.lin.w[0];
-  this->odom_ros.twist.twist.linear.y = st.v.lin.w[1];
-  this->odom_ros.twist.twist.linear.z = st.v.lin.w[2];
+  // Odometry twist is expressed in child_frame_id (base), not header.frame_id.
+  const Eigen::Vector3f body_velocity = st.q.conjugate() * st.v.lin.w;
+  this->odom_ros.twist.twist.linear.x = body_velocity.x();
+  this->odom_ros.twist.twist.linear.y = body_velocity.y();
+  this->odom_ros.twist.twist.linear.z = body_velocity.z();
 
   this->odom_ros.twist.twist.angular.x = st.v.ang.b[0];
   this->odom_ros.twist.twist.angular.y = st.v.ang.b[1];
@@ -1070,27 +1075,61 @@ void dlio::OdomNode::publishPose() {
 
   this->pose_pub->publish(this->pose_ros);
 
+  // TF and odometry must describe exactly the same state and measurement time.
+  if (this->publish_tf_ && this->geo.first_opt_done) {
+    geometry_msgs::msg::TransformStamped tf;
+    tf.header = this->odom_ros.header;
+    tf.child_frame_id = this->baselink_frame;
+    tf.transform.translation.x = st.p.x();
+    tf.transform.translation.y = st.p.y();
+    tf.transform.translation.z = st.p.z();
+    tf.transform.rotation = this->odom_ros.pose.pose.orientation;
+    this->br->sendTransform(tf);
+  }
 }
 
-void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
-  this->publishCloud(published_cloud, T_cloud);
+rclcpp::Time dlio::OdomNode::scanReferenceStamp() const {
+  return rclcpp::Time(static_cast<int64_t>(std::llround(this->scan_stamp * 1e9)), RCL_ROS_TIME);
+}
 
-  // nav_msgs::msg::Path
-  this->path_ros.header.stamp = this->imu_stamp;
-  this->path_ros.header.frame_id = this->odom_frame;
+dlio::OdomNode::ScanOutput dlio::OdomNode::snapshotScanOutput(
+    pcl::PointCloud<PointType>::ConstPtr cloud) {
+  ScanOutput out;
+  out.cloud = std::move(cloud);
+  out.correction = this->T_corr;
+  out.pose.header.stamp = this->scanReferenceStamp();
+  out.pose.header.frame_id = this->odom_frame;
+  out.pose.pose.position.x = this->lidarPose.p.x();
+  out.pose.pose.position.y = this->lidarPose.p.y();
+  out.pose.pose.position.z = this->lidarPose.p.z();
+  out.pose.pose.orientation.w = this->lidarPose.q.w();
+  out.pose.pose.orientation.x = this->lidarPose.q.x();
+  out.pose.pose.orientation.y = this->lidarPose.q.y();
+  out.pose.pose.orientation.z = this->lidarPose.q.z();
+  out.publish_cloud = !this->wait_until_move_ || this->length_traversed >= 0.1;
+  return out;
+}
 
-  geometry_msgs::msg::PoseStamped p;
-  p.header.stamp = this->imu_stamp;
-  p.header.frame_id = this->odom_frame;
-  p.pose.position.x = this->state.p[0];
-  p.pose.position.y = this->state.p[1];
-  p.pose.position.z = this->state.p[2];
-  p.pose.orientation.w = this->state.q.w();
-  p.pose.orientation.x = this->state.q.x();
-  p.pose.orientation.y = this->state.q.y();
-  p.pose.orientation.z = this->state.q.z();
+dlio::OdomNode::State dlio::OdomNode::snapshotState() {
+  std::lock_guard<std::mutex> lock(this->geo.mtx);
+  return this->state;
+}
 
-  this->path_ros.poses.push_back(p);
+void dlio::OdomNode::setMainLoopRunning(bool running) {
+  {
+    std::lock_guard<std::mutex> lock(this->main_loop_running_mutex);
+    this->main_loop_running = running;
+  }
+  if (!running) { this->submap_build_cv.notify_all(); }
+}
+
+void dlio::OdomNode::publishToROS(ScanOutput output) {
+  // All scan data is captured before launching this worker. A later scan or
+  // IMU update cannot relabel an older cloud or tear its associated pose.
+  this->publishCloud(output);
+  this->scan_pose_pub->publish(output.pose);
+  this->path_ros.header = output.pose.header;
+  this->path_ros.poses.push_back(output.pose);
   // bound the path message: at scan rate an unbounded Path grows quadratically
   // in publish bandwidth over long runs
   if (this->path_ros.poses.size() > 10000) {
@@ -1098,34 +1137,6 @@ void dlio::OdomNode::publishToROS(pcl::PointCloud<PointType>::ConstPtr published
                                this->path_ros.poses.begin() + 1000);
   }
   this->path_pub->publish(this->path_ros);
-
-  // transform: odom to baselink
-  geometry_msgs::msg::TransformStamped transformStamped;
-
-  transformStamped.header.stamp = this->imu_stamp;
-  transformStamped.header.frame_id = this->odom_frame;
-  transformStamped.child_frame_id = this->baselink_frame;
-
-  transformStamped.transform.translation.x = this->state.p[0];
-  transformStamped.transform.translation.y = this->state.p[1];
-  transformStamped.transform.translation.z = this->state.p[2];
-
-  transformStamped.transform.rotation.w = this->state.q.w();
-  transformStamped.transform.rotation.x = this->state.q.x();
-  transformStamped.transform.rotation.y = this->state.q.y();
-  transformStamped.transform.rotation.z = this->state.q.z();
-
-  // Skippable when a fusion layer (e.g. robot_localization EKF) owns the
-  // odom->baselink transform: dlio then contributes odometry MESSAGES only
-  // (see cfg/robot_localization_ekf.yaml). Default true -> unchanged.
-  if (this->publish_tf_) {
-    br->sendTransform(transformStamped);
-  }
-
-  // baselink->imu and baselink->lidar are fixed extrinsics, so they are NOT
-  // re-sent here: in extrinsics/source=yaml they are published once (latched) by
-  // the static broadcaster; in =tf robot_state_publisher owns them (see ctor).
-
 }
 
 void dlio::OdomNode::publishStaticTransforms() {
@@ -1228,26 +1239,24 @@ void dlio::OdomNode::resolveExtrinsicsFromTf() {
   }
 }
 
-void dlio::OdomNode::publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud) {
+void dlio::OdomNode::publishCloud(const ScanOutput& output) {
 
   // Skip the (per-scan) dense transform + serialize when nobody is listening,
   // so RViz/Foxglove not subscribed to the deskewed cloud costs nothing -- the
   // single biggest viz-vs-estimator CPU contention source.
   if (this->deskewed_pub->get_subscription_count() == 0) { return; }
 
-  if (this->wait_until_move_) {
-    if (this->length_traversed < 0.1) { return; }
-  }
+  if (!output.publish_cloud) { return; }
 
   pcl::PointCloud<PointType>::Ptr deskewed_scan_t_ = std::make_shared<pcl::PointCloud<PointType>>();
 
-  pcl::transformPointCloud (*published_cloud, *deskewed_scan_t_, T_cloud);
+  pcl::transformPointCloud (*output.cloud, *deskewed_scan_t_, output.correction);
 
   // published deskewed cloud
   sensor_msgs::msg::PointCloud2 deskewed_ros;
   pcl::toROSMsg(*deskewed_scan_t_, deskewed_ros);
-  deskewed_ros.header.stamp = this->scan_header_stamp;
-  deskewed_ros.header.frame_id = this->odom_frame;
+  dlio::stripAcquisitionTimeFields(deskewed_ros.fields);
+  deskewed_ros.header = output.pose.header;
   this->deskewed_pub->publish(deskewed_ros);
 
 }
@@ -1263,7 +1272,16 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
   p.orientation.x = kf.first.second.x();
   p.orientation.y = kf.first.second.y();
   p.orientation.z = kf.first.second.z();
+  geometry_msgs::msg::PoseStamped stamped;
+  stamped.header.stamp = timestamp;
+  stamped.header.frame_id = this->odom_frame;
+  stamped.pose = p;
+  this->kf_stamped_pose_pub->publish(stamped);
   this->kf_pose_ros.poses.push_back(p);
+  if (this->kf_pose_ros.poses.size() > 10000) {
+    this->kf_pose_ros.poses.erase(this->kf_pose_ros.poses.begin(),
+                                this->kf_pose_ros.poses.begin() + 1000);
+  }
 
   // Publish
   this->kf_pose_ros.header.stamp = timestamp;
@@ -1276,6 +1294,7 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
       kf.second->points.size() == kf.second->width * kf.second->height) {
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
+    dlio::stripAcquisitionTimeFields(keyframe_cloud_ros.fields);
     keyframe_cloud_ros.header.stamp = timestamp;
     keyframe_cloud_ros.header.frame_id = this->odom_frame;
     this->kf_cloud_pub->publish(keyframe_cloud_ros);
@@ -1669,6 +1688,7 @@ void dlio::OdomNode::preprocessPoints() {
     // don't process scans until IMU data is present
     if (!this->first_valid_scan) {
 
+      std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
       if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
         return;
       }
@@ -1853,6 +1873,7 @@ void dlio::OdomNode::deskewPointcloud() {
 
   // don't process scans until IMU data is present
   if (!this->first_valid_scan) {
+    std::lock_guard<std::mutex> imu_lock(this->mtx_imu);
     if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
       return;
     }
@@ -1913,7 +1934,7 @@ void dlio::OdomNode::initializeInputTarget() {
 
   // keep history of keyframes
   this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
-  this->keyframe_timestamps.push_back(this->scan_header_stamp);
+  this->keyframe_timestamps.push_back(this->scanReferenceStamp());
   this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
   this->keyframe_transformations.push_back(this->T_corr);
 
@@ -1958,9 +1979,17 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   if (!this->extrinsics_ready_.load()) { return; }  // tf extrinsics not resolved yet
 
-  std::unique_lock<decltype(this->main_loop_running_mutex)> lock(main_loop_running_mutex);
-  this->main_loop_running = true;
-  lock.unlock();
+  if (pc->header.stamp.sec < 0 || pc->header.stamp.nanosec >= 1000000000u) { return; }
+  const int64_t input_ns = rclcpp::Time(pc->header.stamp).nanoseconds();
+  if (input_ns <= this->last_scan_input_ns_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Skipping duplicate or backward scan timestamp; restart for a new session");
+    return;
+  }
+  this->last_scan_input_ns_ = input_ns;
+
+  this->setMainLoopRunning(true);
+  auto release_submap = rcpputils::make_scope_exit([this] { this->setMainLoopRunning(false); });
 
   // Join the previous scan's dashboard thread before this scan mutates any of
   // the stats vectors it reads (comp_times / lidar_rates / metrics, all
@@ -2024,9 +2053,9 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
-    this->main_loop_running = false;
+    this->setMainLoopRunning(false);
     this->submap_future =
-      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state );
+      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->snapshotState() );
     this->submap_future.wait(); // wait until completion
     return;
   }
@@ -2047,22 +2076,20 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Build keyframe normals and submap if needed (and if we're not already waiting)
   if (this->new_submap_is_ready) {
-    this->main_loop_running = false;
+    this->setMainLoopRunning(false);
     this->submap_future =
-      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->state );
+      std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->snapshotState() );
   } else {
-    lock.lock();
-    this->main_loop_running = false;
-    lock.unlock();
-    this->submap_build_cv.notify_one();
+    this->setMainLoopRunning(false);
   }
 
   // Update distance traveled incrementally (replaces the unbounded trajectory
   // vector that debug() used to re-integrate from scratch every scan)
-  double l = (this->state.p - this->length_prev_p).norm();
+  const auto observer = this->snapshotState();
+  double l = (observer.p - this->length_prev_p).norm();
   if (l >= 0.1) {
     this->length_traversed += l;
-    this->length_prev_p = this->state.p;
+    this->length_prev_p = observer.p;
   }
 
   // Update time stamps. Capture the inter-scan period BEFORE overwriting
@@ -2082,7 +2109,8 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
     published_cloud = this->deskewed_scan;
   }
   if (this->publish_thread.joinable()) { this->publish_thread.join(); }
-  this->publish_thread = std::thread( &dlio::OdomNode::publishToROS, this, published_cloud, this->T_corr );
+  this->publish_thread = std::thread(&dlio::OdomNode::publishToROS, this,
+                                     this->snapshotScanOutput(published_cloud));
 
   // Update some statistics (wall-clock comp_time; see cpu_t0 above)
   const double comp_time =
@@ -2128,6 +2156,18 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   // (tf mode). Drops the brief startup window before tf is available.
   if (!this->extrinsics_ready_.load()) { return; }
 
+  if (imu_raw->header.stamp.sec < 0 || imu_raw->header.stamp.nanosec >= 1000000000u) { return; }
+  const int64_t input_ns = rclcpp::Time(imu_raw->header.stamp).nanoseconds();
+  if (input_ns <= this->last_imu_input_ns_) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Skipping duplicate or backward IMU timestamp; restart for a new session");
+    return;
+  }
+  if (this->last_imu_input_ns_ < 0) {
+    this->first_imu_stamp = rclcpp::Time(imu_raw->header.stamp).seconds();
+    this->prev_imu_stamp = this->first_imu_stamp;
+  }
+  this->last_imu_input_ns_ = input_ns;
   this->first_imu_received = true;
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
@@ -2152,10 +2192,6 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   lin_accel[0] = imu->linear_acceleration.x * accel_scale;
   lin_accel[1] = imu->linear_acceleration.y * accel_scale;
   lin_accel[2] = imu->linear_acceleration.z * accel_scale;
-
-  if (this->first_imu_stamp == 0.) {
-    this->first_imu_stamp = imu_stamp_secs;
-  }
 
   // IMU calibration procedure - do for three seconds
   if (!this->imu_calibrated) {
@@ -2189,6 +2225,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
       std::cout << "done" << std::endl << std::endl;
 
+      std::lock_guard<std::mutex> state_lock(this->geo.mtx);
       gyro_avg /= num_samples;
       accel_avg /= num_samples;
 
@@ -2255,7 +2292,8 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   } else {
 
     double dt = imu_stamp_secs - this->prev_imu_stamp;
-    if (dt == 0) { dt = 1.0/200.0; }
+    // With pre-calibrated IMU input the first sample establishes time only.
+    if (!(dt > 0.0)) { return; }
     {
       // imu_rates is read by publishDiagnostics (scan thread, every scan) and
       // the dashboard thread; guard the push+cap_history so the erase can't
@@ -3531,7 +3569,9 @@ void dlio::OdomNode::computeConcaveHull() {
 
 void dlio::OdomNode::updateKeyframes() {
 
-  // calculate difference in pose and rotation to all poses in trajectory
+  // Select using the same registered scan pose stored with the keyframe.
+  // The live IMU state has a different time and is concurrently propagated.
+  // Calculate difference in pose and rotation to all poses in trajectory
   float closest_d = std::numeric_limits<float>::infinity();
   int closest_idx = 0;
   int keyframes_idx = 0;
@@ -3541,9 +3581,9 @@ void dlio::OdomNode::updateKeyframes() {
   for (const auto& k : this->keyframes) {
 
     // calculate distance between current pose and pose in keyframes
-    const float kdx = this->state.p[0] - k.first.first[0];
-    const float kdy = this->state.p[1] - k.first.first[1];
-    const float kdz = this->state.p[2] - k.first.first[2];
+    const float kdx = this->lidarPose.p[0] - k.first.first[0];
+    const float kdy = this->lidarPose.p[1] - k.first.first[1];
+    const float kdz = this->lidarPose.p[2] - k.first.first[2];
     float delta_d = std::sqrt(kdx*kdx + kdy*kdy + kdz*kdz);
 
     // count the number nearby current pose
@@ -3566,20 +3606,20 @@ void dlio::OdomNode::updateKeyframes() {
   Eigen::Quaternionf closest_pose_r = this->keyframes[closest_idx].first.second;
 
   // calculate distance between current pose and closest pose from above
-  const float cdx = this->state.p[0] - closest_pose[0];
-  const float cdy = this->state.p[1] - closest_pose[1];
-  const float cdz = this->state.p[2] - closest_pose[2];
+  const float cdx = this->lidarPose.p[0] - closest_pose[0];
+  const float cdy = this->lidarPose.p[1] - closest_pose[1];
+  const float cdz = this->lidarPose.p[2] - closest_pose[2];
   float dd = std::sqrt(cdx*cdx + cdy*cdy + cdz*cdz);
 
   // calculate difference in orientation using SLERP
   Eigen::Quaternionf dq;
 
-  if (this->state.q.dot(closest_pose_r) < 0.) {
+  if (this->lidarPose.q.dot(closest_pose_r) < 0.) {
     Eigen::Quaternionf lq = closest_pose_r;
     lq.w() *= -1.; lq.x() *= -1.; lq.y() *= -1.; lq.z() *= -1.;
-    dq = this->state.q * lq.inverse();
+    dq = this->lidarPose.q * lq.inverse();
   } else {
-    dq = this->state.q * closest_pose_r.inverse();
+    dq = this->lidarPose.q * closest_pose_r.inverse();
   }
 
   double theta_rad = 2. * atan2(sqrt( pow(dq.x(), 2) + pow(dq.y(), 2) + pow(dq.z(), 2) ), dq.w());
@@ -3615,7 +3655,7 @@ void dlio::OdomNode::updateKeyframes() {
   // arXiv:2305.01843). Veto keyframe creation until observability returns.
   // Default off -> bit-identical.
   if (newKeyframe && this->keyframe_degen_gate_ &&
-      this->gicp.lastDegenerateDirections() > 0) {
+      (!this->gicp.lastDegenTransDirs().empty() || !this->gicp.lastDegenRotDirs().empty())) {
     newKeyframe = false;
   }
 
@@ -3633,7 +3673,7 @@ void dlio::OdomNode::updateKeyframes() {
     // update keyframe vector
     std::unique_lock<decltype(this->keyframes_mutex)> lock(this->keyframes_mutex);
     this->keyframes.push_back(std::make_pair(std::make_pair(this->lidarPose.p, this->lidarPose.q), this->current_scan));
-    this->keyframe_timestamps.push_back(this->scan_header_stamp);
+    this->keyframe_timestamps.push_back(this->scanReferenceStamp());
     this->keyframe_normals.push_back(std::make_shared<const nano_gicp::CovarianceList>(this->gicp.getSourceCovariances()));
     this->keyframe_transformations.push_back(this->T_corr);
     if (this->visual_map_enabled_) {

@@ -6,10 +6,21 @@
 #include <initializer_list>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 namespace dlio {
+
+// A deskewed/voxelized cloud is referenced to one scan pose. The internal time
+// union contains acquisition offsets (or averaged bits), not times relative to
+// that output header. Do not advertise those aliases on processed/map outputs.
+template<typename Field>
+void stripAcquisitionTimeFields(std::vector<Field>& fields) {
+  fields.erase(std::remove_if(fields.begin(), fields.end(), [](const Field& field) {
+    return field.name == "t" || field.name == "time" || field.name == "timestamp";
+  }), fields.end());
+}
 
 // A checked scalar view of a PointCloud2 field. Unlike a typed ROS iterator,
 // this respects row padding, unaligned offsets, and the message byte order.

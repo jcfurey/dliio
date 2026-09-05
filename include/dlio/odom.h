@@ -150,8 +150,18 @@ private:
   // then falls back to the YAML values). Sets extrinsics_ready_ when done.
   void resolveExtrinsicsFromTf();
 
-  void publishToROS(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
-  void publishCloud(pcl::PointCloud<PointType>::ConstPtr published_cloud, Eigen::Matrix4f T_cloud);
+  struct ScanOutput {
+    pcl::PointCloud<PointType>::ConstPtr cloud;
+    Eigen::Matrix4f correction;
+    geometry_msgs::msg::PoseStamped pose;
+    bool publish_cloud;
+  };
+  rclcpp::Time scanReferenceStamp() const;
+  ScanOutput snapshotScanOutput(pcl::PointCloud<PointType>::ConstPtr cloud);
+  State snapshotState();
+  void setMainLoopRunning(bool running);
+  void publishToROS(ScanOutput output);
+  void publishCloud(const ScanOutput& output);
   void publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
                        pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp);
 
@@ -230,6 +240,7 @@ private:
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr scan_pose_pub, kf_stamped_pose_pub;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
@@ -359,6 +370,10 @@ private:
   rclcpp::Time imu_stamp;
   double first_imu_stamp;
   double prev_imu_stamp;
+  // Each input stream is ordered independently. Replaying a new time epoch
+  // requires a fresh node; never integrate duplicate or backward measurements.
+  int64_t last_imu_input_ns_ = -1;
+  int64_t last_scan_input_ns_ = -1;
 
   // Per-instance running state that used to live in function-local statics --
   // those alias across OdomNode instances composed into a single process.

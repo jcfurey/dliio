@@ -43,6 +43,7 @@ private:
 
   void callbackKeyframe(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& keyframe);
   void publishMap();
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr mapMessage();
 
   void savePCD(std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Request> req,
                std::shared_ptr<direct_lidar_inertial_odometry::srv::SavePCD::Response> res);
@@ -56,6 +57,12 @@ private:
 
   pcl::PointCloud<PointType>::Ptr dlio_map;
   std::mutex map_mutex;  // guards dlio_map across callbackKeyframe / publishMap / savePCD
+  rclcpp::Time last_keyframe_stamp_{0, 0, RCL_ROS_TIME};
+  bool have_keyframe_stamp_ = false;
+  uint64_t map_revision_ = 0;
+  std::mutex publish_cache_mutex_;
+  uint64_t cached_revision_ = 0;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr cached_map_;
 
   std::string odom_frame;
 

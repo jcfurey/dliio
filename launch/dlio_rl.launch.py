@@ -69,6 +69,8 @@ def generate_launch_description():
             ('imu', LaunchConfiguration('imu_topic')),
             ('odom', 'dlio/odom_node/odom'),
             ('pose', 'dlio/odom_node/pose'),
+            ('scan_pose', 'dlio/odom_node/scan_pose'),
+            ('kf_pose_stamped', 'dlio/odom_node/keyframe_pose'),
             ('path', 'dlio/odom_node/path'),
             ('kf_pose', 'dlio/odom_node/keyframes'),
             ('kf_cloud', 'dlio/odom_node/pointcloud/keyframe'),
