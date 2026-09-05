@@ -48,6 +48,13 @@ def build_actions(args, package):
         raise ValueError('profile must be generic or 0705')
     if args['mapper'] not in ('preview', 'persistent'):
         raise ValueError('mapper must be preview or persistent')
+    if args['mapping_input'] not in ('observations', 'keyframes'):
+        raise ValueError('mapping_input must be observations or keyframes')
+    observations = args['mapper'] == 'persistent' and args['mapping_input'] == 'observations'
+    if args['keyframe_cloud'] not in ('auto', 'dense', 'filtered'):
+        raise ValueError('keyframe_cloud must be auto, dense, or filtered')
+    keyframe_filtered = (args['mapper'] != 'persistent' if args['keyframe_cloud'] == 'auto'
+                         else args['keyframe_cloud'] == 'filtered')
     mapping_config = Path(args['mapping_config']).expanduser() if args['mapping_config'] else package / 'cfg/mapping.yaml'
     if args['mapper'] == 'persistent' and not mapping_config.is_file():
         raise ValueError(f'Mapping configuration does not exist: {mapping_config}')
@@ -74,6 +81,8 @@ def build_actions(args, package):
             raise ValueError(f'Configuration file does not exist: {filename}')
     # This handoff owns its static extrinsics and requires no camera/fusion node.
     params.append({'use_sim_time': sim, 'extrinsics/source': 'yaml',
+                   'map/keyframe/filtered': keyframe_filtered,
+                   'map/observation/enabled': observations and boolean(args['map']),
                    'odom/visual/enabled': False, 'odom/visual/map/enabled': False,
                    'odom/debug/dashboard': False})
     intra = [{'use_intra_process_comms': True}]
@@ -114,6 +123,8 @@ def build_actions(args, package):
             ('scan_pose', '/dlio/odom_node/scan_pose'), ('path', '/dlio/odom_node/path'),
             ('kf_pose', '/dlio/odom_node/keyframes'), ('kf_pose_stamped', '/dlio/odom_node/keyframe_pose'),
             ('kf_cloud', '/dlio/odom_node/pointcloud/keyframe'),
+            ('mapping_cloud', '/dlio/odom_node/pointcloud/mapping'),
+            ('mapping_pose', '/dlio/odom_node/mapping_pose'),
             ('deskewed', '/dlio/odom_node/pointcloud/deskewed')], extra_arguments=intra))
     if boolean(args['map']) and args['mapper'] == 'preview':
         components.append(ComposableNode(
@@ -129,9 +140,11 @@ def build_actions(args, package):
                      Path(args['run_dir']).expanduser() / 'mapping')
         actions.append(Node(package='direct_lidar_inertial_odometry', executable='dlio_mapping_node.py',
             name='dlio_mapping_node', parameters=[*params, str(mapping_config),
-                {'mapping/storage_directory': str(directory.resolve()), 'mapping/load_path': ''}],
-            remappings=[('keyframes', '/dlio/odom_node/pointcloud/keyframe'),
-                        ('keyframe_pose', '/dlio/odom_node/keyframe_pose'), ('map', '/dlio/map_node/map')],
+                {'mapping/storage_directory': str(directory.resolve()), 'mapping/load_path': '',
+                 'mapping/input_source': args['mapping_input']}],
+            remappings=[('keyframes', '/dlio/odom_node/pointcloud/' + ('mapping' if observations else 'keyframe')),
+                        ('keyframe_pose', '/dlio/odom_node/' + ('mapping_pose' if observations else 'keyframe_pose')),
+                        ('map', '/dlio/map_node/map')],
             output='screen'))
     if boolean(args['rviz']):
         actions.append(Node(package='rviz2', executable='rviz2', name='dlio_rviz',
@@ -151,7 +164,8 @@ def build_actions(args, package):
 DEFAULTS = {
     'mode': 'points', 'profile': 'generic', 'bag': '', 'metadata': '', 'rate': '1.0',
     'rviz': 'false', 'map': 'true', 'use_sim_time': 'auto', 'robot_config': '', 'params_file': '',
-    'mapper': 'preview', 'mapping_config': '', 'archive_directory': '',
+    'mapper': 'preview', 'mapping_config': '', 'archive_directory': '', 'keyframe_cloud': 'auto',
+    'mapping_input': 'observations',
     'pointcloud_topic': '/ouster/points', 'imu_topic': '/ouster/imu',
     'run_dir': str(Path.cwd() / 'dliio_run'),
 }

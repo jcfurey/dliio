@@ -104,6 +104,8 @@ rclcpp::NodeOptions makeOptions() {
   o.append_parameter_override("odom/imu/calibration/time", 0.3);
   o.append_parameter_override("odom/imu/approximateGravity", false);
   o.append_parameter_override("pointcloud/deskew", true);
+  o.append_parameter_override("map/keyframe/filtered", false);
+  o.append_parameter_override("map/observation/enabled", true);
   // tiny keyframe thresholds -> frequent keyframes -> frequent background submap
   // rebuilds, maximizing the keyframe-vector concurrency surface
   o.append_parameter_override("odom/keyframe/threshD", 0.05);
@@ -143,6 +145,12 @@ TEST(NodeConcurrency, ConcurrentCallbacksRunRaceFreeAndShutDownClean) {
       "imu", rclcpp::SensorDataQoS());
   auto img_pub = pub_node->create_publisher<sensor_msgs::msg::Image>(
       "camera", rclcpp::SensorDataQoS());
+  // Discover a real consumer so the dense publication worker also transforms
+  // and serializes its captured scan while other callbacks advance the state.
+  auto keyframe_sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
+      "kf_cloud", 10, [](sensor_msgs::msg::PointCloud2::ConstSharedPtr) {});
+  auto mapping_sub = node->create_subscription<sensor_msgs::msg::PointCloud2>(
+      "mapping_cloud", 8, [](sensor_msgs::msg::PointCloud2::ConstSharedPtr) {});
 
   rclcpp::Clock clock(RCL_SYSTEM_TIME);
   const double scan_dt = 0.1;     // 10 Hz scans

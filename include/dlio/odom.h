@@ -156,14 +156,25 @@ private:
     geometry_msgs::msg::PoseStamped pose;
     bool publish_cloud;
   };
+  struct KeyframeOutput {
+    ScanOutput scan;
+    Eigen::Vector2f prior_xy;
+    bool reject_subfloor;
+  };
   rclcpp::Time scanReferenceStamp() const;
   ScanOutput snapshotScanOutput(pcl::PointCloud<PointType>::ConstPtr cloud);
+  KeyframeOutput snapshotKeyframeOutput();
+  void queueKeyframePublish();
+  bool mappingObservationDue();
+  void queueMappingPublish();
+  void publishMapping(KeyframeOutput output);
+  void publishRegisteredCloud(const KeyframeOutput& output,
+      const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher);
   State snapshotState();
   void setMainLoopRunning(bool running);
   void publishToROS(ScanOutput output);
   void publishCloud(const ScanOutput& output);
-  void publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>,
-                       pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp);
+  void publishKeyframe(KeyframeOutput output);
 
   void getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc);
   void preprocessPoints();
@@ -244,6 +255,8 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr kf_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_cloud_pub;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mapping_pose_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub;
 
@@ -282,6 +295,7 @@ private:
   // Threads
   std::thread publish_thread;
   std::thread publish_keyframe_thread;
+  std::thread publish_mapping_thread;
   std::thread debug_thread;
 
   // Distance traveled (maintained incrementally in callbackPointCloud)
@@ -532,6 +546,15 @@ private:
   int submap_kcc_;
 
   bool densemap_filtered_;
+  bool keyframe_filtered_;
+  bool mapping_enabled_ = false;
+  double mapping_distance_ = 0.20;
+  double mapping_rotation_ = 5.0;
+  double mapping_min_interval_ = 0.20;
+  bool mapping_started_ = false;
+  double mapping_last_stamp_ = 0.;
+  Eigen::Vector3f mapping_last_position_ = Eigen::Vector3f::Zero();
+  Eigen::Quaternionf mapping_last_orientation_ = Eigen::Quaternionf::Identity();
   bool wait_until_move_;
 
   // Sub-floor reject (specular ghost removal); off by default -> bit-identical.

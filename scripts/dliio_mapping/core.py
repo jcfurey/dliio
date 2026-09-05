@@ -1,9 +1,10 @@
 """Mapping storage and geometry. No ROS executor, sensor driver, or pickle data.
 
 One worker owns each Store. SQLite holds all keyframes/submaps on disk; only a
-bounded window of submap points and one active voxel accumulator stay in RAM.
+bounded window of submap points and one active accumulator stay in RAM.
 """
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
 import math
@@ -42,15 +43,15 @@ def validate_metadata(metadata):
 
 @dataclass(frozen=True)
 class Limits:
-    voxel_size: float = .2
+    voxel_size: float = 0.
     submap_keyframes: int = 20
     resident_submaps: int = 8
-    max_voxels: int = 100000
+    max_voxels: int = 1000000  # submap point capacity, including unvoxelized mode
     max_input_points: int = 200000
 
     def __post_init__(self):
-        if not math.isfinite(self.voxel_size) or not .001 <= self.voxel_size <= 100:
-            raise ValueError('voxel_size must be finite and between .001 and 100 metres')
+        if not math.isfinite(self.voxel_size) or not (self.voxel_size == 0 or .001 <= self.voxel_size <= 100):
+            raise ValueError('voxel_size must be 0 (disabled) or between .001 and 100 metres')
         for name, maximum in [('submap_keyframes', 1000), ('resident_submaps', 64),
                               ('max_voxels', 1000000), ('max_input_points', 1000000)]:
             value = getattr(self, name)
@@ -135,9 +136,110 @@ class Voxels:
         np.divide(self.sums, self.counts, out=values, where=self.counts != 0)
         return values.astype('<f4')
 
+    def __len__(self):
+        return len(self.keys)
+
     @property
     def nbytes(self):
         return self.keys.nbytes + self.sums.nbytes + self.counts.nbytes
+
+
+class WindowFusion:
+    """Incremental world-grid means with reversible resident-submap eviction.
+
+    Packed integer keys index NumPy accumulators; no per-point Python arrays.
+    Freed slots are reused, so capacity is bounded by the peak resident window.
+    Source records, including every original scalar, remain in the archive.
+    """
+    def __init__(self, leaf):
+        validate_leaf(leaf)
+        self.leaf = leaf
+        self.index = {}
+        self.free = []
+        self.used = 0
+        self.keys = np.empty((0, 3), dtype=np.int64)
+        self.sums = np.zeros((0, 7), dtype=np.float64)
+        self.counts = np.zeros((0, 7), dtype=np.int64)
+
+    def _grow(self, required):
+        if required <= len(self.keys):
+            return
+        capacity = max(required, 4096, len(self.keys) * 2)
+        for name in ('keys', 'sums', 'counts'):
+            old = getattr(self, name)
+            values = np.zeros((capacity, old.shape[1]), dtype=old.dtype)
+            values[:len(old)] = old
+            setattr(self, name, values)
+
+    def update(self, points, remove=False):
+        if not len(points):
+            return
+        voxels = Voxels.from_points(points, self.leaf)
+        packed = voxels.keys.view('V24').ravel().tolist()
+        slots = np.empty(len(packed), dtype=np.intp)
+        for i, key in enumerate(packed):
+            slot = self.index.get(key)
+            if slot is None:
+                if remove:
+                    raise ValueError('Cannot remove observations outside the fusion window')
+                if self.free:
+                    slot = self.free.pop()
+                else:
+                    slot = self.used
+                    self.used += 1
+                    self._grow(self.used)
+                self.index[key] = slot
+                self.keys[slot] = voxels.keys[i]
+            slots[i] = slot
+        sign = -1 if remove else 1
+        self.sums[slots] += sign * voxels.sums
+        self.counts[slots] += sign * voxels.counts.astype(np.int64)
+        if remove:
+            if np.any(self.counts[slots] < 0):
+                raise ValueError('Fusion observation count underflow')
+            for i in np.flatnonzero(self.counts[slots, 0] == 0):
+                slot = int(slots[i])
+                del self.index[packed[i]]
+                self.sums[slot] = 0
+                self.counts[slot] = 0
+                self.free.append(slot)
+
+    def points(self):
+        slots = np.flatnonzero(self.counts[:self.used, 0])
+        keys = self.keys[slots]
+        slots = slots[np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))]
+        sums, counts = self.sums[slots], self.counts[slots]
+        values = np.full_like(sums, np.nan)
+        np.divide(sums, counts, out=values, where=counts != 0)
+        return values.astype('<f4')
+
+    @property
+    def nbytes(self):
+        # Arrays only. Python key/index bookkeeping is included in node RSS.
+        return self.keys.nbytes + self.sums.nbytes + self.counts.nbytes
+
+
+class Samples:
+    """Keep individual returns, including coincident XYZ with different fields.
+
+    Merging creates a new array so a failed transaction cannot change the live
+    submap. The resident map shares this array with the active accumulator.
+    """
+    def __init__(self, points):
+        self.values = points
+
+    def merged(self, other):
+        return Samples(np.vstack((self.values, other.values)))
+
+    def points(self):
+        return self.values
+
+    def __len__(self):
+        return len(self.values)
+
+    @property
+    def nbytes(self):
+        return 0  # already counted in the resident array
 
 
 def atomic_output(path, write):
@@ -162,6 +264,54 @@ def atomic_output(path, write):
             Path(temporary + suffix).unlink(missing_ok=True)
 
 
+def validate_leaf(leaf):
+    if leaf is not None and (not math.isfinite(leaf) or not .001 <= leaf <= 100):
+        raise ValueError('Fusion leaf size must be between .001 and 100 metres, or None to disable')
+
+
+@contextmanager
+def fused_chunks(chunks, leaf, directory):
+    """Fuse all world-frame chunks on one grid without keeping a global map in RAM.
+
+    This scratch database is output preparation, never the source archive.
+    Per-field sums/counts carry sample weights across submap boundaries.
+    """
+    with tempfile.TemporaryDirectory(prefix='.dliio-fusion-', dir=directory) as temporary:
+        db = sqlite3.connect(Path(temporary) / 'fusion.sqlite3')
+        try:
+            db.execute('PRAGMA cache_size=-8192')
+            db.execute('PRAGMA temp_store=FILE')
+            db.execute('PRAGMA journal_mode=OFF')
+            db.execute('PRAGMA synchronous=OFF')
+            columns = [f's{i}' for i in range(7)] + [f'c{i}' for i in range(7)]
+            db.execute('CREATE TABLE cells (x INTEGER,y INTEGER,z INTEGER,' +
+                       ','.join(f'{name} REAL NOT NULL' for name in columns) +
+                       ',PRIMARY KEY(x,y,z)) WITHOUT ROWID')
+            sql = ('INSERT INTO cells VALUES(' + ','.join('?' for _ in range(17)) +
+                   ') ON CONFLICT(x,y,z) DO UPDATE SET ' +
+                   ','.join(f'{name}={name}+excluded.{name}' for name in columns))
+            for points in chunks:
+                voxels = Voxels.from_points(points, leaf)
+                for start in range(0, len(voxels), 8192):
+                    rows = zip(voxels.keys[start:start + 8192].tolist(),
+                               voxels.sums[start:start + 8192].tolist(),
+                               voxels.counts[start:start + 8192].tolist())
+                    db.executemany(sql, ((*key, *sums, *counts) for key, sums, counts in rows))
+                db.commit()
+            count = db.execute('SELECT count(*) FROM cells').fetchone()[0]
+            cursor = db.execute('SELECT ' + ','.join(f's{i}/NULLIF(c{i},0)' for i in range(7)) +
+                                ' FROM cells ORDER BY x,y,z')
+            def output():
+                while True:
+                    rows = cursor.fetchmany(8192)
+                    if not rows:
+                        return
+                    yield np.asarray(rows, dtype='<f4')  # SQL NULL -> missing-channel NaN
+            yield count, output()
+        finally:
+            db.close()
+
+
 class Store:
     def __init__(self, path, limits, *, metadata=None):
         self.path = Path(path).expanduser().resolve()
@@ -170,6 +320,7 @@ class Store:
         self.active = None
         self.active_count = 0
         self.active_id = None
+        self.fusion = None
         self.read_only = metadata is None
         if self.read_only:
             self.db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, isolation_level=None)
@@ -277,7 +428,9 @@ class Store:
 
     def _evict(self):
         while len(self.resident) > self.limits.resident_submaps:
-            self.resident.popitem(last=False)
+            _, (pose, points) = self.resident.popitem(last=False)
+            if self.fusion is not None:
+                self.fusion.update(transform(points, pose), remove=True)
 
     def ingest(self, stamp_ns, pose, world_points):
         if self.read_only:
@@ -293,13 +446,21 @@ class Store:
         local = transform(points, pose, inverse=True)
         fresh = self.active is None or self.active_count >= self.limits.submap_keyframes
         anchor = pose if fresh else self.resident[self.active_id][0]
-        incoming = Voxels.from_points(transform(points, anchor, inverse=True), self.limits.voxel_size)
-        candidate = incoming if fresh else self.active.merged(incoming)
-        if len(candidate.keys) > self.limits.max_voxels and not fresh:
+        def accumulate(values):
+            return (Voxels.from_points(values, self.limits.voxel_size)
+                    if self.limits.voxel_size else Samples(values))
+        incoming = accumulate(local if fresh else transform(points, anchor, inverse=True))
+        # In sample mode the exact size is known before concatenation. Roll
+        # early instead of allocating a candidate beyond the configured bound.
+        if not fresh and not self.limits.voxel_size and len(self.active) + len(incoming) > self.limits.max_voxels:
             fresh, anchor = True, pose
-            candidate = Voxels.from_points(local, self.limits.voxel_size)
-        if len(candidate.keys) > self.limits.max_voxels:
-            raise ValueError('Single keyframe exceeds submap voxel capacity')
+            incoming = accumulate(local)
+        candidate = incoming if fresh else self.active.merged(incoming)
+        if len(candidate) > self.limits.max_voxels and not fresh:
+            fresh, anchor = True, pose
+            candidate = accumulate(local)
+        if len(candidate) > self.limits.max_voxels:
+            raise ValueError('Single keyframe exceeds submap point capacity')
         identifier = self.meta['keyframes']
         submap_id = self.meta['submaps'] if fresh else self.active_id
         first = identifier if fresh else identifier - self.active_count
@@ -324,47 +485,65 @@ class Store:
         self.active, self.active_id = candidate, submap_id
         self.active_count = 1 if fresh else self.active_count + 1
         self.resident[submap_id] = (anchor, centers)
+        if self.limits.voxel_size:
+            self.fusion = None  # legacy filtered submaps replace old centroids
+        elif self.fusion is not None:
+            self.fusion.update(transform(incoming.points(), anchor))
         self._evict()
         return identifier
 
-    def snapshot(self):
+    def snapshot(self, leaf_size=None):
+        validate_leaf(leaf_size)
         if not self.resident:
             return np.empty((0, 7), dtype='<f4')
-        return np.vstack([transform(points, pose) for pose, points in self.resident.values()])
+        if leaf_size is None:
+            return np.vstack([transform(points, pose) for pose, points in self.resident.values()])
+        if self.fusion is None or self.fusion.leaf != leaf_size:
+            fusion = WindowFusion(leaf_size)
+            for pose, points in self.resident.values():
+                fusion.update(transform(points, pose))
+            self.fusion = fusion
+        return self.fusion.points()
 
     def stats(self):
         return dict(session_id=self.meta['session_id'], keyframes=self.meta['keyframes'], submaps=self.meta['submaps'],
+            voxel_size=self.limits.voxel_size,
             resident_submaps=len(self.resident), resident_points=sum(len(p) for _, p in self.resident.values()),
             resident_array_bytes=sum(p.nbytes + pose.nbytes for pose, p in self.resident.values()) +
                                  (self.active.nbytes if self.active is not None else 0),
+            fusion_array_bytes=self.fusion.nbytes if self.fusion is not None else 0,
             last_stamp_ns=self.meta['last_stamp_ns'], read_only=self.read_only, archive=str(self.path))
 
     def save(self, destination):
         snapshot_database(self.path, destination)
 
     def export_pcd(self, destination, leaf_size=None):
-        if leaf_size is not None and (not math.isfinite(leaf_size) or not .001 <= leaf_size <= 100):
-            raise ValueError('Export leaf size must be between .001 and 100 metres')
+        validate_leaf(leaf_size)
 
         def chunks():
             for pose, count, blob, crc in self.db.execute('SELECT pose,count,points,crc FROM submaps ORDER BY id'):
-                points = transform(decode_points(blob, count, crc, self.limits.max_voxels), decode_pose(pose))
-                if leaf_size is not None:
-                    points = Voxels.from_points(points, leaf_size).points()
-                yield points
+                yield transform(decode_points(blob, count, crc, self.limits.max_voxels), decode_pose(pose))
 
-        # Two bounded passes permit an ordinary binary PCD header and no full-map allocation.
-        count = sum(len(points) for points in chunks())
-        if not 0 < count <= 2 ** 32 - 1:
-            raise ValueError('Cannot export an empty or oversized PCD')
-        def write(path):
+        def write_points(path, count, arrays):
+            if not 0 < count <= 2 ** 32 - 1:
+                raise ValueError('Cannot export an empty or oversized PCD')
             header = ('# .PCD v0.7\nVERSION 0.7\nFIELDS ' + ' '.join(FIELDS) +
                 '\nSIZE 4 4 4 4 4 4 4\nTYPE F F F F F F F\nCOUNT 1 1 1 1 1 1 1\n' +
                 f'WIDTH {count}\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\nPOINTS {count}\nDATA binary\n')
             with path.open('wb') as stream:
                 stream.write(header.encode('ascii'))
-                for points in chunks():
+                for points in arrays:
                     stream.write(np.asarray(points, dtype='<f4').tobytes())
+        count = 0
+        def write(path):
+            nonlocal count
+            if leaf_size is None:
+                # Two bounded passes avoid allocating the full raw map.
+                count = sum(len(points) for points in chunks())
+                write_points(path, count, chunks())
+            else:
+                with fused_chunks(chunks(), leaf_size, path.parent) as (count, arrays):
+                    write_points(path, count, arrays)
         atomic_output(destination, write)
         return count
 

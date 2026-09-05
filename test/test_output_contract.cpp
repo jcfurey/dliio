@@ -15,6 +15,7 @@
 namespace dlio {
 struct OdomNodeTestAccess {
   using Output = OdomNode::ScanOutput;
+  using KeyframeOutput = OdomNode::KeyframeOutput;
   static Output capture(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr cloud) {
     n.scan_stamp = 10.05;
     n.scan_header_stamp = rclcpp::Time(10, 0, RCL_ROS_TIME);
@@ -30,6 +31,7 @@ struct OdomNodeTestAccess {
     n.lidarPose.p.setConstant(100.f); n.T_corr(0, 3) = 50.f;
     n.state.p.setConstant(200.f); n.imu_stamp = rclcpp::Time(21, 0, RCL_ROS_TIME);
     n.length_traversed = 0.;
+    n.T_prior(0, 3) = 100.f;
   }
   static bool scanConnected(OdomNode& n) {
     return n.deskewed_pub->get_subscription_count() && n.scan_pose_pub->get_subscription_count();
@@ -40,8 +42,34 @@ struct OdomNodeTestAccess {
   static void publish(OdomNode& n, Output out) { n.publishToROS(std::move(out)); }
   static const nav_msgs::msg::Path& path(OdomNode& n) { return n.path_ros; }
   static void keyframe(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr cloud) {
-    n.publishKeyframe({{Eigen::Vector3f(7, 8, 9), Eigen::Quaternionf::Identity()}, cloud},
-                      rclcpp::Time(11, 50000000, RCL_ROS_TIME));
+    n.scan_stamp = 11.05;
+    n.lidarPose.p = Eigen::Vector3f(7, 8, 9); n.lidarPose.q.setIdentity();
+    n.T_corr.setIdentity();
+    n.publishKeyframe({n.snapshotScanOutput(cloud), Eigen::Vector2f::Zero(), false});
+  }
+  static KeyframeOutput captureKeyframe(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr dense,
+                                       pcl::PointCloud<PointType>::ConstPtr filtered, bool use_filtered) {
+    capture(n, filtered);
+    n.current_scan = filtered; n.deskewed_scan = dense; n.keyframe_filtered_ = use_filtered;
+    n.T_prior.setIdentity();
+    return n.snapshotKeyframeOutput();
+  }
+  static void publishKeyframe(OdomNode& n, KeyframeOutput out) { n.publishKeyframe(std::move(out)); }
+  static bool mappingDue(OdomNode& n, double stamp, float x, float yaw = 0.f, bool veto = false) {
+    n.scan_stamp = stamp;
+    n.lidarPose.p = Eigen::Vector3f(x, 0, 0);
+    n.lidarPose.q = Eigen::Quaternionf(Eigen::AngleAxisf(yaw, Eigen::Vector3f::UnitZ()));
+    n.fuse_tripped_scan_ = veto;
+    return n.mappingObservationDue();
+  }
+  static bool mappingConnected(OdomNode& n) {
+    return n.mapping_cloud_pub->get_subscription_count() && n.mapping_pose_pub->get_subscription_count();
+  }
+  static void publishMapping(OdomNode& n, KeyframeOutput out) { n.publishMapping(std::move(out)); }
+  static void initializeTarget(OdomNode& n) { n.initializeInputTarget(); }
+  static size_t registrationPoints(OdomNode& n) { return n.keyframes.back().second->size(); }
+  static void floorFilter(OdomNode& n) {
+    n.subfloor_reject_enabled_ = true; n.gravity_align_ = true;
   }
   static void observer(OdomNode& n) {
     n.geo.first_opt_done = true;
@@ -185,6 +213,112 @@ TEST_F(OutputContract, KeyframeCloudHasItsOwnStampedPoseAndPreservesChannels) {
   EXPECT_EQ(pose->header.stamp.sec, 11);
   EXPECT_EQ(pose->header.stamp.nanosec, 50000000u);
   EXPECT_DOUBLE_EQ(pose->pose.position.x, 7.);
+  checkChannels(*received);
+}
+
+TEST_F(OutputContract, DenseKeyframeKeepsNearbyReturnsAndFrozenRegistration) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("dense_keyframe_sink");
+  Cloud::ConstSharedPtr received;
+  Pose::ConstSharedPtr pose;
+  auto sub = sink->create_subscription<Cloud>("kf_cloud", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("kf_pose_stamped", 10, [&](Pose::ConstSharedPtr m) { pose = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node); }));
+  auto dense = cloud();
+  auto second = dense->front(); second.x += .001f; second.reflectivity = 84.f;
+  dense->push_back(second);
+  auto filtered = cloud();
+  auto output = Access::captureKeyframe(node, dense, filtered, false);
+  auto sparse = Access::captureKeyframe(node, dense, filtered, true);
+  EXPECT_EQ(output.scan.cloud, dense);
+  EXPECT_EQ(sparse.scan.cloud, filtered);
+  Access::advance(node);
+  Access::publishKeyframe(node, output);
+  ASSERT_TRUE(waitFor(exec, [&] { return received && pose; }));
+  EXPECT_EQ(received->width * received->height, 2u);
+  EXPECT_EQ(received->header, pose->header);
+  EXPECT_EQ(pose->header.stamp.sec, 10);
+  EXPECT_EQ(pose->header.stamp.nanosec, 50000000u);
+  EXPECT_DOUBLE_EQ(pose->pose.position.x, 3.);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"x"})[0], 3.f);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"x"})[1], second.x + 2.f);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"reflectivity"})[1], 84.f);
+  EXPECT_FLOAT_EQ(dense->front().x, 1.f); // correction never mutates either source
+  EXPECT_FLOAT_EQ(filtered->front().x, 1.f);
+  checkChannels(*received);
+}
+
+TEST_F(OutputContract, InitialTargetPublishesDenseCloudButRetainsSparseRegistrationHistory) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("initial_dense_keyframe_sink");
+  Cloud::ConstSharedPtr received;
+  Pose::ConstSharedPtr pose;
+  auto sub = sink->create_subscription<Cloud>("kf_cloud", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("kf_pose_stamped", 10, [&](Pose::ConstSharedPtr m) { pose = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node); }));
+  auto dense = cloud(); dense->push_back(dense->front());
+  Access::captureKeyframe(node, dense, cloud(), false);
+  Access::initializeTarget(node);
+  ASSERT_TRUE(waitFor(exec, [&] { return received && pose; }));
+  EXPECT_EQ(received->width * received->height, 2u);
+  EXPECT_EQ(received->header, pose->header);
+  EXPECT_EQ(Access::registrationPoints(node), 1u);
+  EXPECT_EQ(Access::keyframeCount(node), 1u);
+}
+
+TEST_F(OutputContract, DenseKeyframeHonorsOptionalGhostFilterWithCapturedCenter) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("dense_floor_keyframe_sink");
+  Cloud::ConstSharedPtr received;
+  auto sub = sink->create_subscription<Cloud>("kf_cloud", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("kf_pose_stamped", 10, [](Pose::ConstSharedPtr) {});
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node); }));
+  auto dense = cloud();
+  for (int i = 0; i < 19; ++i) { dense->push_back(dense->front()); }
+  auto ghost = dense->front(); ghost.z -= 1.f; dense->push_back(ghost);
+  Access::floorFilter(node);
+  auto output = Access::captureKeyframe(node, dense, cloud(), false);
+  Access::advance(node);
+  Access::publishKeyframe(node, output);
+  ASSERT_TRUE(waitFor(exec, [&] { return bool(received); }));
+  EXPECT_EQ(received->width * received->height, 20u);
+  EXPECT_EQ(dense->size(), 21u);
+  checkChannels(*received);
+}
+
+TEST_F(OutputContract, MappingObservationsCoverRevisitsWithoutChangingRegistrationHistory) {
+  auto opts = options(); opts.append_parameter_override("map/observation/enabled", true);
+  dlio::OdomNode node(opts);
+  EXPECT_TRUE(Access::mappingDue(node, 1., 0.f));
+  EXPECT_FALSE(Access::mappingDue(node, 1.1, 1.f)); // bounded publication rate
+  EXPECT_FALSE(Access::mappingDue(node, 1.3, .1f));
+  EXPECT_TRUE(Access::mappingDue(node, 1.6, .21f));
+  EXPECT_TRUE(Access::mappingDue(node, 1.9, 0.f)); // revisit the origin
+  EXPECT_FALSE(Access::mappingDue(node, 2.2, 0.f)); // stationary scans do not accumulate
+  EXPECT_TRUE(Access::mappingDue(node, 2.5, 0.f, .1f)); // pure rotation
+  EXPECT_FALSE(Access::mappingDue(node, 2.8, 1.f, .1f, true));
+  EXPECT_TRUE(Access::mappingDue(node, 3.1, 1.f, .1f)); // veto did not advance selection
+  EXPECT_EQ(Access::keyframeCount(node), 0u);
+}
+
+TEST_F(OutputContract, MappingOutputFreezesPoseCorrectionAndAllScalarChannels) {
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("mapping_output_sink");
+  Cloud::ConstSharedPtr received; Pose::ConstSharedPtr pose;
+  auto sub = sink->create_subscription<Cloud>("mapping_cloud", 8, [&](Cloud::ConstSharedPtr m) { received = m; });
+  auto psub = sink->create_subscription<Pose>("mapping_pose", 8, [&](Pose::ConstSharedPtr m) { pose = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::mappingConnected(node); }));
+  auto output = Access::captureKeyframe(node, cloud(), cloud(), false);
+  Access::advance(node);
+  Access::publishMapping(node, output);
+  ASSERT_TRUE(waitFor(exec, [&] { return received && pose; }));
+  EXPECT_EQ(received->header, output.scan.pose.header);
+  EXPECT_EQ(*pose, output.scan.pose);
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"x"})[0], 3.f);
   checkChannels(*received);
 }
 

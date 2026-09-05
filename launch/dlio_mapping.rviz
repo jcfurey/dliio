@@ -15,14 +15,15 @@ Visualization Manager:
       Plane Cell Count: 100
     - Class: rviz_default_plugins/PointCloud2
       Name: Map signal
-      Enabled: true
+      Enabled: false
       Topic:
         Value: /dlio/map_node/map
         Reliability Policy: Reliable
         Durability Policy: Transient Local
         Depth: 1
-      Size (m): 0.07
-      Style: Flat Squares
+      Size (Pixels): 1
+      Size (m): 0.02
+      Style: Points
       Position Transformer: XYZ
       Color Transformer: Intensity
       Channel Name: intensity
@@ -30,18 +31,21 @@ Visualization Manager:
       Use rainbow: false
     - Class: rviz_default_plugins/PointCloud2
       Name: Map reflectivity
-      Enabled: false
+      Enabled: true
       Topic:
         Value: /dlio/map_node/map
         Reliability Policy: Reliable
         Durability Policy: Transient Local
         Depth: 1
-      Size (m): 0.07
-      Style: Flat Squares
+      Size (Pixels): 1
+      Size (m): 0.02
+      Style: Points
       Position Transformer: XYZ
       Color Transformer: Intensity
       Channel Name: reflectivity
-      Autocompute Intensity Bounds: true
+      Autocompute Intensity Bounds: false
+      Min Intensity: 0
+      Max Intensity: 100
   Views:
     Current:
       Class: rviz_default_plugins/Orbit

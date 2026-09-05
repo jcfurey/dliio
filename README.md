@@ -21,7 +21,9 @@ ros2 launch direct_lidar_inertial_odometry dlio_mapping.launch.py \
 The dataset is supplied separately. The 0705 calibration is specific to that
 recording. The [persistent mapper](doc/MAPPING_NODE.md) retains local keyframes
 and poses, limits the live submap window, and supports archive save/reload and
-full PCD export. Loop closure is the next stage. The original
+full PCD export. It selects full-resolution deskewed mapping observations independently of
+odometry keyframes and fuses their overlap on a shared configurable grid (2 cm by default). Source retention,
+output fusion, and odometry downsampling are separate. Loop closure is the next stage. The original
 `dlio_ouster.launch.py` retains the legacy accumulated-map preview by default.
 
 # Modifications

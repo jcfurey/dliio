@@ -17,6 +17,8 @@ Frame names remain configurable; the table uses `odom` and `base_link`.
 | `pointcloud/deskewed` | Registered XYZ already in `odom` | Exact same header as its `scan_pose` |
 | `keyframe_pose` | Registered base pose for one keyframe | Exact same header as its keyframe cloud |
 | `pointcloud/keyframe` | Registered keyframe XYZ already in `odom` | Keyframe's scan reference time |
+| `mapping_pose` | Registered base pose for a dense mapping observation | Exact same header as its mapping cloud |
+| `pointcloud/mapping` | Full-resolution registered observation in `odom` | Mapping observation scan reference time |
 | `path` | Recent registered scan poses | Individual scan reference times |
 | `keyframes` | Recent keyframe poses as a legacy `PoseArray` | Header describes only the newest entry |
 
@@ -29,12 +31,36 @@ presence and, for the deskewed topic, `waitUntilMove`.
 The scan publisher captures its cloud, registration correction, reference pose,
 timestamp, and movement gate before starting the background worker. Keyframe
 selection and storage both use this registered pose. A newer IMU update cannot
-change the pose or timestamp attached to an older cloud.
+change the pose or timestamp attached to an older cloud. Keyframe publication
+captures the selected scan before background submap construction; it applies
+the captured registration correction once to its own output cloud.
+
+`map/keyframe/filtered` controls whether keyframes contain the registration
+cloud (`true`, compatibility default) or the full-resolution deskewed cloud
+(`false`). The Ouster launch's `keyframe_cloud:=auto` chooses dense output for
+the persistent mapper and filtered output for the preview mapper; `dense` and
+`filtered` select explicitly. `map/dense/filtered` separately controls the
+every-scan `pointcloud/deskewed` topic. Neither setting changes registration
+voxel size or keyframe selection. Dense keyframes retain individual valid,
+cropped returns and honor the optional sub-floor rejection filter. Their full
+clouds are released after publication rather than added to registration's
+keyframe/covariance history.
+
+The persistent Ouster launch defaults to `mapping_input:=observations`. Its
+`pointcloud/mapping` / `mapping_pose` pair is selected from the last mapping
+observation (20 cm translation or 5 degrees rotation, at most 5 Hz), including
+on revisits. This selection leaves odometry's keyframe history unchanged and
+uses the same enabled trust vetoes. Both publishers are reliable, volatile,
+depth 8; the full cloud, correction, pose, timestamp and optional sub-floor
+filter center are captured before publication. These topics are remapped by
+the standalone Ouster launch; legacy launch files retain their existing topics.
+The archive's stable frame IDs belong to this mapping stream, not odometry's
+keyframe catalog. `mapping_input:=keyframes` restores the old source.
 
 `odom` and `pose` serve the high-rate observer. The optional `odom -> base_link`
 TF uses that same observer snapshot and timestamp. Its pose may differ from the
 registered scan pose because it includes subsequent IMU propagation and observer
-gain filtering. To recover a local keyframe, use the **paired `keyframe_pose`**:
+gain filtering. To recover a local keyframe, use the **paired `mapping_pose` or `keyframe_pose` for that cloud**:
 
 ```
 p_base = inverse(T_odom_base_keyframe) * p_odom
@@ -65,7 +91,8 @@ ambient/near-IR. Consumers that need all raw return metadata must retain that
 input separately; the processed output is not a lossless raw-scan archive.
 
 Pair cloud and pose by exact integer header timestamp within a running session.
-The new pose publishers use reliable, volatile QoS with depth 10. Keyframe
+The pose and every-scan deskewed publishers use reliable, volatile QoS with
+depth 10, allowing the scan cloud to survive short dense-map transport bursts. Keyframe
 clouds use reliable, volatile QoS with depth 1; consumers should subscribe before
 replay and bound their synchronization queues. The topics are separate ROS
 messages, so receiving one does not guarantee receiving the other. A mapper

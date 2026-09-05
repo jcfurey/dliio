@@ -1,7 +1,7 @@
 # Persistent mapping
 
 `dlio_mapping_node.py` is a dedicated mapper in this package. It pairs each
-registered keyframe cloud with its exact registered pose, builds bounded voxel
+registered mapping observation with its exact registered pose, builds bounded
 submaps, and saves local keyframes and poses to a versioned archive. Geometry
 and disk work run in a worker in a separate process from odometry. NumPy and
 SQLite are the only additional implementation libraries; there is no external
@@ -27,6 +27,53 @@ The arguments are the same as `dlio_ouster.launch.py`. That original launch
 retains its preview default; `mapper:=persistent` selects this mapper directly.
 `map:=false` omits either mapper. The legacy C++ preview and persistent mapper
 must not publish to the same map topic concurrently.
+
+### Density
+
+Persistent mapping receives **dense deskewed mapping observations** independently
+of odometry's keyframe selection. The default trigger is 20 cm of translation
+or 5 degrees of rotation since the last mapping observation, with a 0.2-second
+minimum interval. Revisiting an existing odometry keyframe still contributes new
+views. Stationary, unchanged scans do not accumulate indefinitely. The frontend
+applies the same physics-fuse, slosh, and enabled degeneracy vetoes as for
+odometry keyframes, and retains its existing registration filter and history.
+
+A shared **2 cm world grid** combines overlapping observations for display and
+export. Each occupied cell contributes its observations' mean position and
+separate finite-channel means. This is proximity fusion, not surface matching
+or pose correction. Sparse views and view-dependent reflectivity can still
+produce visible patches; the grid alone did not eliminate them on 0705.
+Original individual returns remain available in the archive.
+
+Independent controls are available:
+
+- `map/observation/distance`, `map/observation/rotation`, and
+  `map/observation/min_interval` in the robot configuration control mapping
+  observation selection. The distance selects viewpoints; it is not a point
+  spacing or voxel size. The published mapping clouds retain full resolution.
+- `mapping_input:=keyframes` restores the odometry-keyframe input. In that mode,
+  `keyframe_cloud:=auto` selects dense keyframes, while `filtered` selects the
+  registration-sized cloud. Neither changes registration itself or the separate
+  every-scan `map/dense/filtered` setting.
+- `mapping/fusion_size: 0.02` sets the shared output grid in metres. Use `0.01`
+  for finer fusion, or `0.0` for individual stored samples. This viewer/export
+  setting requires a mapper restart and does not alter archived source points.
+- `mapping/voxel_size: 0.0` retains individual returns in stored submaps. A
+  positive value enables the older per-submap filter; original received frames
+  are still archived. With prevoxelized submaps, output weights refer to stored
+  centroids rather than their original return populations.
+
+The live grid updates incrementally and subtracts evicted submaps' contributions.
+Freed accumulator slots are reused. Snapshot preparation is limited by
+`mapping/publish_rate`, independently of observation ingestion. Fusion does not
+normalize reflectivity by incidence angle or infer unobserved surface samples.
+
+Dense maps use more memory, disk space, and DDS bandwidth. The live window is
+bounded by submap and point limits below; saved archives and full exports
+include evicted submaps. Higher density alone does not
+improve trajectory accuracy. Existing archives retain their recorded voxel
+size on reload; the old registration-sized keyframes cannot recover missing
+sensor detail. Replay the bag to build a new dense archive.
 
 `mapping_config:=/path/mapping.yaml` supplies mapping settings. By default the
 archive directory is `run_dir/mapping`; override with `archive_directory:=...`.
@@ -56,9 +103,13 @@ ros2 service call /dlio/mapping/export_pcd \
 
 Both operations include **all archived submaps**, including those evicted from
 RAM. The archive additionally retains every accepted local keyframe and pose.
-PCD export streams submaps and does not allocate the entire map. Voxel means
-combine all samples within a submap; overlapping voxels from different submaps
-remain separate PCD samples. There is no global overlap correction yet.
+PCD export includes all submaps, using `mapping/fusion_size` to co-locate
+overlapping stored samples on one world grid. Global fusion spills its cell
+sums/counts to a temporary SQLite database next to the output and streams the
+result; it does not allocate the entire map in RAM. The temporary database is
+removed on completion or failure. Setting fusion to zero streams individual
+stored samples instead. Output fusion does not alter the archive or optimize
+poses.
 
 After stopping the recording launch, open the saved archive without odometry,
 Ouster, or a bag player:
@@ -85,6 +136,9 @@ ros2 run direct_lidar_inertial_odometry mapping_archive.py snapshot \
   /path/session-working.dliomap /absolute/path/recovered.dliomap
 ros2 run direct_lidar_inertial_odometry mapping_archive.py export \
   /path/recovered.dliomap /absolute/path/recovered.pcd
+# Match the default fused display/export (omit for individual stored samples):
+ros2 run direct_lidar_inertial_odometry mapping_archive.py export \
+  /path/recovered.dliomap /absolute/path/fused.pcd --fusion-size 0.02
 ```
 
 The working archive uses SQLite WAL transactions. Keep its `.dliomap`, `-wal`,
@@ -100,8 +154,10 @@ The viewer rejects unsealed working files to avoid reading a changing archive.
 The input contract is [MAPPING_INTERFACE.md](MAPPING_INTERFACE.md). Input XYZ is
 already in `odom`; the mapper applies the inverse **paired keyframe pose** once
 to obtain base-frame keyframe points. Each submap is anchored at its first
-keyframe pose. It averages points in that anchor frame and transforms its voxel
-centers to `map` when publishing or exporting.
+keyframe pose. It retains samples (or optional voxel means) in that anchor
+frame. Output fusion uses coordinates in `map`, shared across all participating
+submaps. Finite field sums and counts prevent a mean-of-means error when
+different submaps contribute different numbers of stored samples to a cell.
 
 Every stored point has seven little-endian float32 values: `x`, `y`, `z`,
 `intensity`, `reflectivity`, `intensity_corrected`, and `lidar_intensity`.
@@ -117,13 +173,14 @@ Version 1 uses three SQLite tables:
 |---|---|
 | `metadata` | Format/version, session UUID, configured `extrinsics/*`, `imu/*`, and `frames/*` parameters, fields, counts, voxel size, identity map-to-odom transform, pose revision 0 |
 | `keyframes` | Contiguous stable ID, exact integer nanosecond stamp, submap ID, registered base pose in odom, local cloud, point count and CRC32 |
-| `submaps` | Stable ID, anchor pose, first/last keyframe IDs, latest measurement stamp, voxel centers, point count and CRC32 |
+| `submaps` | Stable ID, anchor pose, first/last keyframe IDs, latest measurement stamp, samples or voxel means, point count and CRC32 |
 
 Poses are float64 rigid 4x4 matrices. Reload checks the SQLite format and
 integrity, sizes before fetching point blobs, CRCs, proper rotations, finite
 XYZ, timestamp ordering, contiguous IDs, submap membership and anchor poses,
 and metadata consistency. It streams validation instead of loading the entire
-keyframe catalog into RAM. Archives whose per-frame/submap sizes exceed the
+keyframe catalog into RAM. The `keyframes` table contains mapping observations
+when that stream is selected; its IDs are independent of odometry keyframe IDs. Archives whose per-frame/submap sizes exceed the
 configured input/voxel caps are rejected; the offline CLI exposes those same
 read caps as `--max-input-points` and `--max-voxels`.
 
@@ -137,10 +194,11 @@ Defaults in `cfg/mapping.yaml`:
 
 | Setting | Default | Effect |
 |---|---:|---|
-| `mapping/voxel_size` | 0.2 m | Resolution within each submap |
-| `mapping/submap_keyframes` | 20 | Maximum keyframes per submap |
+| `mapping/voxel_size` | 0.0 | Disabled; positive values enable voxel means in metres |
+| `mapping/fusion_size` | 0.02 m | Shared output grid for overlap fusion; 0 disables |
+| `mapping/submap_keyframes` | 100 | Maximum mapping observations per submap |
 | `mapping/resident_submaps` | 8 | Recent submaps retained for live display |
-| `mapping/max_voxels` | 100,000 | Maximum voxels per submap |
+| `mapping/max_voxels` | 1,000,000 | Maximum points per submap in either mode (legacy parameter name) |
 | `mapping/max_input_points` | 200,000 | Maximum points per input keyframe |
 | `mapping/max_cloud_bytes` | 16 MiB | Maximum serialized input cloud |
 | `mapping/pending_pairs` | 8 | Incomplete timestamp pairs retained |
@@ -148,13 +206,18 @@ Defaults in `cfg/mapping.yaml`:
 | `mapping/worker_queue` | 4 | Maximum queued geometry/service jobs |
 | `mapping/publish_rate` | 1 Hz | Maximum changed-map publication rate |
 
-A submap closes early when adding a keyframe would exceed its voxel cap. A
-single frame that exceeds the cap is rejected. Eviction removes voxel arrays
+A submap closes early when adding a keyframe would exceed its point cap. A
+single frame that exceeds the cap is rejected. Eviction removes point arrays
 from RAM while preserving all records on disk. The active accumulator, recent
 submaps, input queues, and serialized map are bounded independently of total
 run length. NumPy temporaries, ROS/DDS buffers, interpreter memory, and an 8 MiB
 SQLite cache add overhead: the resident-array diagnostic is **not total RSS**.
 Disk use grows with accepted data; archive retention is an operator decision.
+At the default limits the resident point arrays contain at most eight million
+points (224 MB of float32 field data); an actual short session normally uses
+less. The incremental grid adds packed-key bookkeeping and float64 sums/int64 counts
+for occupied cells, with capacity below twice the peak active cell count (minimum
+4,096 slots). Serialized snapshots and temporary transforms add further memory.
 
 These bounds apply to the dedicated mapper. Odometry's internal registration
 keyframe map has a separate `odom/keyframe/maxKeyframes` setting, whose existing
@@ -166,8 +229,10 @@ at the last accepted keyframe measurement. It retains one latest message for
 late subscribers and sends a changed snapshot at the configured rate. Publication
 and pair expiry use wall time, so a paused bag still permits save/reload/display.
 
-`/dlio/mapping/diagnostics` reports accepted keyframes/submaps, resident points and
-array bytes, cached message bytes, queue/pair occupancy, processing time, peak
+`/dlio/mapping/diagnostics` reports accepted keyframes/submaps, stored resident points,
+fused published points, fusion spacing, and
+source and fusion array bytes, cached message bytes, queue/pair occupancy,
+ingestion and snapshot processing time, peak
 process RSS in KiB, and explicit rejected/missing/duplicate input counters.
 Storage I/O errors stop further recording and set ERROR. Configuration and
 calibration changes require a node restart so recorded metadata stays accurate.
@@ -190,10 +255,12 @@ ROS_DOMAIN_ID=157 ros2 run direct_lidar_inertial_odometry verify_mapping_replay.
   --output /absolute/path/new-run/mapping-replay.json
 ```
 
-The second check uses a five-keyframe/four-submap window to exercise eviction.
+The second check uses a 100-observation/four-submap window; a full run exercises eviction.
 Without `--full` it takes a 75-second sample. `--keep-running` leaves a successful
 launch open and records its PID beside the report. Tests verify mapping logic
 and runtime delivery; they do not establish trajectory accuracy without ground
 truth. Loop-closure work can build on local keyframes and stable archive IDs,
 with conservative geometric/texture verification and explicit pose revisions.
-Recorded results are in [MAPPING_VALIDATION.md](MAPPING_VALIDATION.md).
+The foundation results are in [MAPPING_VALIDATION.md](MAPPING_VALIDATION.md),
+with the dense-output and overlap-fusion follow-up in
+[DENSE_MAPPING_VALIDATION.md](DENSE_MAPPING_VALIDATION.md).

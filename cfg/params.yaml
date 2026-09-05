@@ -37,6 +37,15 @@
     # unfiltered (dense) or voxelized clouds; sparse map voxel size [m].
     map/waitUntilMove: true
     map/dense/filtered: false
+    # Keyframe output is independent of the every-scan deskewed topic above.
+    # The persistent mapping launch overrides this to false for dense keyframes.
+    map/keyframe/filtered: true
+    # Dedicated dense mapping observations, selected from the last observation
+    # so revisits keep contributing. The persistent launch enables this stream.
+    map/observation/enabled: false
+    map/observation/distance: 0.20       # metres travelled between observations
+    map/observation/rotation: 5.0        # degrees, alternative rotation trigger
+    map/observation/min_interval: 0.20  # seconds, bounds publication to 5 Hz
     map/sparse/leafSize: 0.25
     # Map republish rate [Hz] (0 disables). The map node accumulates every
     # keyframe but only republishes the whole map on this timer, and only when a

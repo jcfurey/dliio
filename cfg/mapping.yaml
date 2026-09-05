@@ -1,11 +1,18 @@
 /**:
   ros__parameters:
     frames/map: map
-    # Full keyframes/poses remain on disk. These bounds apply to the live map window.
-    mapping/voxel_size: 0.2
-    mapping/submap_keyframes: 20
+    # 0 keeps every received keyframe point; a positive value enables voxel means.
+    # Registration has a separate filter. Full keyframes/poses remain on disk.
+    mapping/voxel_size: 0.0
+    # Co-locate overlapping observations on ONE world grid for display/export.
+    # Source keyframes/submaps stay dense. Set 0.0 for individual-return output.
+    mapping/fusion_size: 0.02
+    # Mapping observations are denser than odometry keyframes. The point cap
+    # usually rolls first, retaining a useful viewing window at bounded memory.
+    mapping/submap_keyframes: 100
     mapping/resident_submaps: 8
-    mapping/max_voxels: 100000
+    # Per-submap point limit in both modes; roll early when the next frame won't fit.
+    mapping/max_voxels: 1000000
     mapping/max_input_points: 200000
     mapping/max_cloud_bytes: 16777216
     mapping/pending_pairs: 8

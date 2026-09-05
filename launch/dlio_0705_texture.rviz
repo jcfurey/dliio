@@ -127,7 +127,7 @@ Visualization Manager:
       Max Intensity: 100
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Dense Map
+      Name: Scan trail (30 s)
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 1

@@ -413,7 +413,11 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->path_pub     = this->create_publisher<nav_msgs::msg::Path>("path", 1);
   this->kf_pose_pub  = this->create_publisher<geometry_msgs::msg::PoseArray>("kf_pose", 1);
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
-  this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 1);
+  this->mapping_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping_cloud", 8);
+  this->mapping_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("mapping_pose", 8);
+  // Dense map messages can briefly occupy the DDS transport. Match the scan
+  // pose's bounded history so an unacknowledged scan survives those bursts.
+  this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 10);
 
 #ifdef HAVE_LIVOX_ROS_DRIVER2
   // Optional raw Livox ingestion: subscribe to a livox_ros_driver2 CustomMsg on
@@ -640,6 +644,7 @@ dlio::OdomNode::~OdomNode() {
 
   if (this->publish_thread.joinable()) { this->publish_thread.join(); }
   if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
+  if (this->publish_mapping_thread.joinable()) { this->publish_mapping_thread.join(); }
   if (this->debug_thread.joinable()) { this->debug_thread.join(); }
 
 }
@@ -699,6 +704,16 @@ void dlio::OdomNode::getParams() {
 
   // Dense map resolution
   dlio::declare_param(this, "map/dense/filtered", this->densemap_filtered_, true);
+  dlio::declare_param(this, "map/keyframe/filtered", this->keyframe_filtered_, true);
+  dlio::declare_param(this, "map/observation/enabled", this->mapping_enabled_, false);
+  dlio::declare_param(this, "map/observation/distance", this->mapping_distance_, 0.20);
+  dlio::declare_param(this, "map/observation/rotation", this->mapping_rotation_, 5.0);
+  dlio::declare_param(this, "map/observation/min_interval", this->mapping_min_interval_, 0.20);
+  if (!std::isfinite(this->mapping_distance_) || this->mapping_distance_ < .01 || this->mapping_distance_ > 100. ||
+      !std::isfinite(this->mapping_rotation_) || this->mapping_rotation_ < .1 || this->mapping_rotation_ > 180. ||
+      !std::isfinite(this->mapping_min_interval_) || this->mapping_min_interval_ < .1 || this->mapping_min_interval_ > 60.) {
+    throw std::invalid_argument("map/observation: distance must be .01..100 m, rotation .1..180 deg, min_interval .1..60 s");
+  }
 
   // Wait until movement to publish map
   dlio::declare_param(this, "map/waitUntilMove", this->wait_until_move_, false);
@@ -1119,6 +1134,55 @@ dlio::OdomNode::ScanOutput dlio::OdomNode::snapshotScanOutput(
   return out;
 }
 
+dlio::OdomNode::KeyframeOutput dlio::OdomNode::snapshotKeyframeOutput() {
+  return {this->snapshotScanOutput(this->keyframe_filtered_ ? this->current_scan : this->deskewed_scan),
+          this->T_prior.block<2, 1>(0, 3),
+          !this->keyframe_filtered_ && this->subfloor_reject_enabled_ && this->gravity_align_};
+}
+
+void dlio::OdomNode::queueKeyframePublish() {
+  // Only the scan callback produces these snapshots. Use one publication
+  // worker at a time; never retain dense clouds in registration's
+  // keyframe/covariance history. Publication is independent of submap building.
+  auto output = this->snapshotKeyframeOutput();
+  if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
+  this->publish_keyframe_thread = std::thread(&dlio::OdomNode::publishKeyframe, this, std::move(output));
+}
+
+bool dlio::OdomNode::mappingObservationDue() {
+  // Map coverage is measured from the last mapping observation, including on
+  // revisits. Registration's nearest-keyframe policy has a different purpose.
+  // Preserve the same trust vetoes used to keep bad poses out of its submap.
+  if (!this->mapping_enabled_ || this->fuse_tripped_scan_ ||
+      (this->slosh_enabled_ && this->slosh_guard_.engaged()) ||
+      (this->keyframe_degen_gate_ &&
+       (!this->gicp.lastDegenTransDirs().empty() || !this->gicp.lastDegenRotDirs().empty()))) { return false; }
+  if (this->mapping_started_) {
+    if (this->scan_stamp - this->mapping_last_stamp_ < this->mapping_min_interval_) { return false; }
+    const double distance = (this->lidarPose.p - this->mapping_last_position_).norm();
+    const double angle = this->lidarPose.q.angularDistance(this->mapping_last_orientation_) * 180. / M_PI;
+    if (distance < this->mapping_distance_ && angle < this->mapping_rotation_) { return false; }
+  }
+  this->mapping_started_ = true;
+  this->mapping_last_stamp_ = this->scan_stamp;
+  this->mapping_last_position_ = this->lidarPose.p;
+  this->mapping_last_orientation_ = this->lidarPose.q;
+  return true;
+}
+
+void dlio::OdomNode::queueMappingPublish() {
+  if (!this->mappingObservationDue()) { return; }
+  KeyframeOutput output{this->snapshotScanOutput(this->deskewed_scan),
+      this->T_prior.block<2, 1>(0, 3), this->subfloor_reject_enabled_ && this->gravity_align_};
+  if (this->publish_mapping_thread.joinable()) { this->publish_mapping_thread.join(); }
+  this->publish_mapping_thread = std::thread(&dlio::OdomNode::publishMapping, this, std::move(output));
+}
+
+void dlio::OdomNode::publishMapping(KeyframeOutput output) {
+  this->publishRegisteredCloud(output, this->mapping_cloud_pub);
+  this->mapping_pose_pub->publish(output.scan.pose);
+}
+
 dlio::OdomNode::State dlio::OdomNode::snapshotState() {
   std::lock_guard<std::mutex> lock(this->geo.mtx);
   return this->state;
@@ -1270,43 +1334,52 @@ void dlio::OdomNode::publishCloud(const ScanOutput& output) {
 
 }
 
-void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen::Quaternionf>, pcl::PointCloud<PointType>::ConstPtr> kf, rclcpp::Time timestamp) {
-
-  // Push back
-  geometry_msgs::msg::Pose p;
-  p.position.x = kf.first.first[0];
-  p.position.y = kf.first.first[1];
-  p.position.z = kf.first.first[2];
-  p.orientation.w = kf.first.second.w();
-  p.orientation.x = kf.first.second.x();
-  p.orientation.y = kf.first.second.y();
-  p.orientation.z = kf.first.second.z();
-  geometry_msgs::msg::PoseStamped stamped;
-  stamped.header.stamp = timestamp;
-  stamped.header.frame_id = this->odom_frame;
-  stamped.pose = p;
-  this->kf_stamped_pose_pub->publish(stamped);
-  this->kf_pose_ros.poses.push_back(p);
+void dlio::OdomNode::publishKeyframe(KeyframeOutput output) {
+  const auto& scan = output.scan;
+  this->kf_stamped_pose_pub->publish(scan.pose);
+  this->kf_pose_ros.poses.push_back(scan.pose.pose);
   if (this->kf_pose_ros.poses.size() > 10000) {
     this->kf_pose_ros.poses.erase(this->kf_pose_ros.poses.begin(),
                                 this->kf_pose_ros.poses.begin() + 1000);
   }
 
   // Publish
-  this->kf_pose_ros.header.stamp = timestamp;
-  this->kf_pose_ros.header.frame_id = this->odom_frame;
+  this->kf_pose_ros.header = scan.pose.header;
   this->kf_pose_pub->publish(this->kf_pose_ros);
 
-  // publish keyframe scan for map (only when a consumer -- the map node and/or a
-  // viz client -- is subscribed; the toROSMsg of a full keyframe cloud is not free)
-  if (this->kf_cloud_pub->get_subscription_count() > 0 &&
-      kf.second->points.size() == kf.second->width * kf.second->height) {
+  this->publishRegisteredCloud(output, this->kf_cloud_pub);
+}
+
+void dlio::OdomNode::publishRegisteredCloud(const KeyframeOutput& output,
+    const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) {
+  const auto& scan = output.scan;
+  if (publisher->get_subscription_count() > 0 && scan.cloud &&
+      scan.cloud->points.size() == scan.cloud->width * scan.cloud->height) {
+    auto source = scan.cloud;
+    if (output.reject_subfloor && !source->empty()) {
+      // The optional ghost filter still applies in dense mode. Its tuning is
+      // startup-only, while the scan-dependent analysis center is captured.
+      std::vector<float> xs(source->size()), ys(source->size()), zs(source->size());
+      for (size_t i = 0; i < source->size(); ++i) {
+        xs[i] = (*source)[i].x; ys[i] = (*source)[i].y; zs[i] = (*source)[i].z;
+      }
+      const auto keep = OdomNode::subFloorKeepMask(xs, ys, zs, output.prior_xy.x(), output.prior_xy.y(),
+          this->subfloor_radius_, this->subfloor_cell_, this->subfloor_zbin_, this->subfloor_min_bin_,
+          this->subfloor_margin_, this->subfloor_max_frac_);
+      auto kept = std::make_shared<pcl::PointCloud<PointType>>();
+      kept->reserve(source->size());
+      for (size_t i = 0; i < source->size(); ++i) {
+        if (keep[i]) { kept->push_back((*source)[i]); }
+      }
+      source = kept;
+    }
+    pcl::PointCloud<PointType> registered;
+    pcl::transformPointCloud(*source, registered, scan.correction);
     sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
-    pcl::toROSMsg(*kf.second, keyframe_cloud_ros);
+    pcl::toROSMsg(registered, keyframe_cloud_ros);
     dlio::stripAcquisitionTimeFields(keyframe_cloud_ros.fields);
-    keyframe_cloud_ros.header.stamp = timestamp;
-    keyframe_cloud_ros.header.frame_id = this->odom_frame;
-    this->kf_cloud_pub->publish(keyframe_cloud_ros);
+    keyframe_cloud_ros.header = scan.pose.header;
+    publisher->publish(keyframe_cloud_ros);
   }
 
 }
@@ -1965,7 +2038,8 @@ void dlio::OdomNode::initializeInputTarget() {
     cv::Mat img = this->lidar_img_ready_ ? this->lidar_refl_img_ : cv::Mat();
     this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
   }
-
+  this->queueKeyframePublish();
+  this->queueMappingPublish();
 }
 
 void dlio::OdomNode::setInputSource() {
@@ -2074,6 +2148,8 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Update current keyframe poses and map
   this->updateKeyframes();
+
+  this->queueMappingPublish();
 
   // Optionally bound the keyframe map. Only safe while the background submap
   // thread is idle (new_submap_is_ready), since pruning re-indexes the
@@ -3698,7 +3774,7 @@ void dlio::OdomNode::updateKeyframes() {
       this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
     }
     lock.unlock();
-
+    this->queueKeyframePublish();
   }
 
 }
@@ -3980,8 +4056,6 @@ void dlio::OdomNode::buildKeyframesAndSubmap(State vehicle_state) {
     this->keyframes[i].second = transformed_keyframe;
     this->keyframe_normals[i] = transformed_covariances;
 
-    if (this->publish_keyframe_thread.joinable()) { this->publish_keyframe_thread.join(); }
-    this->publish_keyframe_thread = std::thread( &dlio::OdomNode::publishKeyframe, this, this->keyframes[i], this->keyframe_timestamps[i] );
   }
 
   lock.unlock();

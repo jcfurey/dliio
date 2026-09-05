@@ -29,12 +29,47 @@ def test_persistent_mapper_is_a_separate_process(tmp_path):
     assert len(handoff.build_actions(dict(handoff.DEFAULTS, mapper='persistent', map='false'), PACKAGE)) == 1
 
 
+@pytest.mark.parametrize('mapper,mode,filtered', [('persistent', 'auto', False), ('preview', 'auto', True),
+                                               ('persistent', 'filtered', True), ('preview', 'dense', False)])
+def test_keyframe_density_is_independent_of_registration(monkeypatch, mapper, mode, filtered):
+    configurations = []
+    original = handoff.ComposableNode
+    def capture(**kwargs):
+        if kwargs.get('plugin') == 'dlio::OdomNode':
+            configurations.append(kwargs['parameters'][-1])
+        return original(**kwargs)
+    monkeypatch.setattr(handoff, 'ComposableNode', capture)
+    handoff.build_actions(dict(handoff.DEFAULTS, mapper=mapper, keyframe_cloud=mode), PACKAGE)
+    assert configurations[0]['map/keyframe/filtered'] is filtered
+    assert not any(key.startswith('odom/preprocessing/') for key in configurations[0])
+
+
 @pytest.mark.parametrize('key,value', [('mode', 'wrong'), ('profile', 'wrong'), ('rate', '0'),
                                     ('rate', 'nan'), ('rate', 'inf'), ('use_sim_time', 'maybe'),
-                                    ('mapper', 'wrong'), ('mapper', '')])
+                                    ('mapper', 'wrong'), ('mapper', ''), ('keyframe_cloud', 'wrong'),
+                                    ('mapping_input', 'wrong')])
 def test_invalid_configuration_fails_before_starting_nodes(key, value):
     with pytest.raises(ValueError):
         handoff.build_actions(dict(handoff.DEFAULTS, **{key: value}), PACKAGE)
+
+
+@pytest.mark.parametrize('mode,enabled', [('observations', True), ('keyframes', False)])
+def test_persistent_input_selects_matching_dense_stream(monkeypatch, mode, enabled):
+    components, nodes = [], []
+    original_component, original_node = handoff.ComposableNode, handoff.Node
+    def component(**kwargs):
+        components.append(kwargs)
+        return original_component(**kwargs)
+    def node(**kwargs):
+        nodes.append(kwargs)
+        return original_node(**kwargs)
+    monkeypatch.setattr(handoff, 'ComposableNode', component)
+    monkeypatch.setattr(handoff, 'Node', node)
+    handoff.build_actions(dict(handoff.DEFAULTS, mapper='persistent', mapping_input=mode), PACKAGE)
+    assert components[0]['parameters'][-1]['map/observation/enabled'] is enabled
+    remap = dict(nodes[0]['remappings'])
+    assert remap['keyframes'].endswith('/mapping' if enabled else '/keyframe')
+    assert remap['keyframe_pose'].endswith('/mapping_pose' if enabled else '/keyframe_pose')
 
 
 def test_packet_replay_requires_metadata_or_bag():

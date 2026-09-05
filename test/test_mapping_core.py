@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from dliio_mapping.core import FIELDS, Limits, Store, Voxels, decode_points, decode_pose, snapshot_database
+from dliio_mapping.core import FIELDS, Limits, Store, Voxels, WindowFusion, decode_points, decode_pose, snapshot_database
 
 META = dict(odom_frame='odom', base_frame='base', map_frame='map',
             map_to_odom=np.eye(4).tolist(), calibration={'extrinsics/baselink2imu/t': [.01, .02, .03]})
@@ -19,9 +19,10 @@ def points(x=0.):
                      [x + 1, 0, 0, 22, 51, 62, 73]], dtype=np.float32)
 
 
-@pytest.fixture
-def store(tmp_path):
-    result = Store(tmp_path / 'working.dliomap', Limits(submap_keyframes=2, resident_submaps=2), metadata=META)
+@pytest.fixture(params=[0., .2])
+def store(tmp_path, request):
+    result = Store(tmp_path / 'working.dliomap',
+                   Limits(voxel_size=request.param, submap_keyframes=2, resident_submaps=2), metadata=META)
     yield result
     result.close()
 
@@ -51,6 +52,39 @@ def test_voxels_weight_samples_per_channel_and_floor_negative_coordinates():
     np.testing.assert_allclose(result, [[-.02, 0, 0, 6, 30, 5, 10], [.01, 0, 0, 100, 100, 100, 100]])
 
 
+def test_incremental_fusion_reverses_eviction_and_reuses_storage():
+    fusion = WindowFusion(.1)
+    a = np.array([[-.01, 0, 0, 2, np.nan, 4, 8], [-.02, 0, 0, 4, 20, 6, np.nan]], dtype=np.float32)
+    b = np.array([[-.03, 0, 0, 12, 40, np.nan, 12], [.01, 0, 0, 100, 100, 100, 100]], dtype=np.float32)
+    fusion.update(a); fusion.update(b)
+    np.testing.assert_allclose(fusion.points(), [[-.02, 0, 0, 6, 30, 5, 10], [.01, 0, 0, 100, 100, 100, 100]])
+    fusion.update(a, remove=True)
+    np.testing.assert_allclose(fusion.points(), b)
+    capacity = fusion.nbytes
+    for i in range(100):
+        fusion.update(b, remove=True)
+        assert len(fusion.points()) == 0
+        b[:, 0] += 10
+        fusion.update(b)
+        np.testing.assert_allclose(fusion.points(), b)
+    assert fusion.nbytes == capacity
+
+
+def test_incremental_snapshot_matches_full_rebuild_across_rollovers(store):
+    rng = np.random.default_rng(414)
+    for i in range(20):
+        pose = np.eye(4)
+        pose[:3, 3] = [.3 * i, .02, -.01]
+        world = rng.uniform(-1, 1, (80, 7)).astype('<f4')
+        world[::3, 4] = np.nan
+        store.ingest(i + 1, pose, world)
+        expected = Voxels.from_points(store.snapshot(), .1).points()
+        np.testing.assert_allclose(store.snapshot(.1), expected, rtol=1e-6, atol=1e-6)
+        # Changing leaf size must rebuild the cache from retained sources.
+        if i % 5 == 0:
+            np.testing.assert_allclose(store.snapshot(.2), Voxels.from_points(store.snapshot(), .2).points(), atol=1e-6)
+
+
 def test_resident_memory_stops_growing_while_archive_retains_all_frames(store, tmp_path):
     plateau = []
     for i in range(120):
@@ -66,8 +100,9 @@ def test_resident_memory_stops_growing_while_archive_retains_all_frames(store, t
     assert store.db.execute('SELECT count(*) FROM keyframes').fetchone()[0] == 120
 
 
-def test_voxel_capacity_rolls_submap_and_rejects_oversize_frame(tmp_path):
-    store = Store(tmp_path / 'small.dliomap', Limits(max_voxels=2), metadata=META)
+@pytest.mark.parametrize('leaf', [0., .2])
+def test_voxel_capacity_rolls_submap_and_rejects_oversize_frame(tmp_path, leaf):
+    store = Store(tmp_path / 'small.dliomap', Limits(voxel_size=leaf, max_voxels=2), metadata=META)
     try:
         store.ingest(1, np.eye(4), points())
         store.ingest(2, np.eye(4), points(5))
@@ -77,6 +112,90 @@ def test_voxel_capacity_rolls_submap_and_rejects_oversize_frame(tmp_path):
         assert store.stats()['keyframes'] == 2
     finally:
         store.close()
+
+
+def test_unvoxelized_map_keeps_coincident_returns_and_each_channel(tmp_path):
+    store = Store(tmp_path / 'dense.dliomap', Limits(), metadata=META)
+    expected = np.array([[1, 2, 3, 10, 20, np.nan, 30],
+                         [1.001, 2, 3, 40, 50, 60, 70],
+                         [1, 2, 3, 80, 90, 100, 110]], dtype='<f4')
+    try:
+        store.ingest(1, np.eye(4), expected[:2])
+        pose = np.array([[0, -1, 0, 10], [1, 0, 0, 20], [0, 0, 1, 30], [0, 0, 0, 1.]])
+        store.ingest(2, pose, expected[2:])
+        np.testing.assert_array_equal(store.snapshot(), expected)
+        saved, exported = tmp_path / 'saved.dliomap', tmp_path / 'all.pcd'
+        store.save(saved)
+        # Loading honors the archive's resolution rather than the viewer default.
+        loaded = Store(saved, Limits(voxel_size=.2))
+        try:
+            assert loaded.limits.voxel_size == 0
+            np.testing.assert_array_equal(loaded.snapshot(), expected)
+            assert loaded.export_pcd(exported) == 3
+            payload = exported.read_bytes().split(b'DATA binary\n', 1)[1]
+            np.testing.assert_array_equal(np.frombuffer(payload, '<f4').reshape(-1, 7), expected)
+        finally:
+            loaded.close()
+    finally:
+        store.close()
+
+
+def test_global_fusion_crosses_submaps_and_preserves_sample_weights(tmp_path):
+    store = Store(tmp_path / 'working.dliomap', Limits(submap_keyframes=1), metadata=META)
+    a = np.array([[.003, .004, 0, 2, 20, np.nan, 4], [.005, .004, 0, 4, np.nan, 8, 6],
+                  [.03, .004, 0, 100, 100, 100, 100]], dtype='<f4')
+    b = np.array([[.007, .004, 0, 12, 40, 10, np.nan]], dtype='<f4')
+    pose = np.array([[0, -1, 0, 1], [1, 0, 0, 2], [0, 0, 1, 3], [0, 0, 0, 1.]])
+    expected = [[.005, .004, 0, 6, 30, 9, 5], [.03, .004, 0, 100, 100, 100, 100]]
+    try:
+        store.ingest(1, np.eye(4), a)
+        store.ingest(2, pose, b)
+        assert store.meta['submaps'] == 2
+        assert len(store.snapshot()) == 4
+        np.testing.assert_allclose(store.snapshot(.02), expected, atol=1e-6)
+        output = tmp_path / 'fused.pcd'
+        assert store.export_pcd(output, .02) == 2
+        payload = output.read_bytes().split(b'DATA binary\n', 1)[1]
+        np.testing.assert_allclose(np.frombuffer(payload, '<f4').reshape(-1, 7), expected, atol=1e-6)
+        assert store.export_pcd(tmp_path / 'raw.pcd') == 4
+        assert store.db.execute('SELECT sum(count) FROM keyframes').fetchone()[0] == 4
+        store.save(tmp_path / 'saved.dliomap')
+        loaded = Store(tmp_path / 'saved.dliomap', Limits())
+        try:
+            loaded.export_pcd(tmp_path / 'loaded.pcd', .02)
+            assert output.read_bytes() == (tmp_path / 'loaded.pcd').read_bytes()
+        finally:
+            loaded.close()
+        assert not list(tmp_path.glob('.dliio-fusion-*'))
+    finally:
+        store.close()
+
+
+def test_global_fusion_keeps_distinct_cells_and_missing_channels(tmp_path):
+    store = Store(tmp_path / 'working.dliomap', Limits(submap_keyframes=1, resident_submaps=1), metadata=META)
+    a = np.array([[-.001, 0, 0, 2, np.nan, np.nan, 10], [.001, 0, 0, 4, 20, np.nan, 30]], dtype='<f4')
+    try:
+        store.ingest(1, np.eye(4), a)
+        store.ingest(2, np.eye(4), a)
+        assert store.stats()['resident_submaps'] == 1
+        output = tmp_path / 'all.pcd'
+        assert store.export_pcd(output, .02) == 2  # includes evicted submap, globally deduplicated
+        payload = output.read_bytes().split(b'DATA binary\n', 1)[1]
+        np.testing.assert_array_equal(np.frombuffer(payload, '<f4').reshape(-1, 7), a)
+        np.testing.assert_array_equal(store.snapshot(.02), a)
+    finally:
+        store.close()
+
+
+def test_failed_global_fusion_cleans_scratch_files_and_preserves_destination(store, tmp_path):
+    store.ingest(1, np.eye(4), points())
+    store.db.execute('UPDATE submaps SET crc=0')
+    output = tmp_path / 'fused.pcd'
+    with pytest.raises(ValueError, match='checksum'):
+        store.export_pcd(output, .02)
+    assert not output.exists()
+    assert not list(tmp_path.glob('.dliio-fusion-*'))
+    assert not list(tmp_path.glob('.fused.pcd.*'))
 
 
 @pytest.mark.parametrize('stamp', [0, -1, 100, 99, 2 ** 63, 100.5, True])
@@ -109,6 +228,7 @@ def test_save_includes_committed_wal_preserves_identity_and_reloads(store, tmp_p
     loaded = Store(saved, store.limits)
     try:
         assert loaded.meta['sealed'] is True
+        assert loaded.limits.voxel_size == store.limits.voxel_size
         assert loaded.meta['session_id'] == store.meta['session_id']
         assert loaded.meta['calibration'] == META['calibration']
         assert loaded.meta['keyframes'] == 9
@@ -181,7 +301,8 @@ def test_empty_archive_roundtrip(store, tmp_path):
         loaded.close()
 
 
-@pytest.mark.parametrize('changes', [{'voxel_size': float('nan')}, {'resident_submaps': 0},
+@pytest.mark.parametrize('changes', [{'voxel_size': float('nan')}, {'voxel_size': -.01},
+                                    {'voxel_size': .0001}, {'voxel_size': float('inf')}, {'resident_submaps': 0},
                                     {'max_voxels': 1000001}, {'max_input_points': True}])
 def test_invalid_limits(changes):
     with pytest.raises(ValueError):

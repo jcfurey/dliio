@@ -25,7 +25,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from tf2_ros import StaticTransformBroadcaster
 from direct_lidar_inertial_odometry.srv import MapArchive
 
-from .core import FIELDS, Limits, Store
+from .core import FIELDS, Limits, Store, validate_leaf
 from .input import Pairer, decode_cloud, decode_pose, stamp_ns
 
 
@@ -51,6 +51,8 @@ class MappingNode(Node):
             return self.get_parameter(name).value
         self.limits = Limits(**{name: parameter('mapping/' + name, getattr(Limits(), name))
                                for name in Limits.__dataclass_fields__})
+        self.fusion_size = parameter('mapping/fusion_size', .02)
+        validate_leaf(self.fusion_size if self.fusion_size != 0 else None)
         self.odom_frame = parameter('frames/odom', 'odom')
         self.base_frame = parameter('frames/baselink', 'base_link')
         self.map_frame = parameter('frames/map', 'map')
@@ -65,6 +67,9 @@ class MappingNode(Node):
                        if name.startswith(('extrinsics/', 'imu/', 'frames/'))}
         self.metadata = dict(odom_frame=self.odom_frame, base_frame=self.base_frame,
                              map_frame=self.map_frame, calibration=calibration,
+                             input_source=parameter('mapping/input_source', 'keyframes'),
+                             observation_selection={name: value.value for name, value in
+                                 self.get_parameters_by_prefix('').items() if name.startswith('map/observation/')},
                              map_to_odom=np.eye(4).tolist())
         self.load_path = parameter('mapping/load_path', '')
         self.storage_directory = Path(parameter('mapping/storage_directory', 'dliio_run/mapping')).expanduser().resolve()
@@ -89,6 +94,7 @@ class MappingNode(Node):
         self.cached_map = None
         self.revision = 0
         self.published_revision = -1
+        self.refresh_interval = 1. / rate
         self.input_group = MutuallyExclusiveCallbackGroup()
         self.publish_group = MutuallyExclusiveCallbackGroup()
         # The storage worker serializes these operations anyway. Admit one
@@ -129,10 +135,10 @@ class MappingNode(Node):
             for operation in ('save_map', 'load_map', 'export_pcd')]
         self.add_on_set_parameters_callback(self._on_parameters)
         self.get_logger().info(f'Mapping archive: {self.state["archive"]}; '
-                               f'{"read-only viewer" if self.viewer else "recording paired keyframes"}')
+                               f'{"read-only viewer" if self.viewer else "recording paired mapping frames"}')
 
     def _on_parameters(self, parameters):
-        immutable = any(p.name.startswith(('mapping/', 'frames/', 'extrinsics/', 'imu/'))
+        immutable = any(p.name.startswith(('mapping/', 'map/observation/', 'frames/', 'extrinsics/', 'imu/'))
                         and p.value != self.get_parameter(p.name).value for p in parameters)
         return SetParametersResult(successful=not immutable,
             reason='Restart the mapper to change configuration or calibration' if immutable else '')
@@ -180,12 +186,18 @@ class MappingNode(Node):
         return store
 
     def _refresh(self, store):
-        points = store.snapshot()
+        start = time.monotonic()
+        points = store.snapshot(self.fusion_size or None)
         message = cloud_message(points, store.meta['last_stamp_ns'], self.map_frame)
         with self.lock:
             self.cached_map = message
             self.state = store.stats()
             self.state['cached_map_bytes'] = len(message.data)
+            self.state['published_points'] = len(points)
+            self.state['fusion_size'] = self.fusion_size
+            elapsed = (time.monotonic() - start) * 1000
+            self.state['refresh_last_ms'] = elapsed
+            self.counters['refresh_max_ms'] = max(self.counters['refresh_max_ms'], elapsed)
             self.revision += 1
 
     def _work(self):
@@ -196,7 +208,13 @@ class MappingNode(Node):
                            self.limits, metadata=self.metadata))
             self._refresh(store)
             self.ready.set_result(True)
+            dirty = False
+            next_refresh = time.monotonic() + self.refresh_interval
             while not self.stopping.is_set() or not self.jobs.empty():
+                if dirty and (time.monotonic() >= next_refresh or self.stopping.is_set()):
+                    self._refresh(store)
+                    dirty = False
+                    next_refresh = time.monotonic() + self.refresh_interval
                 try:
                     operation, data, future = self.jobs.get(timeout=.1)
                 except queue.Empty:
@@ -212,16 +230,17 @@ class MappingNode(Node):
                         stamp, pose, cloud = data
                         store.ingest(stamp, decode_pose(pose),
                                      decode_cloud(cloud, self.limits.max_input_points, self.max_bytes))
-                        self._refresh(store)
+                        dirty = True
                         elapsed = (time.monotonic() - start) * 1000
                         with self.lock:
                             self.counters['processed'] += 1
+                            self.state.update(store.stats())
                             self.state['worker_last_ms'] = elapsed
                             self.counters['worker_max_ms'] = max(self.counters['worker_max_ms'], elapsed)
                     elif operation == 'save_map':
                         store.save(data)
                     elif operation == 'export_pcd':
-                        store.export_pcd(data)
+                        store.export_pcd(data, self.fusion_size or None)
                     elif operation == 'load_map':
                         if not self.viewer:
                             raise ValueError('Loading into a recording session is disabled; start a viewer with load_map:=...')
@@ -296,7 +315,7 @@ class MappingNode(Node):
         status = DiagnosticStatus(name='DLIO Mapping', hardware_id=values.get('session_id', ''))
         status.level = DiagnosticStatus.ERROR if failed else DiagnosticStatus.WARN if drops else DiagnosticStatus.OK
         status.message = ('Storage failed; recording stopped: ' + error) if failed else (
-            error or ('Read-only map viewer' if self.viewer else 'Recording paired keyframes'))
+            error or ('Read-only map viewer' if self.viewer else 'Recording paired mapping frames'))
         status.values = [KeyValue(key=key, value=str(value)) for key, value in sorted(values.items())]
         report = DiagnosticArray()
         report.header.stamp = self.get_clock().now().to_msg()

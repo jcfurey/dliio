@@ -18,14 +18,17 @@ from diagnostic_msgs.msg import DiagnosticArray
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import PointCloud2
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from rosbag2_interfaces.srv import Pause
 from direct_lidar_inertial_odometry.srv import MapArchive
-from dliio_mapping.core import FIELDS, Limits, Store
+from dliio_mapping.core import FIELDS, Limits, Store, decode_points
+from dliio_mapping.input import decode_cloud
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag', type=Path)
     parser.add_argument('--seconds', type=float, default=75., help='Sample duration after the first scan')
+    parser.add_argument('--mapping-input', choices=('observations', 'keyframes'), default='observations')
     parser.add_argument('--full', action='store_true', help='Wait for the complete bag player to exit')
     parser.add_argument('--rviz', action='store_true')
     parser.add_argument('--keep-running', action='store_true', help='Keep the successful launch open for viewing')
@@ -43,15 +46,25 @@ def main():
     node = rclpy.create_node('dlio_mapping_replay_check')
     process = None
     passed = False
+    frame = 'mapping' if args.mapping_input == 'observations' else 'keyframe'
+    pose_name = 'mapping_pose' if frame == 'mapping' else 'keyframe_pose'
     counts, mapping, odometry = Counter(), {}, {}
-    stamps = {name: set() for name in ('scan_pose', 'deskewed', 'keyframe', 'keyframe_pose')}
+    stamps = {name: set() for name in ('scan_pose', 'deskewed', 'keyframe', 'keyframe_pose', 'mapping', 'mapping_pose')}
     latest_map = [None]
     first_scan = [None]
     map_peak = [0]
+    point_counts = {name: {} for name in ('deskewed', 'keyframe', 'mapping')}
+    field_hashes = {}
 
     def collect(name, message):
         counts[name] += 1
-        stamps[name].add(message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec)
+        stamp = message.header.stamp.sec * 1000000000 + message.header.stamp.nanosec
+        stamps[name].add(stamp)
+        if name in point_counts:
+            point_counts[name][stamp] = message.width * message.height
+        if name == frame:
+            points = decode_cloud(message, Limits().max_input_points, 16777216)
+            field_hashes[stamp] = hashlib.sha256(np.ascontiguousarray(points[:, 3:]).tobytes()).hexdigest()
         if name == 'scan_pose' and first_scan[0] is None:
             first_scan[0] = time.monotonic()
 
@@ -89,7 +102,9 @@ def main():
         ('scan_pose', '/dlio/odom_node/scan_pose', PoseStamped),
         ('deskewed', '/dlio/odom_node/pointcloud/deskewed', PointCloud2),
         ('keyframe', '/dlio/odom_node/pointcloud/keyframe', PointCloud2),
-        ('keyframe_pose', '/dlio/odom_node/keyframe_pose', PoseStamped)]:
+        ('keyframe_pose', '/dlio/odom_node/keyframe_pose', PoseStamped),
+        ('mapping', '/dlio/odom_node/pointcloud/mapping', PointCloud2),
+        ('mapping_pose', '/dlio/odom_node/mapping_pose', PoseStamped)]:
         subscriptions.append(node.create_subscription(kind, topic,
             lambda message, name=name: collect(name, message), QoSProfile(depth=20)))
     subscriptions += [
@@ -99,10 +114,10 @@ def main():
             lambda message: diagnostic(mapping, message), 10),
         node.create_subscription(DiagnosticArray, '/diagnostics',
             lambda message: diagnostic(odometry, message), qos_profile_sensor_data)]
-    # A small window forces disk-backed eviction on this bag, without changing
+    # A four-submap window forces eviction on a full bag, without changing
     # the frontend profile or the mapper's voxel/input capacity.
     config = run / 'mapping-check.yaml'
-    config.write_text('/**:\n  ros__parameters:\n    mapping/submap_keyframes: 5\n'
+    config.write_text('/**:\n  ros__parameters:\n    mapping/submap_keyframes: 100\n'
                       '    mapping/resident_submaps: 4\n')
     try:
         discovery = time.monotonic() + 1
@@ -114,7 +129,7 @@ def main():
             process = subprocess.Popen(['ros2', 'launch', 'direct_lidar_inertial_odometry',
                 'dlio_mapping.launch.py', 'mode:=packets', 'profile:=0705', 'rate:=1.0',
                 f'bag:={args.bag.resolve()}', f'run_dir:={run}', f'mapping_config:={config}',
-                'rviz:=' + str(args.rviz).lower()],
+                f'mapping_input:={args.mapping_input}', 'rviz:=' + str(args.rviz).lower()],
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             (run / 'launch.pid').write_text(str(process.pid) + '\n')
             until(lambda: first_scan[0] is not None and 'session_id' in mapping, 45)
@@ -126,10 +141,25 @@ def main():
                                         args.output.with_suffix('.log').read_text()), duration + 40)
             else:
                 until(lambda: time.monotonic() - first_scan[0] >= args.seconds, args.seconds + 10)
-            if args.full:
-                until(lambda: int(mapping.get('keyframes', 0)) == len(stamps['keyframe']) and
+                # Export runs on the bounded storage worker. Pause only after
+                # sampling at full speed, so export cannot overflow its queue.
+                pause = node.create_client(Pause, '/rosbag2_player/pause')
+                until(pause.service_is_ready, 5)
+                paused = pause.call_async(Pause.Request())
+                until(paused.done, 5)
+                paused.result()
+                node.destroy_client(pause)
+                until(lambda: int(mapping.get('keyframes', 0)) == len(stamps[frame]) and
                       int(mapping.get('pending_pairs', -1)) == 0 and int(mapping.get('queue_depth', -1)) == 0, 15)
-            required_stamps = set(stamps['keyframe'])
+            if args.full:
+                until(lambda: int(mapping.get('keyframes', 0)) == len(stamps[frame]) and
+                      int(mapping.get('pending_pairs', -1)) == 0 and int(mapping.get('queue_depth', -1)) == 0, 15)
+            required_stamps = set(stamps[frame])
+            required_scan_stamps = set(stamps['scan_pose'])
+            # Freeze the live sample boundary before waiting for separately
+            # delivered clouds. Checking a continuously advancing pose set at
+            # service completion can mistake an in-flight cloud for a loss.
+            until(lambda: required_scan_stamps <= stamps['deskewed'], 10)
             # Wait for the sampled boundary to commit before enqueuing save.
             # Separate cloud/pose callbacks and 1 Hz diagnostics can lag the
             # probe even when no input is lost.
@@ -139,17 +169,29 @@ def main():
             archived = Store(run / 'saved.dliomap', Limits(resident_submaps=4))
             try:
                 archived_stamps = {row[0] for row in archived.db.execute('SELECT stamp_ns FROM keyframes')}
-                assert archived_stamps <= stamps['keyframe'] & stamps['keyframe_pose']
+                assert archived_stamps <= stamps[frame] & stamps[pose_name]
                 assert required_stamps <= archived_stamps
                 if args.full:
-                    assert archived_stamps == stamps['keyframe'] == stamps['keyframe_pose']
+                    assert archived_stamps == stamps[frame] == stamps[pose_name]
                 assert archived.meta['calibration']['frames/baselink'] == 'dliio_base_link'
                 assert archived.meta['keyframes'] == response.keyframes > 0
                 assert archived.meta['submaps'] > 4 if args.full else archived.meta['submaps'] > 0
                 assert archived.stats()['resident_submaps'] <= 4
-                assert len(archived.snapshot()) <= 400000
-                export_points = archived.export_pcd(run / 'reloaded.pcd')
-                assert export_points >= len(archived.snapshot())
+                assert len(archived.snapshot()) <= 4 * archived.limits.max_voxels
+                assert archived.limits.voxel_size == 0., 'Default mapping must retain individual returns'
+                archived_input_points = 0
+                for stamp, count, blob, crc in archived.db.execute('SELECT stamp_ns,count,points,crc FROM keyframes'):
+                    assert count == point_counts[frame][stamp]
+                    points = decode_points(blob, count, crc, archived.limits.max_input_points)
+                    assert hashlib.sha256(np.ascontiguousarray(points[:, 3:]).tobytes()).hexdigest() == field_hashes[stamp]
+                    archived_input_points += count
+                fusion_size = float(mapping['fusion_size'])
+                assert fusion_size > 0, 'Default output must fuse overlapping keyframes'
+                export_points = archived.export_pcd(run / 'reloaded.pcd', fusion_size)
+                assert export_points < archived_input_points, 'Output did not co-locate overlapping returns'
+                assert export_points >= len(archived.snapshot(fusion_size))
+                raw_points = archived.export_pcd(run / 'raw.pcd')
+                assert raw_points == archived_input_points, 'Dense source samples were lost'
                 archive_stats = archived.stats()
             finally:
                 archived.close()
@@ -172,8 +214,19 @@ def main():
                          'invalid_input', 'late_or_duplicate', 'duplicate_pending'):
                 assert int(mapping.get(name, 0)) == 0, (name, mapping.get(name))
             assert counts['scan_pose'] >= (duration - 5 if args.full else args.seconds) * 9
-            assert stamps['scan_pose'] <= stamps['deskewed']
+            assert required_scan_stamps <= stamps['deskewed']
+            if args.full:
+                assert stamps['scan_pose'] <= stamps['deskewed']
+            shared = point_counts['deskewed'].keys() & point_counts[frame].keys()
+            ratios = [point_counts[frame][stamp] / point_counts['deskewed'][stamp] for stamp in shared]
+            assert ratios and min(ratios) > 1., '0705 mapping still receives the registration cloud'
+            density = {name: dict(min=min(values.values()), median=float(np.median(list(values.values()))),
+                                 max=max(values.values())) for name, values in point_counts.items() if values}
+            density['paired_dense_to_registration_ratio'] = dict(min=min(ratios), median=float(np.median(ratios)),
+                                                                 max=max(ratios), pairs=len(ratios))
             result = dict(passed=True, ros_distro=os.environ.get('ROS_DISTRO'), rate=1., full_bag=args.full,
+                density=density, archived_input_points=archived_input_points, fusion_size=fusion_size,
+                sampled_scan_pairs=len(required_scan_stamps), mapping_input=args.mapping_input,
                 counts=dict(counts), timestamp_pairs={name: len(values) for name, values in stamps.items()},
                 archive=archive_stats, mapping_diagnostics=mapping, odometry_diagnostics=odometry,
                 exported_points=export_points, map_peak_points=map_peak[0],
@@ -182,6 +235,13 @@ def main():
             args.output.write_text(json.dumps(result, indent=2) + '\n')
             print(json.dumps(result, indent=2))
             passed = True
+    except BaseException as error:
+        args.output.write_text(json.dumps(dict(passed=False, error=str(error),
+            counts=dict(counts), mapping_diagnostics=mapping, odometry_diagnostics=odometry,
+            missing_scan_cloud_stamps=sorted(stamps['scan_pose'] - stamps['deskewed']),
+            missing_mapping_cloud_stamps=sorted(stamps[pose_name] - stamps[frame]),
+            missing_mapping_pose_stamps=sorted(stamps[frame] - stamps[pose_name])), indent=2) + '\n')
+        raise
     finally:
         if process and process.poll() is None and not (passed and args.keep_running):
             os.killpg(process.pid, signal.SIGINT)

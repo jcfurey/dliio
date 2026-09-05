@@ -92,7 +92,8 @@ def main():
                 '-r', 'keyframes:=/mapping_smoke/cloud', '-r', 'keyframe_pose:=/mapping_smoke/pose',
                 '-r', 'map:=/mapping_smoke/map', '-p', 'mapping/submap_keyframes:=2',
                 '-p', 'mapping/resident_submaps:=2', '-p', 'mapping/max_voxels:=100',
-                '-p', 'mapping/pair_timeout:=0.2', '-p', 'mapping/publish_rate:=10.0']
+                '-p', 'mapping/pair_timeout:=0.2', '-p', 'mapping/publish_rate:=10.0',
+                '-p', 'map/observation/distance:=0.2']
         with (run / 'recording.log').open('w') as log:
             process = subprocess.Popen(base + ['-p', f'mapping/storage_directory:={run}'],
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -148,10 +149,11 @@ def main():
             process = None
         archived = Store(saved, Limits(resident_submaps=2, max_voxels=100))
         try:
-            np.testing.assert_array_equal(archived.snapshot(), expected_view)
+            np.testing.assert_array_equal(archived.snapshot(float(recording_diagnostics['fusion_size']) or None), expected_view)
             n, blob, crc = archived.db.execute('SELECT count,points,crc FROM keyframes WHERE id=0').fetchone()
             np.testing.assert_allclose(decode_points(blob, n, crc, 10)[:, :3], [[1, 0, 0], [0, 1, 0]], atol=1e-6)
             assert 'extrinsics/baselink2imu/R' in archived.meta['calibration']
+            assert archived.meta['observation_selection']['map/observation/distance'] == .2
             session = archived.meta['session_id']
         finally:
             archived.close()
