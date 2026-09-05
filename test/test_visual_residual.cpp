@@ -28,6 +28,32 @@ using Cloud = pcl::PointCloud<dlio::Point>;
 // Subclass to reach the protected accumulator and reset state per call.
 class TestableGICP : public nano_gicp::NanoGICP<dlio::Point, dlio::Point> {
  public:
+  void useAnalyticTunnelCovariances() {
+    // Exact plane covariances isolate the degeneracy gate from finite-sample
+    // normal estimation at the synthetic tunnel's wall/ceiling corners.
+    source_covs_.clear();
+    for (const auto& p : *input_) {
+      Eigen::Vector3f n = std::abs(p.y) >= std::abs(p.z)
+          ? Eigen::Vector3f::UnitY() : Eigen::Vector3f::UnitZ();
+      Eigen::Matrix4f c = Eigen::Matrix4f::Identity();
+      c.block<3, 3>(0, 0) -= 0.999f * n * n.transpose();
+      source_covs_.push_back(c);
+    }
+    setTargetCovariances(std::make_shared<nano_gicp::CovarianceList>(source_covs_));
+  }
+  bool gradientAt(int index, Eigen::Vector3f& gradient) {
+    return estimate_spatial_intensity_gradient(index, gradient);
+  }
+  double registrationSystem(const Eigen::Isometry3f& trans,
+                            Eigen::Matrix<double, 6, 6>& H,
+                            Eigen::Matrix<double, 6, 1>& b,
+                            Eigen::Matrix<double, 6, 6>& H_geo) {
+    calculate_target_intensity_gradients();
+    update_correspondences(trans);
+    double cost = 0.0;
+    linearize(trans, &H, &b, &cost, &H_geo);
+    return cost;
+  }
   // Returns (H, b, cost) for the visual term alone at pose `trans`.
   double visualSystem(const Eigen::Isometry3f& trans,
                       Eigen::Matrix<double, 6, 6>& H,
@@ -732,8 +758,12 @@ TEST(LidarMapResidual, RangeImageRejectsOccludedPoints) {
   cv::Mat rng(kLH, kLW, CV_32FC1, cv::Scalar(0.f));
   for (const auto& p : target->points) {
     float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
-    rng.at<float>(static_cast<int>(std::lround(v)), static_cast<int>(std::lround(u))) =
-        std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+    // The full interpolation/gradient footprint must contain real returns.
+    for (int row = static_cast<int>(v) - 1; row <= static_cast<int>(v) + 2; ++row) {
+      for (int col = static_cast<int>(u) - 1; col <= static_cast<int>(u) + 2; ++col) {
+        rng.at<float>(row, col) = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+      }
+    }
   }
   gicp.setLidarRangeImage(rng);
   gicp.setLidarRangeConsistency(0.5f, 0.1f);
@@ -981,6 +1011,192 @@ TEST(LidarFlowResidual, ResidualIsZeroWhenFramesCoincide) {
   EXPECT_NEAR(cost, 0.0, 1e-9);
   EXPECT_LT(b.norm(), 1e-3);                  // no gradient at the optimum
   EXPECT_LT(gicp.lastLidarFlowRms(), 1e-4);
+}
+
+TEST(LidarFlowResidual, MeanSubtractedRampHasNoMotionInformation) {
+  // Translating a linear brightness ramp changes only the patch mean. After
+  // removing that mean, its Hessian must not claim any motion information.
+  TestableGICP g;
+  auto img = makeRampImage(kLW, kLH, 0.002f, 0.003f, 0.1f);
+  setupFlow(g, img, Eigen::Isometry3f::Identity(), makeLidarTarget());
+  g.setLidarFlowMode(true, 2);
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b);
+  ASSERT_GT(g.lastLidarFlowCount(), 20);
+  EXPECT_LT(H.norm(), 1e-5);
+}
+
+TEST(LidarFlowResidual, RejectsOcclusionAndMissingGradientSupport) {
+  TestableGICP g;
+  auto img = makeRampImage(kLW, kLH, 0.002f, 0.003f, 0.1f);
+  setupFlow(g, img, Eigen::Isometry3f::Identity(), makeLidarTarget());
+  cv::Mat range(kLH, kLW, CV_32FC1, cv::Scalar(0.1f));
+  g.setLidarFlowPrev(img, Eigen::Isometry3f::Identity(), range);
+  g.setLidarRangeConsistency(0.05f, 0.01f);
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  EXPECT_EQ(g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b), 0.0);
+  EXPECT_EQ(g.lastLidarFlowCount(), 0);
+
+  // Even with a permissive depth tolerance, missing pixels around an otherwise
+  // valid center cannot be treated as texture edges.
+  range.setTo(10.f);
+  for (int col = 0; col < range.cols; col += 2) { range.col(col).setTo(0.f); }
+  g.setLidarFlowPrev(img, Eigen::Isometry3f::Identity(), range);
+  g.setLidarRangeConsistency(100.f, 1.f);
+  EXPECT_EQ(g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b), 0.0);
+  EXPECT_EQ(g.lastLidarFlowCount(), 0);
+}
+
+namespace {
+struct TunnelFrame {
+  Cloud::Ptr cloud = std::make_shared<Cloud>();
+  cv::Mat image{64, 1024, CV_32FC1, cv::Scalar(0.f)};
+  cv::Mat range{64, 1024, CV_32FC1, cv::Scalar(0.f)};
+};
+
+TunnelFrame paintedTunnel(float sensor_x, bool painted) {
+  TunnelFrame out;
+  for (int row = 0; row < 64; ++row) {
+    const float el = 0.36f - 0.72f * row / 63.f;
+    for (int col = 0; col < 1024; ++col) {
+      const float az = -2.f * M_PI * col / 1024.f;
+      Eigen::Vector3f ray(std::cos(el) * std::cos(az), std::cos(el) * std::sin(az), std::sin(el));
+      const float range = 1.f / std::max(std::abs(ray.y()), std::abs(ray.z()));
+      if (range > 10.f) { continue; }
+      const Eigen::Vector3f p = range * ray;
+      const float world_x = p.x() + sensor_x;
+      const float value = painted ? 0.5f + 0.2f * std::sin(4.f * world_x)
+          + 0.15f * std::sin(7.1f * world_x + 2.f * p.z())
+          + 0.1f * std::cos(2.1f * world_x + 3.f * p.y()) : 0.5f;
+      out.image.at<float>(row, col) = value;
+      out.range.at<float>(row, col) = range;
+      if (row % 2 == 0 && col % 8 == 0) {
+        auto pt = makePoint(p.x(), p.y(), p.z());
+        pt.reflectivity = value * 255.f;
+        out.cloud->push_back(pt);
+      }
+    }
+  }
+  return out;
+}
+
+Eigen::Matrix4f alignPaintedTunnel(float motion, bool painted, bool flow,
+                                  float prior, int* rescued) {
+  auto prev = paintedTunnel(0.f, painted);
+  auto cur = paintedTunnel(motion, painted);
+  TestableGICP g;
+  g.setNumThreads(1);
+  g.setRegularizationMethod(nano_gicp::RegularizationMethod::PLANE);
+  g.setDegeneracyThreshRatio(0.005f);
+  g.setMaximumIterations(30);
+  g.setTransformationEpsilon(1e-5f);
+  g.setRotationEpsilon(1e-5f);
+  g.setMaxCorrespondenceDistance(0.5f);
+  g.setPhotometricWeight(0.f);
+  g.setPhotometricHuberDelta(0.1f);
+  g.setLidarProjection(-2.f * M_PI / 1024.f, 0.f, -0.72f / 63.f, 0.36f);
+  g.setLidarImage(cur.image);
+  g.setLidarRangeImage(cur.range);
+  g.setLidarFrame(Eigen::Isometry3f::Identity());
+  g.setLidarFlowPrev(prev.image, Eigen::Isometry3f::Identity(), prev.range);
+  g.setLidarFlowMode(true, 0);
+  g.setLidarFlowWeight(flow ? 100.f : 0.f);
+  g.setVisualGateMaxStep(0.15f, 0.05f);
+  g.setInputSource(cur.cloud);
+  g.setInputTarget(prev.cloud);
+  g.useAnalyticTunnelCovariances();
+  Cloud aligned;
+  Eigen::Matrix4f guess = Eigen::Matrix4f::Identity();
+  guess(0, 3) = prior;
+  g.align(aligned, guess);
+  *rescued = g.lastVisualRescuedDirections();
+  return g.getFinalTransformation();
+}
+}  // namespace
+
+TEST(LidarTunnelOdometry, PaintConstrainsForwardReverseAndStationaryMotion) {
+  // Geometry is an infinite square tunnel: moving along x does not change it.
+  // Paint is attached to WORLD coordinates; it supplies the missing constraint.
+  // A directional velocity clamp would fail the reverse and stationary cases.
+  for (float motion : {-0.08f, 0.f, 0.08f}) {
+    SCOPED_TRACE(motion);
+    int rescued = 0;
+    const auto pose = alignPaintedTunnel(motion, true, true, 0.03f, &rescued);
+    EXPECT_GT(rescued, 0);
+    EXPECT_NEAR(pose(0, 3), motion, 0.01f);
+    EXPECT_LT((pose.block<2, 1>(1, 3).norm()), 0.005f);
+  }
+}
+
+TEST(LidarTunnelOdometry, NoTextureOrDisabledFlowKeepsWeakAxisPrior) {
+  for (bool painted : {false, true}) {
+    int rescued = 0;
+    const auto pose = alignPaintedTunnel(0.08f, painted, !painted, 0.03f, &rescued);
+    EXPECT_EQ(rescued, 0);
+    EXPECT_NEAR(pose(0, 3), 0.03f, 0.003f);
+  }
+}
+
+TEST(LidarTunnelOdometry, PlanarGraffitiHasATangentialPhotometricGradient) {
+  auto cloud = std::make_shared<Cloud>();
+  for (int row = -4; row <= 4; ++row) {
+    for (int col = -4; col <= 4; ++col) {
+      auto p = makePoint(0.1f * col, 0.1f * row, 1.f);
+      p.reflectivity = 255.f * (0.5f + 0.2f * p.x - 0.1f * p.y);
+      cloud->push_back(p);
+    }
+  }
+  TestableGICP g;
+  g.setPhotometricChannel(true);
+  g.setPhotometricScale(255.f);
+  g.setInputTarget(cloud);
+  Eigen::Vector3f gradient;
+  ASSERT_TRUE(g.gradientAt(40, gradient));
+  EXPECT_NEAR(gradient.x(), 0.2f, 1e-4f);
+  EXPECT_NEAR(gradient.y(), -0.1f, 1e-4f);
+  EXPECT_NEAR(gradient.z(), 0.f, 1e-6f);
+}
+
+TEST(LidarTunnelOdometry, AppearanceDoesNotMaskGeometricDegeneracyAndCostMatchesGradient) {
+  auto target = std::make_shared<Cloud>();
+  for (int row = -4; row <= 4; ++row) {
+    for (int col = -4; col <= 4; ++col) {
+      auto p = makePoint(0.1f * col, 0.1f * row, 1.f);
+      p.reflectivity = 255.f * (0.5f + 0.2f * p.x - 0.1f * p.y);
+      target->push_back(p);
+    }
+  }
+  auto source = std::make_shared<Cloud>(*target);
+  for (auto& p : *source) { p.reflectivity += 3.f; }
+  TestableGICP g;
+  g.setNumThreads(1);
+  g.setPhotometricChannel(true);
+  g.setPhotometricScale(255.f);
+  g.setPhotometricHuberDelta(0.f);
+  g.setInputSource(source);
+  g.setInputTarget(target);
+  g.useAnalyticTunnelCovariances();
+  Eigen::Matrix<double, 6, 6> H0, H, geo0, geo;
+  Eigen::Matrix<double, 6, 1> b0, b;
+  const auto pose = Eigen::Isometry3f::Identity();
+  g.setPhotometricWeight(0.f);
+  g.registrationSystem(pose, H0, b0, geo0);
+  g.setPhotometricWeight(1000.f);
+  g.registrationSystem(pose, H, b, geo);
+  EXPECT_LT((geo - H0).norm(), 1e-8);
+  EXPECT_GT((H - geo).norm(), 100.f);
+  Eigen::Matrix<double, 6, 1> numeric;
+  constexpr float eps = 1e-4f;
+  for (int k = 0; k < 6; ++k) {
+    Eigen::Matrix<double, 6, 6> temp, temp_geo;
+    Eigen::Matrix<double, 6, 1> temp_b;
+    const double cp = g.registrationSystem(perturbLeft(pose, k, eps), temp, temp_b, temp_geo);
+    const double cm = g.registrationSystem(perturbLeft(pose, k, -eps), temp, temp_b, temp_geo);
+    numeric(k) = (cp - cm) / (2.0 * eps);
+  }
+  EXPECT_LT((numeric - 2.0 * b).norm(), 0.005 * b.norm());
 }
 
 // THE sign/frame test: the analytic gradient must agree with a central finite

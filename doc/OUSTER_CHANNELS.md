@@ -51,6 +51,13 @@ keyframe references, map residuals, and flow use the same convention.
 Field decoding alone does not validate that model for a particular
 sensor's beam offsets, scan organization, or extrinsics.
 
+The [0705 tunnel review](REVIEW_2026-09-05_tunnel_texture.md) documents the
+subsequent texture, degeneracy-gate, and timing fixes. Its dataset-specific
+profile combines signal image flow with calibrated-reflectivity map gradients.
+Image flow validates both range images and interpolation support. Planar wall
+patches retain tangential photometric gradients, and relative point times remain
+anchored to the message header after cropping.
+
 Photometric channel fallback is resolved on the first nonempty cloud, even if
 the weight is initially zero. If neither channel is readable, the term stays
 disabled when a live weight change is requested. An unavailable image channel

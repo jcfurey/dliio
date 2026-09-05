@@ -1,0 +1,29 @@
+# 0705 recorded-tunnel texture profile. Apply after params.yaml,
+# ouster_tunnel.yaml, and ouster_07052026_extrinsics.yaml.
+# Requires full-resolution organized, destaggered Ouster clouds.
+# See doc/REVIEW_2026-09-05_tunnel_texture.md for measured limits and replay setup.
+/**:
+  ros__parameters:
+    # Calibrated reflectivity supplies the spatial map gradient. Signal supplies
+    # full-resolution inter-frame texture; their weights are tuned together.
+    odom/gicp/photometricChannel: reflectivity
+    odom/gicp/photometricScale: 255.0
+    odom/gicp/photometricWeight: 0.1
+    odom/gicp/photometricHuberDelta: 0.05
+    odom/lidar_image/enabled: true
+    odom/lidar_image/weight: 0.0
+    odom/lidar_image/channel: intensity
+    odom/lidar_image/scale: 4096.0
+    odom/lidar_image/denoiseKernel: 3
+    odom/lidar_image/flow/enabled: true
+    odom/lidar_image/flow/weight: 100.0
+    odom/lidar_image/flow/imageRef: true
+    odom/lidar_image/flow/patch: 0
+    odom/lidar_image/rangeAbsTol: 0.5
+    odom/lidar_image/rangeRelTol: 0.1
+    odom/lidar_image/condScale/enabled: false
+    odom/lidar_image/dirSeparated/enabled: false
+    odom/visual/enabled: false
+    odom/visual/map/enabled: false
+    odom/visual/gateMaxStepTrans: 0.3
+    odom/visual/gateMaxStepRot: 0.05

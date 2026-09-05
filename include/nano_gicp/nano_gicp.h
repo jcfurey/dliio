@@ -315,7 +315,8 @@ public:
   // the degenerate axis. Threading: the accumulator snapshots the image (refcount
   // hold) for the loop's lifetime; the member is never mutated in place.
   void setLidarFlowWeight(float weight);
-  void setLidarFlowPrev(const cv::Mat& prev_img, const Eigen::Isometry3f& T_lw_prev);
+  void setLidarFlowPrev(const cv::Mat& prev_img, const Eigen::Isometry3f& T_lw_prev,
+                       const cv::Mat& prev_range = cv::Mat());
   // Flow-term reference mode (doc/INTENSITY_AUDIT_2026-07-09.md). image_ref=true
   // (default): the reference brightness is sampled from the CURRENT scan's
   // full-resolution image (setLidarImage) at the point's prior-pose projection --
@@ -501,7 +502,9 @@ public:
 protected:
   virtual void computeTransformation(PointCloudSource& output, const Eigen::Matrix4f& guess) override;
 
-  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<double, 6, 6>* H, Eigen::Matrix<double, 6, 1>* b, double* cost = nullptr);
+  void linearize(const Eigen::Isometry3f& trans, Eigen::Matrix<double, 6, 6>* H,
+                 Eigen::Matrix<double, 6, 1>* b, double* cost = nullptr,
+                 Eigen::Matrix<double, 6, 6>* H_geo = nullptr);
   void update_correspondences(const Eigen::Isometry3f& trans);
 
   template<typename PointT>
@@ -676,6 +679,7 @@ protected:
   int lidar_flow_patch_;              // patch half-width in [0,3]; 0 = single pixel
   cv::Mat lidar_flow_prev_img_;       // PREVIOUS scan's image (owned deep copy), CV_32FC1, /scale
   Eigen::Isometry3f T_lw_prev_flow_;  // world -> previous lidar (previous scan's corrected pose)
+  cv::Mat lidar_flow_prev_range_;
   int last_lidar_flow_count_;         // diagnostics: flow residuals last scan
   float last_lidar_flow_rms_;
   cv::Mat lidar_range_img_;           // current range image [m], CV_32FC1, <=0 invalid (optional)

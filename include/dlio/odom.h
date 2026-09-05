@@ -173,7 +173,7 @@ private:
                  const std::vector<double>& sorted_timestamps);
   void propagateGICP();
 
-  void propagateState();
+  void propagateState(const builtin_interfaces::msg::Time& stamp);
   void updateState();
 
   void setAdaptiveParams();
@@ -392,6 +392,7 @@ private:
     Eigen::Vector3f prev_p;
     Eigen::Quaternionf prev_q;
     Eigen::Vector3f prev_vel;
+    double prev_state_stamp = -1.0;  // time of the stored observer state (latest IMU), not the LiDAR midpoint
   }; Geo geo;
 
   // State Vector
@@ -497,6 +498,8 @@ private:
   double gravity_;
 
   bool time_offset_;
+  bool observer_time_aligned_ = false;
+  double observer_lag_seconds_ = 0.0;
 
   bool adaptive_params_;
 
@@ -657,6 +660,7 @@ private:
   bool lidar_flow_image_ref_ = true;   // reference = current full-res image (true) vs voxel-averaged field (false)
   int lidar_flow_patch_ = 0;           // patch half-width [0,3]; 0 = single pixel (INTENSITY_AUDIT_2026-07-09)
   cv::Mat lidar_flow_prev_img_;        // previous scan's image, stashed for the flow term
+  cv::Mat lidar_flow_prev_range_;      // reject missing returns and occlusions in the previous image
   Eigen::Isometry3f lidar_flow_T_lw_prev_ = Eigen::Isometry3f::Identity();  // prev scan corrected world->lidar
   bool lidar_flow_prev_valid_ = false; // a previous image has been stashed
   double lidar_ds_ratio_ = 0.05;       // weak-subspace bar (fraction of lambda_max)

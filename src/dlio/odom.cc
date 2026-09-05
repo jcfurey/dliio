@@ -1833,7 +1833,11 @@ void dlio::OdomNode::deskewPointcloud() {
 
   // compute offset between sweep reference time and first point timestamp
   double offset = 0.0;
-  if (this->time_offset_) {
+  // Ouster t and Velodyne time are already relative to the message header.
+  // Re-anchoring them to the first surviving return makes filtering/cropping
+  // shift the entire sweep against the IMU clock.
+  if (this->time_offset_ && this->sensor != dlio::SensorType::OUSTER &&
+      this->sensor != dlio::SensorType::VELODYNE) {
     offset = sweep_ref_time - extract_point_time(*points_unique_timestamps.begin());
   }
 
@@ -2127,8 +2131,9 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
   this->first_imu_received = true;
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
-  {
-    // imu_stamp is read by publishPose (timer thread) under geo.mtx; guard the write.
+  if (!this->geo.first_opt_done) {
+    // Before propagation starts, the initialized state is stationary. Once
+    // running, publish the timestamp atomically with the propagated state.
     std::lock_guard<std::mutex> lock(this->geo.mtx);
     this->imu_stamp = imu->header.stamp;
   }
@@ -2265,8 +2270,14 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     this->imu_meas.dt = dt;
     this->prev_imu_stamp = this->imu_meas.stamp;
 
-    Eigen::Vector3f lin_accel_corrected = (this->imu_accel_sm_ * lin_accel) - this->state.b.accel;
-    Eigen::Vector3f ang_vel_corrected = ang_vel - this->state.b.gyro;
+    Eigen::Vector3f accel_bias, gyro_bias;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      accel_bias = this->state.b.accel;
+      gyro_bias = this->state.b.gyro;
+    }
+    Eigen::Vector3f lin_accel_corrected = (this->imu_accel_sm_ * lin_accel) - accel_bias;
+    Eigen::Vector3f ang_vel_corrected = ang_vel - gyro_bias;
 
     this->imu_meas.lin_accel = lin_accel_corrected;
     this->imu_meas.ang_vel = ang_vel_corrected;
@@ -2281,7 +2292,7 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
     if (this->geo.first_opt_done) {
       // Geometric Observer: Propagate State
-      this->propagateState();
+      this->propagateState(imu->header.stamp);
     }
 
   }
@@ -2713,7 +2724,8 @@ void dlio::OdomNode::getNextPose() {
     // pose (it deep-copies and snapshots them). No previous stashed yet (first
     // scan) -> off this scan.
     if (lidar_flow_active && this->lidar_flow_prev_valid_) {
-      this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_);
+      this->gicp.setLidarFlowPrev(this->lidar_flow_prev_img_, this->lidar_flow_T_lw_prev_,
+                                this->lidar_flow_prev_range_);
       this->gicp.setLidarFlowMode(this->lidar_flow_image_ref_, this->lidar_flow_patch_);
       this->gicp.setLidarFlowWeight(static_cast<float>(this->lidar_flow_weight_));
     } else {
@@ -2740,9 +2752,8 @@ void dlio::OdomNode::getNextPose() {
         this->gicp.lastOobCorrespondences());
   }
 
-  // Surface degeneracy (e.g. featureless tunnel): the solver held the IMU
-  // prior along the unobservable directions; warn so the operator knows the
-  // estimate is dead-reckoning in those directions.
+  // Distinguish geometric weakness from directions still held after texture
+  // fusion. A successfully rescued axis is not dead-reckoning on the IMU.
   int degenerate_dirs = this->gicp.lastDegenerateDirections();
   // Snapshot for /diagnostics (publishDiagnostics reads these on the same
   // scan thread): directions held this scan + cumulative scans the gate fired.
@@ -2750,9 +2761,10 @@ void dlio::OdomNode::getNextPose() {
   if (degenerate_dirs > 0) {
     ++this->loc_gate_updates_cumulative_;
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-        "Scan-to-map registration is degenerate along %d direction(s); "
-        "holding IMU prior there (geometrically self-similar environment?)",
-        degenerate_dirs);
+        "Scan-to-map geometry is weak along %d direction(s); "
+        "texture rescued up to %d, holding the prior along %zu",
+        degenerate_dirs, this->gicp.lastVisualRescuedDirections(),
+        this->gicp.lastDegenTransDirs().size() + this->gicp.lastDegenRotDirs().size());
   }
 
   // Get final transformation in global frame
@@ -2884,6 +2896,7 @@ void dlio::OdomNode::getNextPose() {
     Eigen::Matrix4f T_wl = this->T * this->extrinsics.baselink2lidar_T;
     this->lidar_flow_T_lw_prev_.matrix() = T_wl.inverse();
     this->lidar_flow_prev_img_ = this->lidar_refl_img_;
+    this->lidar_flow_prev_range_ = this->lidar_range_img_;
     this->lidar_flow_prev_valid_ = true;
   }
 
@@ -3137,10 +3150,11 @@ void dlio::OdomNode::propagateGICP() {
 
 }
 
-void dlio::OdomNode::propagateState() {
+void dlio::OdomNode::propagateState(const builtin_interfaces::msg::Time& stamp) {
 
   // Lock thread to prevent state from being accessed by UpdateState
   std::lock_guard<std::mutex> lock( this->geo.mtx );
+  this->imu_stamp = stamp;
 
   double dt = this->imu_meas.dt;
 
@@ -3187,6 +3201,28 @@ void dlio::OdomNode::updateState() {
   Eigen::Quaternionf qe, qhat, qcorr;
   qhat = this->state.q;
 
+  // Registration estimates the scan midpoint, while the continuously
+  // propagated observer is already at the latest IMU time (usually >50 ms
+  // later for a 10 Hz spinning LiDAR). Comparing these poses directly creates
+  // an artificial -velocity*latency error and feeds it into velocity and bias.
+  // Reconstruct the observer prediction at the measurement time from the
+  // preceding corrected observer state, using the same buffered IMU data.
+  Eigen::Vector3f predicted_position = this->state.p;
+  this->observer_lag_seconds_ = rclcpp::Time(this->imu_stamp).seconds() - this->scan_stamp;
+  this->observer_time_aligned_ = std::abs(this->observer_lag_seconds_) < 1e-6;
+  if (this->geo.prev_state_stamp >= 0.0 &&
+      this->geo.prev_state_stamp < this->scan_stamp &&
+      this->scan_stamp <= rclcpp::Time(this->imu_stamp).seconds()) {
+    const auto prediction = this->integrateImu(this->geo.prev_state_stamp,
+        this->geo.prev_q, this->geo.prev_p, this->geo.prev_vel, {this->scan_stamp});
+    if (prediction.size() == 1) {
+      this->observer_time_aligned_ = true;
+      predicted_position = prediction.front().block<3, 1>(0, 3);
+      qhat = Eigen::Quaternionf(prediction.front().block<3, 3>(0, 0));
+      qhat.normalize();
+    }
+  }
+
   // Constuct error quaternion
   qe = qhat.conjugate()*qin;
 
@@ -3199,7 +3235,7 @@ void dlio::OdomNode::updateState() {
   qcorr.w() = 1 - abs(qe.w());
   Eigen::Vector3f qe_vec = sgn*qe.vec();
 
-  Eigen::Vector3f err = pin - this->state.p;
+  Eigen::Vector3f err = pin - predicted_position;
   Eigen::Vector3f err_body;
 
   // LODESTAR-flavored degeneracy-aware observer gain (default 1 = off,
@@ -3230,6 +3266,9 @@ void dlio::OdomNode::updateState() {
 
   qcorr.vec() = qe_vec;
   qcorr = qhat * qcorr;
+  // Apply the rotation correction at the latest state, transporting the
+  // tangent from the predicted midpoint orientation to the current one.
+  qcorr = qcorr * qhat.conjugate() * this->state.q;
 
   err_body = qhat.conjugate()._transformVector(err);
 
@@ -3280,6 +3319,7 @@ void dlio::OdomNode::updateState() {
   this->geo.prev_p = this->state.p;
   this->geo.prev_q = this->state.q;
   this->geo.prev_vel = this->state.v.lin.w;
+  this->geo.prev_state_stamp = rclcpp::Time(this->imu_stamp).seconds();
 
   // Degeneracy covariance inflation (under geo.mtx, read by publishPose): mark
   // the held world-frame axes untrusted with a rank-1 add (covVar * d d^T) on
@@ -4010,6 +4050,8 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Distance Traveled (m)", fnum(this->length_traversed, 3));
   kv("Keyframes", std::to_string(this->keyframes.size()));
   kv("Deskewed Points", std::to_string(this->deskew_size.load()));
+  kv("Observer Time Aligned", this->observer_time_aligned_ ? "1" : "0");
+  kv("Observer IMU Lead (ms)", fnum(1000.0 * this->observer_lag_seconds_, 2));
   kv("Sub-floor Points Rejected", std::to_string(this->last_subfloor_rejected_));
   kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
   // CPU starvation: realtime factor (>1 = slower than real time), cumulative

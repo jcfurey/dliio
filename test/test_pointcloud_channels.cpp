@@ -43,6 +43,43 @@ struct OdomNodeTestAccess {
   static bool useReflectivity(const OdomNode& node) { return node.use_reflectivity_; }
   static bool photometricActive(const OdomNode& node) { return node.photometric_active_; }
   static void applyLiveParams(OdomNode& node) { node.applyLiveParams(); }
+  static double firstDeskewStamp(OdomNode& node) {
+    node.imu_buffer.push_back({9.0, 0.01, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero()});
+    node.deskewPointcloud();
+    return node.scan_stamp;
+  }
+  static void checkDelayedConstantMotion(OdomNode& node, double lag, float innovation = 0.f) {
+    constexpr float speed = 0.5f, yaw_rate = 0.2f;
+    node.geo.prev_state_stamp = 10.0;
+    node.geo.prev_p.setZero();
+    node.geo.prev_q.setIdentity();
+    node.geo.prev_vel = Eigen::Vector3f(speed, 0.f, 0.f);
+    node.scan_stamp = 10.1;
+    node.prev_scan_stamp = 10.0;
+    node.imu_stamp = rclcpp::Time(static_cast<int64_t>((10.1 + lag) * 1e9));
+    const Eigen::Vector3f expected_position(speed * (0.1 + lag), 0.f, 0.f);
+    const Eigen::Quaternionf expected_rotation(Eigen::AngleAxisf(yaw_rate * (0.1 + lag), Eigen::Vector3f::UnitZ()));
+    node.state.p = expected_position;
+    node.state.q = expected_rotation;
+    node.state.v.lin.w = node.geo.prev_vel;
+    node.state.b.accel.setZero();
+    node.state.b.gyro.setZero();
+    node.lidarPose.p = Eigen::Vector3f(speed * 0.1f + innovation, 0.f, 0.f);
+    node.lidarPose.q = Eigen::Quaternionf(Eigen::AngleAxisf(yaw_rate * 0.1f, Eigen::Vector3f::UnitZ()));
+    for (int k = -2; k <= 22; ++k) {
+      node.imu_buffer.push_front({10.0 + k * 0.01, 0.01,
+          Eigen::Vector3f(0.f, 0.f, yaw_rate), Eigen::Vector3f(0.f, 0.f, 9.80665f)});
+    }
+    node.updateState();
+    const Eigen::Vector3f expected_error(innovation, 0.f, 0.f);
+    EXPECT_LT((node.state.p - expected_position - 0.1f * node.geo_Kp_ * expected_error).norm(), 1e-6f);
+    EXPECT_NEAR(node.state.v.lin.w.x(), speed + 0.1f * node.geo_Kv_ * innovation, 1e-6f);
+    const Eigen::Vector3f expected_bias = -0.1f * node.geo_Kab_ *
+        node.lidarPose.q.conjugate()._transformVector(expected_error);
+    EXPECT_LT((node.state.b.accel - expected_bias).norm(), 1e-6f);
+    EXPECT_LT(node.state.b.gyro.norm(), 1e-6f);
+    EXPECT_LT(node.state.q.angularDistance(expected_rotation), 1e-6f);
+  }
   static const pcl::PointCloud<PointType>& voxelize(OdomNode& node) {
     node.imu_buffer.push_back({0.0, 0.01, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero()});
     node.preprocessPoints();
@@ -110,6 +147,28 @@ protected:
   static void SetUpTestSuite() { rclcpp::init(0, nullptr); }
   static void TearDownTestSuite() { rclcpp::shutdown(); }
 };
+
+TEST_F(PointCloudChannels, RelativeOusterTimesKeepHeaderOriginAfterEarlyReturnsAreRemoved) {
+  auto opts = options();
+  opts.append_parameter_override("odom/computeTimeOffset", true);
+  dlio::OdomNode node(opts);
+  auto msg = ousterScan();
+  for (size_t i = 0; i < 16; ++i) {
+    put(msg, i, 16, static_cast<uint32_t>(20'000'000 + (15 - i) * 1000));
+  }
+  Access::ingest(node, msg);
+  EXPECT_NEAR(Access::firstDeskewStamp(node), 10.020008, 1e-7);
+}
+
+TEST_F(PointCloudChannels, ObserverDoesNotInterpretScanLatencyAsMotionError) {
+  for (double lag : {0.0, 0.02, 0.05, 0.09}) {
+    SCOPED_TRACE(lag);
+    dlio::OdomNode node(options());
+    Access::checkDelayedConstantMotion(node, lag);
+  }
+  dlio::OdomNode node(options());
+  Access::checkDelayedConstantMotion(node, 0.05, 0.02f);  // real innovations still update velocity/bias
+}
 
 pcl::PointCloud<PointType> mapChannelCloud() {
   pcl::PointCloud<PointType> cloud;

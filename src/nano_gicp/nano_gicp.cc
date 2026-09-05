@@ -53,6 +53,25 @@ inline float bilinearSample(const cv::Mat& img, float u, float v) {
   return top * (1.f - ay) + bot * ay;
 }
 
+// Require real returns for every pixel touched by interpolation and gradients.
+// A missing return is not a black paint mark. Bounds are checked by the caller.
+inline bool validRangeSupport(const cv::Mat& range, float u, float v, int patch = 0) {
+  const int x = static_cast<int>(std::floor(u));
+  const int y = static_cast<int>(std::floor(v));
+  for (int row = y - patch - 1; row <= y + patch + 2; ++row) {
+    for (int col = x - patch - 1; col <= x + patch + 2; ++col) {
+      const float r = range.ptr<float>(row)[col];
+      if (!(r > 0.f) || !std::isfinite(r)) { return false; }
+    }
+  }
+  return true;
+}
+
+inline double huberCost(float residual, float delta) {
+  const double a = std::abs(static_cast<double>(residual));
+  return delta > 0.f && a > delta ? delta * (2.0 * a - delta) : a * a;
+}
+
 }  // namespace
 
 template class nano_gicp::NanoGICP<dlio::Point, dlio::Point>;
@@ -600,11 +619,12 @@ void NanoGICP<PointSource, PointTarget>::setLidarFlowMode(bool image_ref, int pa
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setLidarFlowPrev(const cv::Mat& prev_img,
-                                                         const Eigen::Isometry3f& T_lw_prev) {
+    const Eigen::Isometry3f& T_lw_prev, const cv::Mat& prev_range) {
     // Deep copy: own the buffer for the whole next scan, so a concurrent reassign
     // of the node's image can't free it under the parallel flow loop.
     this->lidar_flow_prev_img_ = prev_img.empty() ? cv::Mat() : prev_img.clone();
     this->T_lw_prev_flow_ = T_lw_prev;
+    this->lidar_flow_prev_range_ = prev_range.clone();
 }
 
 template <typename PointSource, typename PointTarget>
@@ -959,24 +979,26 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
       return false;
   }
   
-  // Solve least squares
-  Eigen::Matrix4f AtA = A.transpose() * A;
-  Eigen::Vector4f Ati = A.transpose() * i;
-  
-  // Check condition number
-  Eigen::JacobiSVD<Eigen::Matrix4f> svd(AtA);
-  float cond = svd.singularValues()(0) / svd.singularValues()(3);
-  if (cond > 1e6 || !std::isfinite(cond)) {
-      return false;
+  // Paint on a planar wall has a well-defined tangential gradient, while the
+  // normal derivative is unobservable. Requiring a full-rank 3D affine fit
+  // discarded precisely these useful wall patches. Fit a minimum-norm
+  // gradient in the supported spatial subspace; reject line-like support.
+  Eigen::MatrixXf centered = A.leftCols<3>();
+  const Eigen::RowVector3f mean_position = centered.colwise().mean();
+  centered.rowwise() -= mean_position;
+  const Eigen::VectorXf centered_i = i.array() - mean_intensity;
+  const Eigen::Matrix3f spread = centered.transpose() * centered;
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig(spread);
+  if (eig.info() != Eigen::Success || !eig.eigenvalues().allFinite()) { return false; }
+  const float floor = std::max(1e-9f, 1e-4f * eig.eigenvalues()(2));
+  if (eig.eigenvalues()(1) <= floor) { return false; }
+  Eigen::Vector3f inv;
+  for (int k = 0; k < 3; ++k) {
+    inv(k) = eig.eigenvalues()(k) > floor ? 1.f / eig.eigenvalues()(k) : 0.f;
   }
-  
-  Eigen::Vector4f g = AtA.ldlt().solve(Ati);
-  
-  if (g.hasNaN() || !g.allFinite()) {
-      return false;
-  }
-  
-  gradient = g.head<3>();
+  gradient = eig.eigenvectors() * inv.asDiagonal() * eig.eigenvectors().transpose()
+             * centered.transpose() * centered_i;
+  if (!gradient.allFinite()) { return false; }
   
   // Reject unreasonably large or small gradients
   float gradient_mag = gradient.norm();
@@ -1068,8 +1090,14 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     // (bit-identical to the pre-budget behavior).
     double xicp_partial_t_used = 0.0;  // [m]
     double xicp_partial_r_used = 0.0;  // [rad]
+    double prev_rescued_t = 0.0, prev_rescued_r = 0.0;
+    double prev_partial_t = 0.0, prev_partial_r = 0.0;
+    bool pending_convergence = false;
 
-    for (int i = 0; i < this->max_iterations_; ++i) {
+    // The extra evaluation validates the final proposed step as well. Never
+    // return an untested last step merely because it is small or the iteration
+    // budget ran out. Rejected steps also restore their rescue budgets.
+    for (int i = 0; i <= this->max_iterations_; ++i) {
         update_correspondences(trans);
 
         // Accumulated, solved, and gated in double; see linearize() for why.
@@ -1077,27 +1105,13 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         Eigen::Matrix<double, 6, 1> b;
         double cost = 0.0;
 
-        linearize(trans, &H, &b, &cost);
-
-        if (cost > prev_cost) {
-            // last step made things worse: revert it and damp harder
-            trans = prev_trans;
-            lambda *= kLambdaScale;
-            if (lambda > kLambdaMax) { break; }  // no progress possible
-            update_correspondences(trans);
-            linearize(trans, &H, &b, &cost);
-        } else {
-            lambda = std::max(lambda / kLambdaScale, base_lambda);
-        }
-        prev_cost = cost;
-        prev_trans = trans;
-
         // Snapshot the GEOMETRIC (LiDAR-only) Hessian before adding the visual
         // term. The degeneracy gate judges observability from this, NOT from
         // the visual-augmented H: otherwise a strong-but-wrong visual term
         // masks the degeneracy, the gate releases its prior-hold, and the pose
         // diverges along the (still physically unobservable) axis.
-        const Eigen::Matrix<double, 6, 6> H_geo = H;
+        Eigen::Matrix<double, 6, 6> H_geo;
+        linearize(trans, &H, &b, &cost, &H_geo);
 
         // GenZ-ICP adaptive blend weight (lagged one iteration, like the kernel):
         // from the geometric translation block's conditioning (lambda_min/lambda_max
@@ -1118,16 +1132,16 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // Direct visual (camera) photometric term: accumulate into the SAME
         // H/b that linearize() built, BEFORE damping and the degeneracy gate,
         // so a camera-constrained axis can be detected (and rescued) by the
-        // gate below. The LM step-acceptance cost above stays geometric-only
-        // (visual is a secondary constraint); the visual term still shapes dx.
+        // gate below. Include the same image residuals in step acceptance: a
+        // useful texture-driven step can increase the weak geometric cost.
         // No-op unless setVisualEnabled(true) and both frames are set.
         if (visual_enabled_) {
-            accumulateVisualResidual(trans, &H, &b, nullptr);
+            accumulateVisualResidual(trans, &H, &b, &cost);
         }
         // Frame-to-MAP camera term (absolute anchor): also into H/b before the
         // gate, so it can rescue the degenerate axis with map landmarks.
         if (visual_map_weight_ > 0.f) {
-            accumulateVisualMapResidual(trans, &H, &b, nullptr);
+            accumulateVisualMapResidual(trans, &H, &b, &cost);
         }
         // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
         if (lidar_map_weight_ > 0.f) {
@@ -1141,7 +1155,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 // resulting motion. See REVIEW.md #8, EXPLORATION_2026-06-26 #2.
                 Eigen::Matrix<double, 6, 6> H_lid = Eigen::Matrix<double, 6, 6>::Zero();
                 Eigen::Matrix<double, 6, 1> b_lid = Eigen::Matrix<double, 6, 1>::Zero();
-                accumulateLidarMapResidual(trans, &H_lid, &b_lid, nullptr);
+                accumulateLidarMapResidual(trans, &H_lid, &b_lid, &cost);
                 if (lidar_cond_scale_enabled_) {
                     conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
                                        static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
@@ -1153,7 +1167,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 H += H_lid;
                 b += b_lid;
             } else {
-                accumulateLidarMapResidual(trans, &H, &b, nullptr);  // bit-identical
+                accumulateLidarMapResidual(trans, &H, &b, &cost);
             }
         }
 
@@ -1165,7 +1179,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         if (lidar_flow_weight_ > 0.f) {
             Eigen::Matrix<double, 6, 6> H_flow = Eigen::Matrix<double, 6, 6>::Zero();
             Eigen::Matrix<double, 6, 1> b_flow = Eigen::Matrix<double, 6, 1>::Zero();
-            accumulateLidarFlowResidual(trans, &H_flow, &b_flow, nullptr);
+            accumulateLidarFlowResidual(trans, &H_flow, &b_flow, &cost);
             if (lidar_dir_separated_enabled_) {
                 directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
                                       &H_flow, &b_flow);
@@ -1173,6 +1187,31 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             H += H_flow;
             b += b_flow;
         }
+
+        if (!std::isfinite(cost) || cost > prev_cost + 1e-10 * std::max(1.0, prev_cost)) {
+            trans = prev_trans;
+            rescued_t_used = prev_rescued_t;
+            rescued_r_used = prev_rescued_r;
+            xicp_partial_t_used = prev_partial_t;
+            xicp_partial_r_used = prev_partial_r;
+            pending_convergence = false;
+            lambda *= kLambdaScale;
+            if (lambda > kLambdaMax) { break; }
+            continue;
+        }
+        if (pending_convergence) {
+            this->converged_ = true;
+            break;
+        }
+        if (i == this->max_iterations_) { break; }
+        // Do not undo increased damping when re-evaluating a reverted pose.
+        if (cost < prev_cost) { lambda = std::max(lambda / kLambdaScale, base_lambda); }
+        prev_cost = cost;
+        prev_trans = trans;
+        prev_rescued_t = rescued_t_used;
+        prev_rescued_r = rescued_r_used;
+        prev_partial_t = xicp_partial_t_used;
+        prev_partial_r = xicp_partial_r_used;
 
         // Snapshot the combined (geometric + photometric) Hessian BEFORE
         // damping: the visual-rescue Rayleigh test below must measure the
@@ -1258,7 +1297,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 const double comp = v.dot(dx.head<3>());
                 if (lam <= rr_thresh) {
                     ++degenerate;
-                    if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Hrr * v) > rr_thresh) {
+                    if (v.dot(Hrr * v) > rr_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_r - rescued_r_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
@@ -1314,7 +1353,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                 const double comp = v.dot(dx.tail<3>());
                 if (lam <= tt_thresh) {
                     ++degenerate;
-                    if ((visual_enabled_ || lidar_map_weight_ > 0.f) && v.dot(Htt * v) > tt_thresh) {
+                    if (v.dot(Htt * v) > tt_thresh) {
                         // bounded visual-driven motion, drawing from the per-scan budget
                         const double cap = std::max(0.0, cap_t - rescued_t_used);
                         const double cl = std::max(-cap, std::min(cap, comp));
@@ -1367,11 +1406,8 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
 
         // Check convergence: rotation step (dx.head) vs rotation_epsilon_,
         // translation step (dx.tail) vs transformation_epsilon_.
-        if (dx.head<3>().norm() < rotation_epsilon_ &&
-            dx.tail<3>().norm() < transformation_epsilon_) {
-            this->converged_ = true;
-            break;
-        }
+        pending_convergence = dx.head<3>().norm() < rotation_epsilon_ &&
+                              dx.tail<3>().norm() < transformation_epsilon_;
     }
 
     // Per-scan IMU-consistency clamp: bound the TOTAL correction (final GICP
@@ -1478,7 +1514,8 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     const Eigen::Isometry3f& trans,
     Eigen::Matrix<double, 6, 6>* H,
     Eigen::Matrix<double, 6, 1>* b,
-    double* cost) {
+    double* cost,
+    Eigen::Matrix<double, 6, 6>* H_geo) {
     
     H->setZero();
     b->setZero();
@@ -1500,14 +1537,15 @@ void NanoGICP<PointSource, PointTarget>::linearize(
     // contribution into a SEPARATE accumulator so its total Hessian mass can be
     // scaled to a nominal reference count (making photometricWeight independent
     // of the valid-gradient point count, and comparable to the other terms).
-    // When off, the photometric term accumulates into the shared H_private below
-    // exactly as before -> bit-identical. The residual count is tallied either
-    // way (diagnostic + future adaptive weighting).
+    // A separate accumulator also preserves a geometry-only Hessian for the
+    // observability gate. The residual count is tallied in either mode.
     const bool normalize_photo = use_photometric && (this->photometric_ref_count_ > 0.f);
+    // Keep appearance information out of the geometric observability test.
+    const bool separate_photo = use_photometric && (normalize_photo || H_geo != nullptr);
     std::vector<Eigen::Matrix<double, 6, 6>> Hp_private(
-        normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 6>::Zero());
+        separate_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 6>::Zero());
     std::vector<Eigen::Matrix<double, 6, 1>> bp_private(
-        normalize_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 1>::Zero());
+        separate_photo ? num_threads_ : 0, Eigen::Matrix<double, 6, 1>::Zero());
     std::vector<long> photo_count_private(num_threads_, 0);
     // Adaptive-kernel residual collection (Chebrolu et al.): fit alpha post-loop.
     const bool adaptive_kernel = use_photometric && this->adaptive_kernel_enabled_;
@@ -1585,6 +1623,10 @@ void NanoGICP<PointSource, PointTarget>::linearize(
             Eigen::Vector3f gradient = (*target_intensity_gradients_)[target_index];
             
             if (gradient.norm() > kGradientMagMin && gradient.norm() < kGradientMagMax) {
+                // Evaluate the same local target intensity model differentiated
+                // below. The nearest point's value alone is piecewise constant
+                // in pose, so it cannot validate a gradient-driven sub-voxel step.
+                intensity_diff -= gradient.dot(residual);
                 // Residual is (I_src - I_tgt); its Jacobian w.r.t. the (left-perturbation)
                 // pose is d/dθ (I_src - I_tgt(x)) = -gᵀ·dx/dθ = [ gᵀ·skew(x) | -gᵀ ].
                 // (Must match the geometric term's convention or the photometric step
@@ -1621,16 +1663,19 @@ void NanoGICP<PointSource, PointTarget>::linearize(
                 }
                 ++photo_count_private[thread_num];
                 photo_sq_sum += static_cast<double>(intensity_diff) * intensity_diff;  // telemetry only
-                if (normalize_photo) {
+                if (separate_photo) {
                     // Separate accumulator: scaled to the reference count post-loop.
                     Hp_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
                     bp_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
-                    photo_cost_sum += weight * intensity_diff * intensity_diff;
+                    photo_cost_sum += adaptive_kernel ? weight * intensity_diff * intensity_diff
+                        : photometric_weight_ * huberCost(intensity_diff, photometric_huber_delta_);
                 } else {
-                    // Raw (default): shared accumulator, bit-identical to before.
+                    // Shared accumulation when neither normalization nor a
+                    // separate geometric Hessian is requested.
                     H_private[thread_num] += (weight * J_photometric.transpose() * J_photometric).cast<double>();
                     b_private[thread_num] += (weight * J_photometric.transpose() * intensity_diff).cast<double>();
-                    cost_sum += weight * intensity_diff * intensity_diff;
+                    cost_sum += adaptive_kernel ? weight * intensity_diff * intensity_diff
+                        : photometric_weight_ * huberCost(intensity_diff, photometric_huber_delta_);
                 }
             }
         }
@@ -1641,6 +1686,7 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         (*b) += b_private[i];
     }
     if (cost != nullptr) { *cost = cost_sum; }
+    if (H_geo != nullptr) { *H_geo = *H; }
 
     // Photometric residual count + RMS (telemetry, tallied regardless of
     // normalization; RMS is the UNweighted brightness-constancy fit quality).
@@ -1666,14 +1712,14 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         this->current_alpha_ = this->last_fit_alpha_;
     }
 
-    // Opt-in mass-normalization: scale the separate photometric accumulator to
-    // the nominal reference count and fold it in. (When off, the photometric
-    // term was already summed into H_private above -> bit-identical.)
-    if (normalize_photo) {
+    // Merge appearance after the geometric snapshot, optionally scaled to the
+    // nominal reference count.
+    if (separate_photo) {
         Eigen::Matrix<double, 6, 6> Hp_sum = Eigen::Matrix<double, 6, 6>::Zero();
         Eigen::Matrix<double, 6, 1> bp_sum = Eigen::Matrix<double, 6, 1>::Zero();
         for (int i = 0; i < num_threads_; ++i) { Hp_sum += Hp_private[i]; bp_sum += bp_private[i]; }
-        const double norm = refCountScale(static_cast<double>(this->photometric_ref_count_), photo_count);
+        const double norm = normalize_photo
+            ? refCountScale(static_cast<double>(this->photometric_ref_count_), photo_count) : 1.0;
         (*H) += Hp_sum * norm;
         (*b) += bp_sum * norm;
         if (cost != nullptr) { *cost += photo_cost_sum * norm; }
@@ -1808,7 +1854,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualResidual(
         const int tn = omp_get_thread_num();
         H_private[tn] += (weight * J.transpose() * J).cast<double>();
         b_private[tn] += (weight * J.transpose() * r).cast<double>();
-        cost_sum += weight * r * r;
+        cost_sum += visual_weight_ * huberCost(r, visual_huber_delta_);
         sq_sum += static_cast<double>(r) * r;
         count += 1;
     }
@@ -1927,7 +1973,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateVisualMapResidual(
         const int tn = omp_get_thread_num();
         H_private[tn] += (weight * J.transpose() * J).cast<double>();
         b_private[tn] += (weight * J.transpose() * r).cast<double>();
-        cost_sum += weight * r * r;
+        cost_sum += visual_map_weight_ * huberCost(r, visual_huber_delta_);
         sq_sum += static_cast<double>(r) * r;
         count += 1;
     }
@@ -2005,7 +2051,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
     // node keeps real time (the term is count-normalized, so a subset is fine).
     constexpr int kLidarMaxPoints = 4000;
     const int n_target = static_cast<int>(target_->size());
-    const int stride = std::max(1, n_target / kLidarMaxPoints);
+    const int stride = std::max(1, (n_target + kLidarMaxPoints - 1) / kLidarMaxPoints);
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
     for (int j = 0; j < n_target; j += stride) {
@@ -2052,6 +2098,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
         // submap projects far-side / occluded points onto near walls and floods
         // the residual with mismatches (the dominant cause of high frame-to-map RMS).
         if (use_range) {
+            if (!validRangeSupport(lidar_range_img_, u, v)) { continue; }
             const int ui = static_cast<int>(std::lround(u));
             const int vi = static_cast<int>(std::lround(v));
             const float ri = lidar_range_img_.ptr<float>(vi)[ui];
@@ -2097,7 +2144,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
         const int tn = omp_get_thread_num();
         H_private[tn] += (weight * J.transpose() * J).cast<double>();
         b_private[tn] += (weight * J.transpose() * r).cast<double>();
-        cost_sum += weight * r * r;
+        cost_sum += lidar_map_weight_ * huberCost(r, photometric_huber_delta_);
         sq_sum += static_cast<double>(r) * r;
         count += 1;
     }
@@ -2160,6 +2207,12 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
     const bool image_ref = this->lidar_flow_image_ref_;
     const cv::Mat cur = this->lidar_image_;
     if (image_ref && (cur.empty() || cur.type() != CV_32FC1)) { return; }
+    const cv::Mat prev_range = this->lidar_flow_prev_range_;
+    const cv::Mat cur_range = this->lidar_range_img_;
+    const bool use_prev_range = !prev_range.empty();
+    const bool use_cur_range = image_ref && !cur_range.empty();
+    if (use_prev_range && (prev_range.type() != CV_32FC1 || prev_range.size() != prev.size())) { return; }
+    if (use_cur_range && (cur_range.type() != CV_32FC1 || cur_range.size() != cur.size())) { return; }
     const Eigen::Matrix3f R_lw_cur = this->T_lw_cur_.linear();
     const Eigen::Vector3f t_lw_cur = this->T_lw_cur_.translation();
 
@@ -2188,7 +2241,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
 
     constexpr int kFlowMaxPoints = 4000;                 // stride the source to bound per-iter cost
     const int n_src = static_cast<int>(input_->size());
-    const int stride = std::max(1, n_src / kFlowMaxPoints);
+    const int stride = std::max(1, (n_src + kFlowMaxPoints - 1) / kFlowMaxPoints);
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8) reduction(+:cost_sum,sq_sum,count)
     for (int i = 0; i < n_src; i += stride) {
@@ -2216,6 +2269,12 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
             inv_el_eff = inv_el_a;
         }
         if (!(u >= bw && u <= umax && v >= bw && v <= vmax)) { continue; }   // NaN-safe bounds
+        if (use_prev_range) {
+            if (!validRangeSupport(prev_range, u, v, P)) { continue; }
+            const float depth = bilinearSample(prev_range, u, v);
+            const float tol = std::max(lidar_range_abs_tol_, lidar_range_rel_tol_ * depth);
+            if (std::abs(std::sqrt(rr2) - depth) > tol) { continue; }
+        }
 
         // Reference: sample the CURRENT full-res image at the RAW point's
         // projection (pose-independent -- the point's position relative to the
@@ -2237,6 +2296,12 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
                 v_ref = (cel - lidar_el_b_) * inv_el_a;
             }
             if (!(u_ref >= bw && u_ref <= cur_umax && v_ref >= bw && v_ref <= cur_vmax)) { continue; }
+            if (use_cur_range) {
+                if (!validRangeSupport(cur_range, u_ref, v_ref, P)) { continue; }
+                const float depth = bilinearSample(cur_range, u_ref, v_ref);
+                const float tol = std::max(lidar_range_abs_tol_, lidar_range_rel_tol_ * depth);
+                if (std::abs(Pc.norm() - depth) > tol) { continue; }
+            }
         }
 
         const float gu = 0.5f * (bilinearSample(prev, u + 1.f, v) - bilinearSample(prev, u - 1.f, v));
@@ -2255,7 +2320,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
         // plain difference. Per-pixel Jacobian uses the pixel's own prev-image
         // gradient; contributions are divided by n_pix so a patch point carries
         // the same total mass as a single-pixel point (count-normalization).
-        float mean_mov = 0.f, mean_ref = 0.f;
+        float mean_mov = 0.f, mean_ref = 0.f, mean_gu = 0.f, mean_gv = 0.f;
         float mov_px[49], ref_px[49], gu_px[49], gv_px[49];   // P <= 3 (enforced by setter)
         int k = 0;
         for (int dv = -P; dv <= P; ++dv) {
@@ -2269,10 +2334,14 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
                     : (lidar_image_use_dedicated_channel_ ? sp.lidar_intensity : sp.reflectivity) * inv_scale;
                 mean_mov += mov_px[k];
                 mean_ref += ref_px[k];
+                mean_gu += gu_px[k];
+                mean_gv += gv_px[k];
             }
         }
         mean_mov /= static_cast<float>(n_pix);
         mean_ref /= static_cast<float>(n_pix);
+        mean_gu /= static_cast<float>(n_pix);
+        mean_gv /= static_cast<float>(n_pix);
 
         const int tn = omp_get_thread_num();
         double pt_sq = 0.0;
@@ -2281,7 +2350,11 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
             const float r = (P > 0) ? ((mov_px[k] - mean_mov) - (ref_px[k] - mean_ref))
                                     : (mov_px[k] - ref_px[k]);
             Eigen::Matrix<float, 1, 2> gI;
-            gI << gu_px[k], gv_px[k];
+            // The moving patch mean depends on pose too. Without its
+            // derivative a uniform ramp falsely reports motion information
+            // even though subtracting the patch mean removes that information.
+            gI << gu_px[k] - (P > 0 ? mean_gu : 0.f),
+                  gv_px[k] - (P > 0 ? mean_gv : 0.f);
             // x = trans·p_w perturbs on the LEFT -> J = [-G·skew(x) | G], same as
             // the visual frame-to-frame term; G = grad_I · dpi · R_lw_prev.
             const Eigen::Matrix<float, 1, 3> G = gI * dpi * R_lw_prev;
@@ -2296,7 +2369,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
             }
             H_private[tn] += (weight * J.transpose() * J).cast<double>();
             b_private[tn] += (weight * J.transpose() * r).cast<double>();
-            cost_sum += weight * r * r;
+            cost_sum += (lidar_flow_weight_ / n_pix) * huberCost(r, photometric_huber_delta_);
             pt_sq += static_cast<double>(r) * r;
         }
         sq_sum += pt_sq / static_cast<double>(n_pix);
