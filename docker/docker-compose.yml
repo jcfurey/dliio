@@ -11,7 +11,7 @@
 #
 # Optional environment knobs:
 #   ROS_DISTRO (jazzy)  ROS_IMAGE_FLAVOR (ros-base|perception)  SKIP_ROSDEP (0|1)
-#   CMAKE_BUILD_TYPE (Release)  ROS_DOMAIN_ID (0)  RMW_IMPLEMENTATION (rmw_fastrtps_cpp)
+#   CMAKE_BUILD_TYPE (Release)  ROS_DOMAIN_ID (0)  RMW_IMPLEMENTATION (rmw_cyclonedds_cpp)
 #   POINTCLOUD_TOPIC  IMU_TOPIC  USE_SIM_TIME (true)  ROBOT_CONFIG  PARAMS_FILE
 #   DLIIO_BAG_DIR (../bags)  DLIIO_OUT_DIR (../out)  BAG  BAG_RATE (1.0)
 
@@ -23,10 +23,10 @@ x-build-args: &build-args
 
 x-runtime: &runtime
   network_mode: host   # DDS discovery/multicast with the host's ROS 2 graph
-  ipc: host            # Fast DDS shared-memory transport between host and container
+  ipc: host
   environment:
     ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
-    RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+    RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
   volumes:
     - ../cfg:/cfg:ro                         # edit cfg/*.yaml on the host, no rebuild
     - ${DLIIO_BAG_DIR:-../bags}:/bags:ro     # ros2 bag directories
@@ -47,7 +47,7 @@ services:
       - ros2
       - launch
       - direct_lidar_inertial_odometry
-      - dlio.launch.py
+      - dlio_ouster.launch.py
       - use_sim_time:=${USE_SIM_TIME:-true}
       - pointcloud_topic:=${POINTCLOUD_TOPIC:-/ouster/points}
       - imu_topic:=${IMU_TOPIC:-/ouster/imu}

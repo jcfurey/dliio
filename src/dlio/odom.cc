@@ -31,7 +31,11 @@
 #include "rcpputils/scope_exit.hpp"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <sensor_msgs/image_encodings.hpp>
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
 #include <cv_bridge/cv_bridge.hpp>
+#else
+#include <cv_bridge/cv_bridge.h>
+#endif
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 
@@ -424,6 +428,11 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->livox_sub = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
       "livox", rclcpp::SensorDataQoS().keep_last(1),
       [this](const livox_ros_driver2::msg::CustomMsg::SharedPtr msg) {
+        if (msg->point_num != msg->points.size()) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+              "Discarding Livox CustomMsg with inconsistent point_num and points length");
+          return;
+        }
         this->livox_pub->publish(livoxToPointCloud2(*msg, this->lidar_frame));
       }, livox_sub_opt);
   RCLCPP_INFO(this->get_logger(),

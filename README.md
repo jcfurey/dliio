@@ -1,3 +1,28 @@
+# dliio: standalone LiDAR–inertial odometry
+
+The Ouster workflow is contained in this repository: odometry, accumulated-map
+preview, calibrated 0705 profiles, packet replay, RViz configuration, and
+validation tools. It needs no other estimator, camera, fusion, or TF helper
+node. Ouster supplies the sensor driver; RViz and the bag player are optional.
+
+See **[the handoff guide](doc/HANDOFF.md)** for clean builds on **Humble, Jazzy,
+Kilted, and Lyrical**, the pinned Ouster dependency, live operation, and replay.
+`DLIIO_ENABLE_LIVOX` stays **ON by default**: installing `livox_ros_driver2`
+enables its raw `CustomMsg` adapter; PointCloud2 support is always available.
+
+After building dliio and the pinned Ouster driver, the complete 0705 command is:
+
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio_ouster.launch.py \
+  mode:=packets profile:=0705 bag:=/absolute/path/07052026_4_an \
+  rviz:=true rate:=1.0
+```
+
+The dataset is supplied separately. The 0705 calibration is specific to that
+recording. The current map is a preview; the interface for the forthcoming
+mapping and loop-closure backend is documented in
+[Mapping input contract](doc/MAPPING_INTERFACE.md).
+
 # Modifications
 
 Lidar intensity aided DLIO. The extra "i" in the name is for intensity.
@@ -95,7 +120,7 @@ A *stripped* cloud (xyz-only, unorganized, no time field) reduces DLIO to plain 
 | Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; constant diagonal covariance from `odom/covariance/*` (tune for your EKF) |
 | Pose | `dlio/odom_node/pose` (`PoseStamped`) | same state, no twist |
 | TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` (only in `extrinsics/source: yaml`; in `tf` mode the node *consumes* those static transforms instead) | follows REP-105; no `map` frame is published — DLIO is odometry, not SLAM with loop closure |
-| Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; intensity is range-corrected when the intensity channel is active |
+| Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; raw `intensity` and `reflectivity` remain separate; correction is in `intensity_corrected` |
 | Keyframes / map | `dlio/odom_node/keyframes`, `dlio/map_node/map` | map is keyframe accumulation (unbounded; for visualization/export) |
 | Save map | `/save_pcd` service | absolute existing directory required |
 
@@ -140,10 +165,10 @@ Also note that the LiDAR and IMU sensors _need_ to be properly time-synchronized
 ### Dependencies
 The following has been verified to be compatible, although other configurations may work too:
 
-- Ubuntu 24.04
-- ROS 2 Jazzy or newer (`rclcpp`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`, `pcl_conversions`, `tf2_ros`)
+- Ubuntu 22.04 / ROS 2 Humble; Ubuntu 24.04 / Jazzy or Kilted; Ubuntu 26.04 / Lyrical
+- ROS 2 dependencies (`rclcpp`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `pcl_ros`, `pcl_conversions`, `tf2_ros`)
 - C++ 17
-- CMake >= `3.12.4`
+- CMake >= `3.16`
 - OpenMP >= `4.5`
 - Point Cloud Library >= `1.10.0`
 - Eigen >= `3.3.7`
@@ -152,7 +177,8 @@ The following has been verified to be compatible, although other configurations 
 sudo apt install libomp-dev libpcl-dev libeigen3-dev
 ```
 
-DLIO currently supports `ROS 1` and `ROS 2`!
+This branch targets ROS 2. Historical ROS 1 instructions and releases are not
+part of this handoff.
 
 ### Compiling
 Compile with `colcon`:
@@ -181,7 +207,8 @@ docker build -f docker/Dockerfile --target test .          # build + colcon test
 docker compose -f docker/docker-compose.yml build dlio     # runtime image
 ```
 
-See [`docker/README.md`](docker/README.md) for bag replay, build arguments, and the air-gapped (`perception` + `SKIP_ROSDEP=1`) path.
+See [`docker/README.md`](docker/README.md) for bag replay, build arguments, and
+the requirements for a fully prepared offline dependency image.
 
 ### Execution
 

@@ -269,6 +269,17 @@ TEST_F(OutputContract, MapRejectsWrongFramesMalformedCloudsAndInvalidTimes) {
   checkChannels(*MapAccess::message(node));
 }
 
+TEST_F(OutputContract, ComposedMapAcceptsIntraProcessInputWithLatchedDdsOutput) {
+  rclcpp::NodeOptions opts;
+  opts.use_intra_process_comms(true);
+  dlio::MapNode node(opts);
+  MapAccess::ingest(node, message());
+  const auto output = MapAccess::message(node);
+  ASSERT_TRUE(output);
+  EXPECT_EQ(output->width, 1u);
+  checkChannels(*output);
+}
+
 TEST_F(OutputContract, MapSnapshotsKeepMeasurementTimeAndRejectDuplicateKeyframes) {
   dlio::MapNode node;
   MapAccess::ingest(node, message());

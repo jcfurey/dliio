@@ -18,6 +18,10 @@ log/
 **/*.mcap
 **/*.pcd
 bags/
+dliio_run/
+out/
+**/__pycache__/
+**/.pytest_cache/
 
 # Editor / OS noise
 **/.vscode/

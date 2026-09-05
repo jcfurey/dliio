@@ -8,6 +8,9 @@ log/
 # Local data used by the docker compose workflow (see docker/README.md)
 bags/
 out/
+dliio_run/
+__pycache__/
+.pytest_cache/
 
 # Recorded data / exported maps
 *.bag

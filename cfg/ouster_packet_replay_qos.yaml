@@ -1,0 +1,15 @@
+/ouster/metadata:
+  history: keep_last
+  depth: 1
+  reliability: reliable
+  durability: transient_local
+/ouster/lidar_packets:
+  history: keep_last
+  depth: 4096
+  reliability: reliable
+  durability: volatile
+/ouster/imu_packets:
+  history: keep_last
+  depth: 1000
+  reliability: reliable
+  durability: volatile

@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(dliio_installed_consumer LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 17)
+find_package(direct_lidar_inertial_odometry REQUIRED)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE
+  direct_lidar_inertial_odometry::direct_lidar_inertial_odometry__rosidl_typesupport_cpp)

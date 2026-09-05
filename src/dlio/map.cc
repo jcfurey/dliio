@@ -14,6 +14,7 @@
 #include "dlio/utils.h"
 #include "dlio/pointcloud_fields.h"
 #include "rclcpp/create_timer.hpp"
+#include "rclcpp/version.h"
 
 #include <filesystem>
 #include <cmath>
@@ -59,12 +60,22 @@ dlio::MapNode::MapNode(const rclcpp::NodeOptions& options)
   this->keyframe_sub = this->create_subscription<sensor_msgs::msg::PointCloud2>("keyframes", 10,
       std::bind(&dlio::MapNode::callbackKeyframe, this, std::placeholders::_1), keyframe_sub_opt);
 
+  // Humble's intra-process manager does not support transient-local publishers.
+  // Keep keyframe delivery intra-process; the latched preview is a DDS output.
+  rclcpp::PublisherOptions map_options;
+  map_options.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
   this->map_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "map", rclcpp::QoS(1).transient_local());
+      "map", rclcpp::QoS(1).transient_local(), map_options);
 
   this->save_pcd_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   this->save_pcd_srv = this->create_service<direct_lidar_inertial_odometry::srv::SavePCD>("save_pcd",
-      std::bind(&dlio::MapNode::savePCD, this, std::placeholders::_1, std::placeholders::_2), rclcpp::ServicesQoS(), this->save_pcd_cb_group);
+      std::bind(&dlio::MapNode::savePCD, this, std::placeholders::_1, std::placeholders::_2),
+#if RCLCPP_VERSION_MAJOR >= 28
+      rclcpp::ServicesQoS(),
+#else
+      rmw_qos_profile_services_default,
+#endif
+      this->save_pcd_cb_group);
 
   this->dlio_map = std::make_shared<pcl::PointCloud<PointType>>();
 

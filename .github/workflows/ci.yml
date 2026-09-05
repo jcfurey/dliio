@@ -2,36 +2,76 @@ name: CI
 
 on:
   push:
-    branches: [master, lyrical]
+    branches: [master, lyrical, cam-dev]
   pull_request:
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
-    container: ros:jazzy-ros-base
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [humble, jazzy, kilted, lyrical]
+    container: ros:${{ matrix.ros_distro }}-ros-base
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      MAKEFLAGS: -j2
+      OMP_NUM_THREADS: 4
+      OPENBLAS_NUM_THREADS: 1
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
     steps:
       - uses: actions/checkout@v4
         with:
           path: src/direct_lidar_inertial_odometry
 
-      - name: Install dependencies
+      - name: Install declared dependencies
         run: |
           apt-get update
-          rosdep update --rosdistro jazzy
-          rosdep install --from-paths src --ignore-src -y
+          rosdep update --rosdistro "$ROS_DISTRO"
+          rosdep install --from-paths src --ignore-src -y --rosdistro "$ROS_DISTRO"
 
-      - name: Build
+      - name: Build standalone package
         shell: bash
         run: |
-          source /opt/ros/jazzy/setup.bash
-          colcon build --event-handlers console_cohesion+
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          colcon build --event-handlers console_cohesion+ --cmake-args -DDLIIO_ENABLE_LIVOX=ON
 
       - name: Test
         shell: bash
         run: |
-          source /opt/ros/jazzy/setup.bash
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          source install/setup.bash
           colcon test --event-handlers console_cohesion+
           colcon test-result --verbose
+
+      - name: Verify installed components and map service
+        shell: bash
+        run: |
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          source install/setup.bash
+          ros2 run direct_lidar_inertial_odometry verify_install.py
+
+      - name: Compile and exercise the enabled Livox adapter
+        shell: bash
+        run: |
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          colcon build --base-paths src/direct_lidar_inertial_odometry/test/livox_interfaces \
+            --build-base livox_build --install-base livox_install
+          source livox_install/setup.bash
+          colcon build --packages-select direct_lidar_inertial_odometry --cmake-force-configure \
+            --cmake-args -DDLIIO_ENABLE_LIVOX=ON
+          source install/setup.bash
+          ros2 run direct_lidar_inertial_odometry verify_install.py \
+            --require-livox --output dliio_run/livox-smoke.json
+
+      - name: Compile an independent consumer of the install
+        shell: bash
+        run: |
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          source install/setup.bash
+          cmake -S src/direct_lidar_inertial_odometry/test/installed_consumer -B consumer_build
+          cmake --build consumer_build --parallel 2
+          ./consumer_build/consumer
 
   # AddressSanitizer + UndefinedBehaviorSanitizer: catches heap overflow,
   # use-after-free, and UB in the test paths (GICP math, IMU integration,

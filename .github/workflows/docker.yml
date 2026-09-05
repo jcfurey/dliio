@@ -6,12 +6,13 @@ name: Docker
 # build inputs change, or on demand.
 on:
   push:
-    branches: [master, lyrical]
+    branches: [master, lyrical, cam-dev]
     paths:
       - 'docker/**'
       - '.dockerignore'
       - 'CMakeLists.txt'
       - 'package.xml'
+      - 'ouster.repos'
       - '.github/workflows/docker.yml'
   pull_request:
     paths:
@@ -19,12 +20,17 @@ on:
       - '.dockerignore'
       - 'CMakeLists.txt'
       - 'package.xml'
+      - 'ouster.repos'
       - '.github/workflows/docker.yml'
   workflow_dispatch:
 
 jobs:
   build-and-test-image:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [humble, jazzy, kilted, lyrical]
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +44,6 @@ jobs:
           target: test
           push: false
           build-args: |
-            ROS_DISTRO=jazzy
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ROS_DISTRO=${{ matrix.ros_distro }}
+          cache-from: type=gha,scope=${{ matrix.ros_distro }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.ros_distro }}

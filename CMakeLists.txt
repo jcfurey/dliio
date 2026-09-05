@@ -10,7 +10,7 @@
 #                                                         #
 ###########################################################
 
-cmake_minimum_required(VERSION 3.12.4)
+cmake_minimum_required(VERSION 3.16)
 project(direct_lidar_inertial_odometry)
 
 # Default to Release but respect whatever the user/colcon asked for
@@ -51,25 +51,24 @@ find_package(PCL REQUIRED COMPONENTS common io registration kdtree search featur
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
 # OpenCV: direct visual photometric residual (nano_gicp) + image undistort (odom)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d)
 
 # Optional: raw Livox CustomMsg ingestion. Only built when livox_ros_driver2 is
 # present in the workspace; without it the node consumes Livox data already in
 # PointCloud2 form (the default), so this is NOT a required build dependency.
-find_package(livox_ros_driver2 QUIET)
-if(livox_ros_driver2_FOUND)
+option(DLIIO_ENABLE_LIVOX "Enable Livox CustomMsg ingestion when its message package is available" ON)
+if(DLIIO_ENABLE_LIVOX)
+  find_package(livox_ros_driver2 QUIET)
+endif()
+if(DLIIO_ENABLE_LIVOX AND livox_ros_driver2_FOUND)
   message(STATUS "livox_ros_driver2 found: enabling raw Livox CustomMsg ingestion.")
 else()
-  message(STATUS "livox_ros_driver2 not found: Livox CustomMsg ingestion disabled "
-                 "(feed Livox as PointCloud2 instead).")
+  message(STATUS "Livox CustomMsg adapter unavailable or disabled; PointCloud2 ingestion remains available.")
 endif()
 
 # OpenMP via the imported target (carries compile options and link flags to
 # every dependent instead of mutating global CMAKE_*_FLAGS)
-find_package(OpenMP)
-if(NOT OpenMP_CXX_FOUND)
-  message(WARNING "OpenMP could not be found; building single-threaded.")
-endif()
+find_package(OpenMP REQUIRED)
 
 # CPUID test
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
@@ -141,7 +140,7 @@ target_link_libraries(dlio_components
   ${PCL_LIBRARIES}
   ${cpp_typesupport_target}
 )
-if(livox_ros_driver2_FOUND)
+if(DLIIO_ENABLE_LIVOX AND livox_ros_driver2_FOUND)
   # PRIVATE: only odom.cc compiles the Livox path; odom.h stays livox-free so the
   # OdomNode layout is identical for every translation unit (no ODR mismatch).
   target_compile_definitions(dlio_components PRIVATE HAVE_LIVOX_ROS_DRIVER2)
@@ -152,6 +151,7 @@ if(livox_ros_driver2_FOUND)
   # target_link_libraries above (CMake forbids mixing keyword/plain styles).
   target_link_libraries(dlio_components ${livox_ros_driver2_TARGETS})
   target_include_directories(dlio_components PRIVATE ${livox_ros_driver2_INCLUDE_DIRS})
+  ament_export_dependencies(livox_ros_driver2)
 endif()
 rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
@@ -164,13 +164,20 @@ ament_auto_add_executable(dlio_map_node src/dlio/map_node.cc)
 target_compile_definitions(dlio_map_node PRIVATE PCL_NO_PRECOMPILE)
 target_link_libraries(dlio_map_node dlio_components)
 
-install(DIRECTORY cfg launch
+install(DIRECTORY cfg launch doc
   DESTINATION share/${PROJECT_NAME}
 )
+install(FILES README.md ouster.repos LICENSE THIRD_PARTY_LICENSES.md
+  DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
+  DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY scripts DESTINATION share/${PROJECT_NAME})
 
 # Tests
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_handoff_launch test/test_handoff_launch.py TIMEOUT 60)
   ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
   target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_nano_gicp

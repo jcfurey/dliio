@@ -12,12 +12,11 @@
 #       --build-arg CMAKE_BUILD_TYPE=RelWithDebInfo .         # ASan+UBSan subset
 #
 # Build args
-#   ROS_DISTRO        jazzy (default; what CI runs) | kilted | lyrical | ...
+#   ROS_DISTRO        humble | jazzy (default) | kilted | lyrical
 #   ROS_IMAGE_FLAVOR  ros-base (default, CI parity) | perception
-#                     'perception' pre-installs every dependency in package.xml
-#                     (pcl_ros, pcl_conversions, cv_bridge, image_transport,
-#                     libopencv-dev), so with SKIP_ROSDEP=1 the build needs no
-#                     access to packages.ros.org at all (air-gapped / proxied hosts).
+#                     Alternate image flavor. SKIP_ROSDEP=1 requires a base
+#                     that already contains every dependency in package.xml,
+#                     including bag tools, RViz, middleware, and test libraries.
 #   BASE_IMAGE        full override of the base image (defaults to
 #                     ros:${ROS_DISTRO}-${ROS_IMAGE_FLAVOR})
 #   SKIP_ROSDEP       0 (default) | 1 -- skip apt-get/rosdep in the deps stage
@@ -39,12 +38,16 @@ ARG BASE_IMAGE=ros:${ROS_DISTRO}-${ROS_IMAGE_FLAVOR}
 
 # ---- deps -------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS deps
+USER root
 ARG ROS_DISTRO
 ARG SKIP_ROSDEP=0
 ENV ROS_DISTRO=${ROS_DISTRO} \
     DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    OMP_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=1 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 WORKDIR /ws
 
@@ -64,9 +67,15 @@ FROM deps AS build
 ARG CMAKE_BUILD_TYPE=Release
 ARG DLIIO_SANITIZE=
 ARG BUILD_TESTING=ON
+ARG BUILD_JOBS=2
 # Exported so the sanitize stage / run-sanitized-tests.sh know how the tree was built.
 ENV DLIIO_SANITIZE=${DLIIO_SANITIZE} \
-    CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+    CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
+    MAKEFLAGS=-j${BUILD_JOBS} \
+    OMP_NUM_THREADS=4 \
+    OPENBLAS_NUM_THREADS=1 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 # The whole package (see .dockerignore for what is left out of the context).
 COPY . src/direct_lidar_inertial_odometry
@@ -76,14 +85,20 @@ RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
          --cmake-args \
            -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
            -DBUILD_TESTING="${BUILD_TESTING}" \
+           -DDLIIO_ENABLE_LIVOX=ON \
            -DDLIIO_SANITIZE="${DLIIO_SANITIZE}"
 
 # ---- test -------------------------------------------------------------------
 # `docker build --target test` is the gate: a failing gtest fails the image build.
 FROM build AS test
 RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
+    && source /ws/install/setup.bash \
     && colcon test --event-handlers console_cohesion+ \
-    && colcon test-result --verbose
+    && colcon test-result --verbose \
+    && ros2 run direct_lidar_inertial_odometry verify_install.py \
+    && cmake -S src/direct_lidar_inertial_odometry/test/installed_consumer -B consumer_build \
+    && cmake --build consumer_build --parallel 2 \
+    && ./consumer_build/consumer
 
 # ---- sanitize ---------------------------------------------------------------
 # Same subset and options as the asan-ubsan / tsan-informational CI jobs.
@@ -109,4 +124,4 @@ ENTRYPOINT ["/entrypoint.sh"]
 #   docker run --rm --net=host --ipc=host dliio \
 #     ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
 #       use_sim_time:=true pointcloud_topic:=/ouster/points imu_topic:=/ouster/imu
-CMD ["ros2", "launch", "direct_lidar_inertial_odometry", "dlio.launch.py"]
+CMD ["ros2", "launch", "direct_lidar_inertial_odometry", "dlio_ouster.launch.py"]
