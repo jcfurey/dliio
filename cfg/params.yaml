@@ -318,7 +318,9 @@
     odom/gicp/photometricScale: 255.0
 
     # Intensity range correction (only applied when photometricChannel: intensity)
-    # I_corrected = clamp(I * (r / rRef)^alpha, 0, 255)
+    # I_corrected = I * (r / rRef)^alpha (no 8-bit clipping).
+    # Raw intensity is preserved; registration uses intensity_corrected.
+    # Ouster native 'signal' is accepted as the raw intensity field.
     # intensityAlpha : falloff exponent (2.0 = inverse-square; tune per sensor;
     #                  the inverse-square model is poor below ~10 m)
     # intensityRRef  : reference range in metres (anchor; 1.0 is a safe default)

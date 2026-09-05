@@ -69,7 +69,7 @@ jobs:
           # and catches use-after-free in the worker-thread lifecycle / keyframe
           # vectors under real concurrency. OMP_NUM_THREADS kept default here.
           rc=0
-          for t in test_nano_gicp test_imu_integration test_visual_residual test_node_concurrency; do
+          for t in test_nano_gicp test_imu_integration test_intensity test_pointcloud_channels test_visual_residual test_node_concurrency; do
             echo "::group::$t"
             ./build/direct_lidar_inertial_odometry/$t || rc=1
             echo "::endgroup::"
@@ -116,4 +116,3 @@ jobs:
           export OMP_NUM_THREADS=1
           export TSAN_OPTIONS="halt_on_error=0:report_thread_leaks=0:suppressions=$(pwd)/src/direct_lidar_inertial_odometry/test/tsan.supp"
           ./build/direct_lidar_inertial_odometry/test_node_concurrency
-

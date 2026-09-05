@@ -14,6 +14,7 @@
 
 // SYSTEM
 #include <atomic>
+#include <limits>
 
 #ifdef HAS_CPUID
 #include <cpuid.h>
@@ -62,7 +63,9 @@ namespace dlio {
   class MapNode;
 
   struct Point {
-    Point(): data{0.f, 0.f, 0.f, 1.f}, intensity(0.f), reflectivity(0.f) {}
+    Point(): data{0.f, 0.f, 0.f, 1.f}, intensity(0.f), reflectivity(0.f), timestamp(0.0),
+             intensity_corrected(std::numeric_limits<float>::quiet_NaN()),
+             lidar_intensity(0.f) {}
 
     PCL_ADD_POINT4D;
     float intensity;    // return signal strength (range-dependent)
@@ -73,6 +76,10 @@ namespace dlio {
     double timestamp;  // (Hesai)  absolute timestamp in seconds      (< 1e14)
                        // (Livox)  absolute timestamp in nanoseconds  (> 1e14, = seconds * 1e9)
     };
+    // Derived channels are separate so image selection/denoising and range
+    // correction never overwrite the two sensor measurements above.
+    float intensity_corrected; // NaN = no correction supplied; use raw intensity
+    float lidar_intensity;     // selected LiDAR-image channel, before normalization
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   } EIGEN_ALIGN16;
 }
@@ -83,12 +90,14 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(dlio::Point,
                                  (float, z, z)
                                  (float, intensity, intensity)
                                  (float, reflectivity, reflectivity)
+                                 (float, intensity_corrected, intensity_corrected)
+                                 (float, lidar_intensity, lidar_intensity)
                                  (std::uint32_t, t, t)
                                  (float, time, time)
                                  (double, timestamp, timestamp))
 
 // PCL field registration above relies on this exact layout (overlapping
 // union members registered by offset); fail loudly if the struct changes.
-static_assert(sizeof(dlio::Point) == 32, "dlio::Point layout changed; update PCL field registration");
+static_assert(sizeof(dlio::Point) == 48, "dlio::Point layout changed; update PCL field registration");
 
 typedef dlio::Point PointType;

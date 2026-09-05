@@ -16,6 +16,12 @@ namespace {
 
 using Cloud = pcl::PointCloud<dlio::Point>;
 
+class PhotometricGICP : public nano_gicp::NanoGICP<dlio::Point, dlio::Point> {
+public:
+  const nano_gicp::GradientList& gradients() const { return *target_intensity_gradients_; }
+  bool valid(size_t i) const { return (*gradient_valid_)[i] != 0; }
+};
+
 dlio::Point makePoint(float x, float y, float z) {
   dlio::Point p;
   p.x = x; p.y = y; p.z = z;
@@ -667,6 +673,78 @@ TEST(NanoGICP, PhotometricRmsTracked) {
   g0.setInputSource(source);
   Cloud a0; g0.align(a0);
   EXPECT_EQ(g0.lastPhotometricRms(), 0.0f);
+}
+
+TEST(NanoGICP, PhotometricEnablesOnAnExistingTarget) {
+  auto cloud = makeIntensityCorner(2.0f, 0.2f);
+  PhotometricGICP g;
+  g.setNumThreads(1);
+  g.setInputTarget(cloud); // cached while photometry was disabled
+  g.setInputSource(cloud);
+  g.setPhotometricWeight(0.5f);
+  Cloud out;
+  g.align(out);
+  EXPECT_GT(g.lastPhotometricCount(), 0);
+}
+
+TEST(NanoGICP, PhotometricScaleRefreshesCachedGradients) {
+  auto cloud = makeIntensityCorner(2.0f, 0.2f);
+  PhotometricGICP g;
+  g.setNumThreads(1);
+  g.setPhotometricWeight(0.5f);
+  g.setInputTarget(cloud);
+  g.setInputSource(cloud);
+  Cloud out;
+  g.align(out);
+  const auto before = g.gradients();
+  g.setPhotometricScale(510.f); // halve both residual and Jacobian units
+  g.align(out);
+  int compared = 0;
+  for (size_t i = 0; i < cloud->size(); ++i) {
+    if (!g.valid(i) || before[i].norm() < 1e-6f) { continue; }
+    EXPECT_LT((g.gradients()[i] - before[i] * 0.5f).norm(), 1e-5f);
+    ++compared;
+  }
+  EXPECT_GT(compared, 0);
+}
+
+TEST(NanoGICP, SharedTargetGradientsRespectSelectedChannel) {
+  auto cloud = makeIntensityCorner(2.0f, 0.2f);
+  for (auto& p : *cloud) { p.intensity = 10.f; } // only reflectivity has texture
+  PhotometricGICP background, main;
+  background.setNumThreads(1);
+  background.setPhotometricWeight(0.5f);
+  background.setPhotometricChannel(true);
+  background.setInputTarget(cloud);
+  main.setNumThreads(1);
+  main.setPhotometricWeight(0.5f);
+  main.shareTargetDataFrom(background);
+  main.setInputSource(cloud);
+  Cloud out;
+  main.align(out);
+  EXPECT_EQ(main.lastPhotometricCount(), 0); // intensity is uniform
+  main.setPhotometricChannel(true);
+  main.align(out);
+  EXPECT_GT(main.lastPhotometricCount(), 0);
+}
+
+TEST(NanoGICP, CorrectedIntensityDrivesPhotometryWithoutReplacingRawSignal) {
+  auto cloud = makeIntensityCorner(2.0f, 0.2f);
+  for (auto& p : *cloud) {
+    p.intensity_corrected = p.intensity;
+    p.intensity = 1000.f; // only the separately corrected signal has texture
+    p.reflectivity = 0.f;
+  }
+  PhotometricGICP g;
+  g.setNumThreads(4);
+  g.setPhotometricWeight(0.5f);
+  g.setInputTarget(cloud);
+  g.setInputSource(cloud);
+  Cloud out;
+  g.align(out);
+  EXPECT_GT(g.lastPhotometricCount(), 0);
+  EXPECT_NEAR(g.lastPhotometricRms(), 0.f, 1e-6f);
+  for (const auto& p : *cloud) { EXPECT_FLOAT_EQ(p.intensity, 1000.f); }
 }
 
 // Read-only telemetry: the geometric trust margin (weakest-axis eigenvalue / gate

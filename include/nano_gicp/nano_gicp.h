@@ -200,7 +200,8 @@ public:
   void setPhotometricWeight(float weight);
   void setGradientKNeighbors(int k);
   // Selects which point field feeds the photometric term:
-  // false = intensity (default), true = reflectivity.
+  // false = corrected intensity when supplied, otherwise raw intensity (default);
+  // true = calibrated reflectivity.
   void setPhotometricChannel(bool use_reflectivity);
   // Full-scale value of the photometric channel (default 255). The channel is
   // divided by this before gradient estimation and residuals, so
@@ -327,7 +328,8 @@ public:
   // so the term's total influence is patch-size invariant).
   void setLidarFlowMode(bool image_ref, int patch);
   void setLidarImage(const cv::Mat& refl_norm);  // CV_32FC1, reflectivity/scale
-  // Linear spherical model: col = (atan2(Y,X) - az_b)/az_a, row = (elev - el_b)/el_a.
+  // Linear spherical model with azimuth unwrapped into the image interval:
+  // col = (azimuth - az_b)/az_a, row = (elev - el_b)/el_a.
   void setLidarProjection(float az_a, float az_b, float el_a, float el_b);
   void setLidarFrame(const Eigen::Isometry3f& T_lidar_world);  // world->lidar from the prior pose
   // Optional per-row elevation LUT (size = image rows). OS-series beam
@@ -349,6 +351,9 @@ public:
   // the residual is dimensionless; set per CHANNEL (reflectivity ~255, near-IR/
   // ambient ~thousands). Kept separate from the 3D photometric scale.
   void setLidarImageScale(float scale);
+  // OdomNode supplies a separate image channel; direct callers may retain the
+  // historical reflectivity reference (default false).
+  void setLidarImageUseDedicatedChannel(bool enabled);
   // Condition-scaled directional weighting of the LiDAR-map term (see
   // conditionScaleTerm): boost the term along geometrically-weak axes so it can
   // clear the degeneracy-gate rescue bar without inflating strong axes. power =
@@ -623,7 +628,8 @@ protected:
   float clamp_floor_;                  // tightest cap fraction (multiplier in (0,1]) at full degeneracy
 
   std::shared_ptr<const GradientList> target_intensity_gradients_;
-  std::shared_ptr<const std::vector<bool>> gradient_valid_;
+  std::shared_ptr<const std::vector<uint8_t>> gradient_valid_;
+  bool target_gradients_dirty_ = true;
 
   // --- Direct visual (camera) photometric term state ---
   bool visual_enabled_;
@@ -658,6 +664,7 @@ protected:
 
   // --- COIN-LIO LiDAR intensity-image term state ---
   float lidar_map_weight_;
+  bool lidar_image_use_dedicated_channel_ = false;
   std::shared_ptr<const std::vector<float>> target_lidar_refs_;  // per-target keyframe-image brightness (/scale); <0 invalid
   cv::Mat lidar_image_;               // current reflectivity image, CV_32FC1, /scale
   float lidar_az_a_, lidar_az_b_;     // col = (atan2(Y,X) - az_b) / az_a

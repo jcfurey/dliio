@@ -1,15 +1,18 @@
 # Testing & sanitizers
 
-## Unit & integration tests (49, run in CI)
+## Unit & integration tests (run in CI)
 
-`colcon test` -> 7 gtest suites:
+`colcon test` runs the gtest targets listed in `CMakeLists.txt`, including:
 - `test_nano_gicp` — GICP alignment, block-wise degeneracy gate, small-cloud
   covariance guard, PLANE vs MIN_EIG regularization (synthetic plane/corner).
 - `test_imu_integration` — continuous-time deskew kernel vs closed-form
   constant-accel / constant-omega / gravity-cancel trajectories.
 - `test_intensity` — the radiometric `correctIntensity` kernel: range-only at
   normal incidence, incidence (1/cos) brightening, cosMin grazing-angle floor,
-  255 saturation, bad-input guards.
+  preservation of signal above 255, bad-input guards, and image-channel denoising.
+- `test_pointcloud_channels` — real node intake, deskew, and voxel filtering of
+  Ouster original/native wire layouts; datatype conversion, aliases, row padding,
+  independent raw/corrected/image channels, and missing-field/live-enable handling.
 - `test_visual_residual` — camera frame-to-frame, camera frame-to-map, and
   COIN-LIO LiDAR-image residuals: residual->0 at truth, analytic-vs-finite-
   difference Jacobian (sign guards), Gauss-Newton descent, occlusion-gate
@@ -41,7 +44,9 @@ ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 \
 ```
 `detect_leaks=0` suppresses one-shot leaks in PCL/OpenCV/rclcpp statics; the
 heap-overflow / use-after-free / UB checks are what matter for the hot-path math.
-**Status: clean on all 49 tests** (the hard CI gate).
+The ASan/UBSan CI job is a hard gate. Its selected suites cover registration,
+IMU integration, intensity correction and wire-format channels, visual residuals,
+and the live-node concurrency harness.
 
 ## TSan — clean (via the live-node harness)
 

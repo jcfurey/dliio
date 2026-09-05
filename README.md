@@ -8,6 +8,9 @@ Added `photometricWeight` (default value: 0.1) and `gradientKNeighbors` (default
 
 These new user-configurable parameters allow you to control the influence of the intensity information. In featureless environments a higher `photometricWeight` is preferred.
 
+For Ouster field formats, channel selection, and verification, see
+[Ouster intensity and reflectivity](doc/OUSTER_CHANNELS.md).
+
 Added `intensityAlpha` (default value: 2.0) and `intensityRRef` (default value: 1.0) to cfg/params.yaml.
 
 These new user-configurable parameters allow you to control the influence of the range correction. Specifically, `intensityAlpha` is the falloff exponent and `intensityRRef` is the reference range in metres.

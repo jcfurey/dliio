@@ -15,8 +15,11 @@
 #include "dlio/degeneracy_governor.h"
 #include "dlio/degeneracy_observer.h"
 #include "dlio/physics_fuse.h"
+#include "dlio/pointcloud_fields.h"
 #include "nano_gicp/elevation_lut.h"
+#include "nano_gicp/lidar_projection.h"
 #include <set>
+#include <array>
 #include <unordered_map>
 #include <limits>
 #include <cstdint>
@@ -134,6 +137,7 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   std::string photometricChannel;
   dlio::declare_param(this, "odom/gicp/photometricChannel", photometricChannel, std::string("intensity"),
       "Point field feeding the photometric term: 'intensity' or 'reflectivity'");
+  if (photometricChannel == "signal") { photometricChannel = "intensity"; }
   this->use_reflectivity_ = (photometricChannel == "reflectivity");
   this->photometric_active_ = (photometricWeight > 0.0);
   if (photometricChannel != "intensity" && photometricChannel != "reflectivity") {
@@ -562,10 +566,8 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->crop.setMax(Eigen::Vector4f(this->crop_size_, this->crop_size_, this->crop_size_, 1.0));
 
   this->voxel.setLeafSize(this->vf_res_, this->vf_res_, this->vf_res_);
-  // pcl::VoxelGrid drops the custom 'reflectivity'/'intensity' fields (its
-  // centroid only averages a fixed set of known fields), zeroing the photometric
-  // channel and silently killing the photometric/COIN-LIO terms. Save the leaf
-  // layout so preprocessPoints() can average those channels per voxel by hand.
+  // PCL averages intensity, but its fixed centroid accumulators omit custom
+  // reflectivity and derived channels. Transfer those explicitly per voxel.
   this->voxel.setSaveLeafLayout(true);
 
   this->metrics.spaciousness.push_back(0.);
@@ -888,12 +890,14 @@ void dlio::OdomNode::getParams() {
       "Weight of a maximally-salient source point (1 = off; e.g. 4 = up to 4x on salient points)", 1.0, 100.0);
   this->gicp.setSaliencyWeighting(this->saliency_enabled_, static_cast<float>(this->saliency_boost_));
   // COIN-LIO image channel + normalization (2026-06-22). The per-point image slot
-  // (point.reflectivity) is filled from this cloud field; near-IR/ambient carries
+  // (point.lidar_intensity) is filled from this cloud field; near-IR/ambient carries
   // far more texture than reflectivity (mean 645 vs 19, ~100x dynamic range) but is
   // shot-noise-dominated per pixel, so it pairs with denoiseKernel. Default
   // 'reflectivity' + scale 255 + no denoise is bit-identical to the prior behavior.
   dlio::declare_param(this, "odom/lidar_image/channel", this->lidar_image_channel_, std::string("reflectivity"),
       "Cloud field feeding the LiDAR-image slot: 'reflectivity' | 'intensity' | 'ambient' (near-IR)");
+  if (this->lidar_image_channel_ == "signal") { this->lidar_image_channel_ = "intensity"; }
+  if (this->lidar_image_channel_ == "near_ir") { this->lidar_image_channel_ = "ambient"; }
   if (this->lidar_image_channel_ != "reflectivity" && this->lidar_image_channel_ != "intensity"
       && this->lidar_image_channel_ != "ambient") {
     RCLCPP_WARN(this->get_logger(),
@@ -903,6 +907,7 @@ void dlio::OdomNode::getParams() {
   }
   dlio::declare_param(this, "odom/lidar_image/scale", this->lidar_image_scale_, 255.0,
       "Full-scale normalization of the LiDAR-image channel (reflectivity ~255, near-IR ~thousands)");
+  this->gicp.setLidarImageUseDedicatedChannel(true);
   this->gicp.setLidarImageScale(static_cast<float>(this->lidar_image_scale_));
   dlio::declare_param(this, "odom/lidar_image/denoiseKernel", this->lidar_image_denoise_kernel_, 0,
       "K x K spatial box-blur of the organized image channel before residuals (<=1 = off; tames near-IR shot noise)");
@@ -1280,9 +1285,18 @@ void dlio::OdomNode::publishKeyframe(std::pair<std::pair<Eigen::Vector3f, Eigen:
 
 float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_incidence,
                                        float alpha, float r_ref, float cos_min) {
-  if (!(range > 0.f) || r_ref <= 0.f) { return intensity; }
-  const float c = std::max(cos_incidence, cos_min);  // c>0 (cos_min should be >0)
-  return std::clamp(intensity * std::pow(range / r_ref, alpha) / c, 0.f, 255.f);
+  if (!std::isfinite(intensity) || !std::isfinite(range) || !(range > 0.f) ||
+      !std::isfinite(r_ref) || !(r_ref > 0.f) || !std::isfinite(alpha) ||
+      !std::isfinite(cos_incidence) || !std::isfinite(cos_min) || !(cos_min > 0.f)) {
+    return intensity;
+  }
+  const double c = std::max(cos_incidence, cos_min);
+  const double corrected = std::max(0.f, intensity) *
+      std::pow(static_cast<double>(range) / r_ref, alpha) / c;
+  // This is a radiometric signal, not an 8-bit display value. Clipping at 255
+  // erased Ouster signal texture even with photometricScale=65535.
+  return static_cast<float>(std::min(corrected,
+      static_cast<double>(std::numeric_limits<float>::max())));
 }
 
 dlio::SensorType dlio::OdomNode::detectSensorType(
@@ -1430,6 +1444,7 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
 
 void dlio::OdomNode::applyLiveParams() {
   if (!this->live_dirty_.load()) { return; }
+  std::lock_guard<std::mutex> target_lock(this->gicp_temp_mutex_);
   std::map<std::string, double> pending;
   {
     std::lock_guard<std::mutex> lock(this->live_mtx_);
@@ -1440,9 +1455,10 @@ void dlio::OdomNode::applyLiveParams() {
     const std::string& name = kv.first;
     const double v = kv.second;
     if (name == "odom/gicp/photometricWeight") {
-      this->gicp.setPhotometricWeight(static_cast<float>(v));
-      this->gicp_temp.setPhotometricWeight(static_cast<float>(v));
-      this->photometric_active_ = (v > 0.0);
+      const float weight = this->photometric_channel_available_ ? static_cast<float>(v) : 0.f;
+      this->gicp.setPhotometricWeight(weight);
+      this->gicp_temp.setPhotometricWeight(weight);
+      this->photometric_active_ = (weight > 0.f);
     } else if (name == "odom/gicp/photometricHuberDelta") {
       this->gicp.setPhotometricHuberDelta(static_cast<float>(v));
       this->gicp_temp.setPhotometricHuberDelta(static_cast<float>(v));
@@ -1478,123 +1494,101 @@ void dlio::OdomNode::applyLiveParams() {
 
 void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedPtr& pc) {
 
-  pcl::PointCloud<PointType>::Ptr original_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
+  auto original_scan_ = std::make_shared<pcl::PointCloud<PointType>>();
+  this->scan_header_stamp = pc->header.stamp;
+  this->lidar_img_ready_ = false;
+  this->lidar_refl_img_.release();
+  this->lidar_range_img_.release();
+  this->lidar_img_az_grad_energy_ = 0.f;
+  this->lidar_image_effective_channel_ = "unavailable";
+  if (!PointCloudScalarField::validLayout(*pc)) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "Invalid PointCloud2 layout; skipping scan.");
+    this->original_scan = original_scan_;
+    return;
+  }
   pcl::fromROSMsg(*pc, *original_scan_);
 
-  // One-time intensity<->reflectivity fallback: resolve the configured photometric
-  // channel against the fields the sensor actually publishes, so a mismatch
-  // degrades gracefully instead of silently producing an all-zero (dead) term.
-  // Field availability is a property of the topic, so resolving once is enough;
-  // this runs on the first scan, before the background submap thread starts, so
-  // reconfiguring gicp/gicp_temp here is race-free.
-  if (!this->channel_resolved_) {
-    auto has_field = [&pc](const char* name) {
-      return std::any_of(pc->fields.begin(), pc->fields.end(),
-          [name](const sensor_msgs::msg::PointField& f){ return f.name == name; });
-    };
-    const bool has_refl = has_field("reflectivity");
-    const bool has_int  = has_field("intensity");
-    const bool was_refl = this->use_reflectivity_;
-    const bool was_active = this->photometric_active_;
-    resolvePhotometricChannel(has_refl, has_int, this->use_reflectivity_, this->photometric_active_);
+  // Decode BOTH measurements regardless of which terms are enabled. PCL's
+  // conversion support differs by version and cannot resolve native aliases.
+  // Explicit views also respect padding between organized rows.
+  const PointCloudScalarField intensity(*pc, {"intensity", "signal"});
+  const PointCloudScalarField reflectivity(*pc, {"reflectivity"});
+  const PointCloudScalarField ambient(*pc, {"ambient", "near_ir"});
+  this->input_intensity_field_ = intensity ? intensity.name() : "unavailable";
+  this->input_reflectivity_field_ = reflectivity ? reflectivity.name() : "unavailable";
+  for (size_t i = 0; i < original_scan_->size(); ++i) {
+    auto& p = original_scan_->points[i];
+    p.intensity = intensity ? intensity[i] : 0.f;
+    p.reflectivity = reflectivity ? reflectivity[i] : 0.f;
+    p.intensity_corrected = p.intensity;
+    p.lidar_intensity = 0.f;
+  }
 
-    if (!this->photometric_active_ && was_active) {
-      RCLCPP_WARN(this->get_logger(), "photometric term enabled but the cloud has neither "
-          "'reflectivity' nor 'intensity'; disabling the photometric term.");
+  // Resolve even when weight starts at zero: live enabling must use the same
+  // channel and radiometric preprocessing as the already stored keyframes.
+  // Wait for a nonempty cloud so an empty startup message cannot disable it.
+  if (!this->channel_resolved_ && !original_scan_->empty()) {
+    const bool was_refl = this->use_reflectivity_;
+    bool available = true;
+    resolvePhotometricChannel(static_cast<bool>(reflectivity), static_cast<bool>(intensity),
+        this->use_reflectivity_, available);
+    this->photometric_channel_available_ = available;
+    if (!available) {
+      if (this->photometric_active_) {
+        RCLCPP_WARN(this->get_logger(), "Photometric term has no readable intensity/signal "
+            "or reflectivity field; disabling it.");
+      }
+      this->photometric_active_ = false;
       this->gicp.setPhotometricWeight(0.f);
       this->gicp_temp.setPhotometricWeight(0.f);
     } else if (this->use_reflectivity_ != was_refl) {
-      RCLCPP_WARN(this->get_logger(), "photometricChannel=%s unavailable in the cloud; "
-          "falling back to '%s'.", was_refl ? "reflectivity" : "intensity",
-          this->use_reflectivity_ ? "reflectivity" : "range-corrected intensity");
-      this->gicp.setPhotometricChannel(this->use_reflectivity_);
-      this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
+      RCLCPP_WARN(this->get_logger(), "photometricChannel=%s unavailable; using %s. "
+          "photometricScale remains configured by the user.",
+          was_refl ? "reflectivity" : "intensity", this->use_reflectivity_ ? "reflectivity" : "intensity");
     }
+    this->gicp.setPhotometricChannel(this->use_reflectivity_);
+    this->gicp_temp.setPhotometricChannel(this->use_reflectivity_);
     this->channel_resolved_ = true;
   }
 
-  // Populate the reflectivity channel from the raw message. pcl::fromROSMsg only
-  // copies fields whose datatype matches our struct (reflectivity is a float here,
-  // but sensors publish it as uint8/uint16), so copy it explicitly with conversion.
-  // Done before NaN removal so indices still line up 1:1 with the message.
-  // Also needed by the COIN-LIO LiDAR intensity-image term (independent of the
-  // 3D-spatial reflectivity photometric term).
-  if ((this->use_reflectivity_ && this->photometric_active_) || this->lidar_image_enabled_ ||
-      this->lidar_flow_enabled_) {
-    // Which cloud field feeds the per-point image slot (point.reflectivity).
-    // Default 'reflectivity' -> bit-identical. The COIN-LIO image term may select
-    // a higher-texture channel (odom/lidar_image/channel = intensity|ambient);
-    // honoured only when the 3D reflectivity photometric term isn't also using
-    // the slot (they share it), so the default photometric path is unchanged.
-    std::string img_field = "reflectivity";
-    if (this->lidar_image_enabled_ && !(this->use_reflectivity_ && this->photometric_active_)) {
-      img_field = this->lidar_image_channel_;   // reflectivity | intensity | ambient
+  // Image channels have their own storage. Selecting/denoising ambient or raw
+  // intensity must not change the sensor reflectivity used by 3D registration.
+  // The same path serves map images and flow-only configurations.
+  if (this->lidar_image_enabled_ || this->lidar_flow_enabled_) {
+    const PointCloudScalarField* image_field = &reflectivity;
+    if (this->lidar_image_channel_ == "intensity") { image_field = &intensity; }
+    else if (this->lidar_image_channel_ == "ambient") { image_field = &ambient; }
+    // Keep the established intensity fallback, but require a readable field;
+    // absent channels must not manufacture a valid all-zero image.
+    if (!*image_field && intensity) {
+      RCLCPP_WARN_ONCE(this->get_logger(), "LiDAR-image channel '%s' unavailable; "
+          "using raw intensity/signal with the configured image scale.", this->lidar_image_channel_.c_str());
+      image_field = &intensity;
     }
-    auto field_it = std::find_if(pc->fields.begin(), pc->fields.end(),
-        [&img_field](const sensor_msgs::msg::PointField& f){ return f.name == img_field; });
-    if (field_it != pc->fields.end()) {
-      const size_t n = original_scan_->points.size();
-      auto fill = [&](auto it) {
-        for (size_t i = 0; i < n; ++i, ++it) {
-          original_scan_->points[i].reflectivity = static_cast<float>(*it);
-        }
-      };
-      using PF = sensor_msgs::msg::PointField;
-      switch (field_it->datatype) {
-        case PF::UINT8:   fill(sensor_msgs::PointCloud2ConstIterator<uint8_t >(*pc, img_field)); break;
-        case PF::UINT16:  fill(sensor_msgs::PointCloud2ConstIterator<uint16_t>(*pc, img_field)); break;
-        case PF::UINT32:  fill(sensor_msgs::PointCloud2ConstIterator<uint32_t>(*pc, img_field)); break;
-        case PF::FLOAT32: fill(sensor_msgs::PointCloud2ConstIterator<float   >(*pc, img_field)); break;
-        default:
-          RCLCPP_WARN_ONCE(this->get_logger(),
-              "LiDAR-image channel '%s' has unsupported datatype %u; channel will be zero.",
-              img_field.c_str(), field_it->datatype);
-          break;
+    if (*image_field) {
+      this->lidar_image_effective_channel_ = image_field->name();
+      for (size_t i = 0; i < original_scan_->size(); ++i) {
+        original_scan_->points[i].lidar_intensity = (*image_field)[i];
+      }
+      if (pc->height > 1 && original_scan_->height == pc->height && original_scan_->width == pc->width) {
+        this->denoiseOrganizedChannel(original_scan_, pc->width, pc->height,
+                                     this->lidar_image_denoise_kernel_);
+        this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
       }
     } else {
-      // Selected field absent. The 3D photometric term already fell back to
-      // intensity above; the COIN-LIO LiDAR-image term still needs a per-point
-      // channel, so build it from 'intensity' (already populated by fromROSMsg).
-      // The image is then a raw-intensity image (range-dependent, not calibrated),
-      // but functional.
-      for (auto& p : original_scan_->points) { p.reflectivity = p.intensity; }
-      RCLCPP_WARN_ONCE(this->get_logger(),
-          "LiDAR-image term: cloud has no '%s' field; using 'intensity' for the "
-          "LiDAR image (range-dependent, not calibrated).", img_field.c_str());
+      RCLCPP_WARN_ONCE(this->get_logger(), "LiDAR-image channel '%s' unavailable "
+          "and no intensity/signal fallback; skipping image terms.", this->lidar_image_channel_.c_str());
     }
-  }
-
-  // Spatial denoise of the image channel: near-IR/ambient is shot-noise-dominated
-  // per pixel (temporal noise ~1.5x the Poisson floor), so a K x K box blur over
-  // the organized grid averages the independent shot noise down ~sqrt(valid
-  // neighbours) while preserving structured wall texture (lag-1 autocorr ~0.9).
-  // In-place on the .reflectivity slot before the image is built, so the current
-  // image and the keyframe references denoise consistently. No-op for K <= 1 or a
-  // non-organized cloud, and (default 0) bit-identical for reflectivity.
-  if (this->lidar_image_enabled_ && this->lidar_image_denoise_kernel_ > 1 &&
-      pc->height > 1 && original_scan_->height == pc->height &&
-      original_scan_->width == pc->width) {
-    this->denoiseOrganizedChannel(original_scan_, pc->width, pc->height,
-                                  this->lidar_image_denoise_kernel_);
-  }
-
-  // COIN-LIO LiDAR intensity image: build from the ORGANIZED grid before NaN
-  // removal flattens it. No-op if the cloud isn't organized. The flow term
-  // consumes the same image, so a flow-only config also builds it (previously
-  // it silently no-oped without the map term).
-  this->lidar_img_ready_ = false;
-  if ((this->lidar_image_enabled_ || this->lidar_flow_enabled_) && pc->height > 1 &&
-      original_scan_->height == pc->height && original_scan_->width == pc->width) {
-    this->buildLidarIntensityImage(original_scan_, pc->width, pc->height);
   }
 
   // Radiometric intensity correction (raw-intensity photometric path only):
   // range falloff and, optionally, incidence angle (Kashani et al.). Applied
   // BEFORE NaN removal so the organized grid is available for cheap per-point
-  // normals. Skipped for reflectivity (sensor-calibrated) and when the
-  // photometric term is off, so downstream consumers only see modified
-  // intensities when the feature is actually in use.
-  if (!this->use_reflectivity_ && this->photometric_active_ && this->intensity_r_ref_ > 0.0) {
+  // normals. Skipped for reflectivity (sensor-calibrated); the
+  // result is stored separately from raw intensity. Populate it even at zero
+  // weight so live enabling can compare against consistently prepared keyframes.
+  if (!this->use_reflectivity_ && this->photometric_channel_available_ && this->intensity_r_ref_ > 0.0) {
     const float alpha   = static_cast<float>(this->intensity_alpha_);
     const float r_ref   = static_cast<float>(this->intensity_r_ref_);
     const float cos_min = static_cast<float>(this->intensity_cos_min_);
@@ -1623,13 +1617,13 @@ void dlio::OdomNode::getScanFromROS(const sensor_msgs::msg::PointCloud2::SharedP
               if (nn > 1e-6f) { cos_a = std::abs((c / r).dot(n / nn)); }
             }
           }
-          pt.intensity = correctIntensity(pt.intensity, r, cos_a, alpha, r_ref, cos_min);
+          pt.intensity_corrected = correctIntensity(pt.intensity, r, cos_a, alpha, r_ref, cos_min);
         }
       }
     } else {
       for (auto& pt : original_scan_->points) {
         const float r = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-        pt.intensity = correctIntensity(pt.intensity, r, 1.0f, alpha, r_ref, cos_min);
+        pt.intensity_corrected = correctIntensity(pt.intensity, r, 1.0f, alpha, r_ref, cos_min);
       }
     }
   }
@@ -1714,32 +1708,39 @@ void dlio::OdomNode::preprocessPoints() {
     this->voxel.setInputCloud(this->deskewed_scan);
     this->voxel.filter(*current_scan_);
 
-    // Re-attach the photometric channels VoxelGrid dropped: average each input
-    // point's reflectivity/intensity into the output voxel it fell into, using
-    // the saved leaf layout (O(N), no extra kd-tree). Without this the submap's
-    // channel is all-zero and every photometric gradient is rejected. Only the
-    // photometric GICP term and the COIN-LIO LiDAR-image term read these
-    // channels, so skip the transfer entirely in the default geometry-only path.
-    // Both channels are averaged regardless of which one is in use: the absent
-    // one is simply zero in -> zero out (the active channel is the one the term
-    // reads via photometric_use_reflectivity_), so single-channel sensors
-    // (intensity-only or reflectivity-only) are handled correctly.
+    // Preserve sensor and derived channels through voxelization, including
+    // geometry-only startup followed by live photometric enabling. PCL's
+    // CentroidPoint does not accumulate custom fields such as reflectivity.
     const size_t M = current_scan_->size();
-    if (M > 0 && (this->photometric_active_ || this->lidar_image_enabled_)) {
-      std::vector<float> refl_sum(M, 0.f), int_sum(M, 0.f);
-      std::vector<int> cnt(M, 0);
+    if (M > 0) {
+      using Member = float PointType::*;
+      const Member channels[] = {&PointType::intensity, &PointType::reflectivity,
+          &PointType::intensity_corrected, &PointType::lidar_intensity};
+      std::vector<std::array<double, 4>> sums(M, {0., 0., 0., 0.});
+      std::vector<std::array<int, 4>> counts(M, {0, 0, 0, 0});
+      const auto min_cell = this->voxel.getMinBoxCoordinates();
+      const auto max_cell = this->voxel.getMaxBoxCoordinates();
+      bool valid_layout = true;
       for (const auto& p : this->deskewed_scan->points) {
+        const auto cell = this->voxel.getGridCoordinates(p.x, p.y, p.z);
+        // On grid-index overflow PCL returns an unchanged copy of the input
+        // without updating its saved layout. Preserve that copy's fields too.
+        if ((cell.array() < min_cell.array()).any() || (cell.array() > max_cell.array()).any()) {
+          valid_layout = false;
+          break;
+        }
         const int idx = this->voxel.getCentroidIndex(p);
-        if (idx >= 0 && static_cast<size_t>(idx) < M) {
-          refl_sum[idx] += p.reflectivity;
-          int_sum[idx]  += p.intensity;
-          ++cnt[idx];
+        if (idx < 0 || static_cast<size_t>(idx) >= M) { continue; }
+        for (size_t ch = 0; ch < 4; ++ch) {
+          const float value = p.*channels[ch];
+          if (std::isfinite(value)) { sums[idx][ch] += value; ++counts[idx][ch]; }
         }
       }
-      for (size_t i = 0; i < M; ++i) {
-        if (cnt[i] > 0) {
-          current_scan_->points[i].reflectivity = refl_sum[i] / cnt[i];
-          current_scan_->points[i].intensity    = int_sum[i]  / cnt[i];
+      for (size_t i = 0; valid_layout && i < M; ++i) {
+        for (size_t ch = 0; ch < 4; ++ch) {
+          current_scan_->points[i].*channels[ch] = counts[i][ch] > 0
+              ? static_cast<float>(sums[i][ch] / counts[i][ch])
+              : std::numeric_limits<float>::quiet_NaN();
         }
       }
     }
@@ -2452,7 +2453,6 @@ dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstP
   }
   const Eigen::Matrix3f R = T_lw.linear();
   const Eigen::Vector3f t = T_lw.translation();
-  const float inv_az_a = 1.f / this->lidar_az_a_;
   const float inv_el_a = 1.f / this->lidar_el_a_;
   // MUST match the model the GICP map term projects with, or the reference is
   // sampled at different pixels than the residual lands on. Both now read the
@@ -2472,7 +2472,7 @@ dlio::OdomNode::sampleKeyframeLidarRefs(const pcl::PointCloud<PointType>::ConstP
     if (rxy2 < 1e-6f) { continue; }
     const float az = std::atan2(Pl.y(), Pl.x());
     const float el = std::atan2(Pl.z(), std::sqrt(rxy2));
-    const float u = (az - this->lidar_az_b_) * inv_az_a;
+    const float u = nano_gicp::columnFromAzimuth(az, this->lidar_az_a_, this->lidar_az_b_, img.cols);
     float v;
     if (use_lut) {
       // Shared inversion (nano_gicp/elevation_lut.h) -- the same code the map
@@ -2502,8 +2502,9 @@ void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::P
     for (int col = 0; col < width; ++col) {
       const auto& p = organized->at(col, row);   // organized access (col, row)
       const size_t idx = static_cast<size_t>(row) * width + col;
-      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
-        in[idx] = p.reflectivity;
+      if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+          p.getVector3fMap().squaredNorm() > 0.f && std::isfinite(p.lidar_intensity)) {
+        in[idx] = p.lidar_intensity;
         valid[idx] = 1;
       }
     }
@@ -2526,7 +2527,7 @@ void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::P
           if (valid[nidx]) { sum += in[nidx]; ++cnt; }
         }
       }
-      if (cnt > 0) { organized->at(col, row).reflectivity = sum / static_cast<float>(cnt); }
+      if (cnt > 0) { organized->at(col, row).lidar_intensity = sum / static_cast<float>(cnt); }
     }
   }
 }
@@ -2534,7 +2535,7 @@ void dlio::OdomNode::denoiseOrganizedChannel(const pcl::PointCloud<PointType>::P
 void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::ConstPtr& organized,
                                               int width, int height) {
   // Reflectivity image in native (row=ring, col=azimuth) order, normalized to
-  // the same /scale units as the residual reference (point.reflectivity/scale).
+  // the same /scale units as the residual reference (point.lidar_intensity/scale).
   // Per-channel scale (odom/lidar_image/scale; default 255, bit-identical) keeps
   // the image and the gicp map-term reference normalized identically.
   const float inv_scale = 1.f / static_cast<float>(this->lidar_image_scale_);
@@ -2545,8 +2546,9 @@ void dlio::OdomNode::buildLidarIntensityImage(const pcl::PointCloud<PointType>::
     float* drng = rng.ptr<float>(row);
     for (int col = 0; col < width; ++col) {
       const auto& p = organized->at(col, row);   // organized access (col, row)
-      if (std::isfinite(p.x) && std::isfinite(p.reflectivity)) {
-        dst[col] = p.reflectivity * inv_scale;
+      if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+          p.getVector3fMap().squaredNorm() > 0.f && std::isfinite(p.lidar_intensity)) {
+        dst[col] = p.lidar_intensity * inv_scale;
         drng[col] = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
       }
     }
@@ -3852,7 +3854,10 @@ void dlio::OdomNode::buildSubmap(State vehicle_state) {
     // photometric gradients without blocking the main loop. Covariances come
     // from the keyframe normals assembled above (submap_normals), shared with
     // the registration instance in getNextPose().
-    this->gicp_temp.registerInputTarget(this->submap_cloud);
+    {
+      std::lock_guard<std::mutex> target_lock(this->gicp_temp_mutex_);
+      this->gicp_temp.registerInputTarget(this->submap_cloud);
+    }
 
     this->submap_kf_idx_prev = this->submap_kf_idx_curr;
   }
@@ -4022,6 +4027,9 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Geo Trans Trust Margin", fnum(this->gicp.lastGeoTransMargin(), 4));
   kv("Photometric Active", this->photometric_active_ ? "1" : "0");
   kv("Photometric Channel", this->use_reflectivity_ ? "reflectivity" : "intensity");
+  kv("Input Intensity Field", this->input_intensity_field_);
+  kv("Input Reflectivity Field", this->input_reflectivity_field_);
+  kv("Lidar Image Channel", this->lidar_image_effective_channel_);
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
   kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));

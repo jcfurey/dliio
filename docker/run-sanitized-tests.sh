@@ -23,7 +23,7 @@ case "${DLIIO_SANITIZE:-}" in
     export ASAN_OPTIONS=detect_leaks=0:halt_on_error=1:abort_on_error=1
     export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
     rc=0
-    for t in test_nano_gicp test_imu_integration test_visual_residual test_node_concurrency; do
+    for t in test_nano_gicp test_imu_integration test_intensity test_pointcloud_channels test_visual_residual test_node_concurrency; do
       echo "=== ${t} (${DLIIO_SANITIZE}) ==="
       "${BUILD_DIR}/${t}" || rc=1
     done

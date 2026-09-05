@@ -245,6 +245,10 @@ if(BUILD_TESTING)
     dlio_components
   )
 
+  ament_add_gtest(test_pointcloud_channels test/test_pointcloud_channels.cpp)
+  target_compile_definitions(test_pointcloud_channels PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_pointcloud_channels dlio_components)
+
   ament_add_gtest(test_sensor_detection test/test_sensor_detection.cpp)
   target_compile_definitions(test_sensor_detection PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_sensor_detection

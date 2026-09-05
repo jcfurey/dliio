@@ -79,7 +79,7 @@ public:
 
   // Radiometric intensity correction (range + optional incidence angle), the
   // Kashani et al. model  I' = I * (r/r_ref)^alpha / max(cos_incidence, cos_min)
-  // clamped to [0,255]. cos_incidence = |beam . surface_normal| in [0,1]
+  // without 8-bit clipping. cos_incidence = |beam . surface_normal| in [0,1]
   // (1 = normal incidence; pass 1 to apply range-only). Static and
   // side-effect-free for unit testing.
   static float correctIntensity(float intensity, float range, float cos_incidence,
@@ -102,7 +102,7 @@ public:
   static void resolvePhotometricChannel(bool has_reflectivity, bool has_intensity,
                                         bool& use_reflectivity, bool& photometric_active);
 
-  // Spatial box-blur the per-point image channel (the .reflectivity slot) over
+  // Spatial box-blur the per-point image channel (.lidar_intensity) over
   // the organized K x K neighbourhood, averaging per-pixel shot noise down
   // ~sqrt(valid neighbours) while preserving structured wall texture (near-IR is
   // shot-noise-dominated). Restricted to valid-return pixels (finite x), in-place,
@@ -127,6 +127,7 @@ public:
       float margin, float max_reject_frac);
 
 private:
+  friend struct OdomNodeTestAccess;
 
   struct State;
 
@@ -336,6 +337,7 @@ private:
   // GICP
   nano_gicp::NanoGICP<PointType, PointType> gicp;
   nano_gicp::NanoGICP<PointType, PointType> gicp_temp;
+  std::mutex gicp_temp_mutex_; // live settings vs background target-gradient build
 
   // Transformations
   Eigen::Matrix4f T, T_prior, T_corr;
@@ -569,11 +571,15 @@ private:
   double intensity_cos_min_;
   // Photometric channel: false = intensity, true = reflectivity
   bool use_reflectivity_;
-  // photometric term enabled (weight > 0); gates the intensity range correction
+  // Photometric term enabled (weight > 0 and a readable channel was resolved).
   bool photometric_active_;
   // One-time intensity<->reflectivity fallback resolution against the actual
-  // cloud fields (set on the first scan; see getScanFromROS).
+  // cloud fields (set on the first nonempty scan; see getScanFromROS).
   bool channel_resolved_ = false;
+  bool photometric_channel_available_ = true;
+  std::string input_intensity_field_ = "unavailable";
+  std::string input_reflectivity_field_ = "unavailable";
+  std::string lidar_image_effective_channel_ = "unavailable";
 
   // --- Direct visual (camera) photometric term (off by default) ---
   // Frame-to-frame direct image alignment that constrains the LiDAR-degenerate

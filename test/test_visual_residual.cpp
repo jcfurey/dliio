@@ -1077,6 +1077,70 @@ TEST(LidarFlowResidual, FieldReferenceModeStillZeroAtCoincidence) {
   EXPECT_NEAR(cost, 0.0, 1e-9);
 }
 
+TEST(LidarImageChannels, DedicatedChannelFeedsMapAndFlowIndependentlyOfReflectivity) {
+  TestableGICP g;
+  const cv::Mat img = makeRampImage(kLW, kLH, 0.02f, 0.03f, 0.1f);
+  auto cloud = makeLidarTarget();
+  for (auto& p : *cloud) {
+    float u, v; projectL(Eigen::Vector3f(p.x, p.y, p.z), u, v);
+    p.lidar_intensity = bilinearSampleRamp(img, u, v) * 4096.f;
+    p.reflectivity = 20.f; // independent calibrated measurement
+  }
+  g.setLidarImageUseDedicatedChannel(true);
+  g.setLidarImageScale(4096.f);
+  g.setLidarProjection(kLAzA, kLAzB, kLElA, kLElB);
+  g.setLidarFrame(Eigen::Isometry3f::Identity());
+  g.setLidarImage(img);
+  g.setLidarFlowPrev(img, Eigen::Isometry3f::Identity());
+  g.setLidarFlowMode(false, 0);
+  g.setLidarFlowWeight(1.f);
+  g.setLidarMapWeight(1.f);
+  g.setInputSource(cloud);
+  g.setInputTarget(cloud);
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  EXPECT_NEAR(g.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b), 0.0, 1e-9);
+  EXPECT_GT(g.lastLidarMapCount(), 20);
+  EXPECT_NEAR(g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b), 0.0, 1e-9);
+  EXPECT_GT(g.lastLidarFlowCount(), 20);
+  g.setLidarImageUseDedicatedChannel(false);
+  EXPECT_GT(g.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b), 0.1);
+  EXPECT_GT(g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b), 0.1);
+}
+
+TEST(LidarImageChannels, ClockwiseScanProjectsBothHalvesAcrossAtan2Seam) {
+  TestableGICP g;
+  const float az_step = -2.f * static_cast<float>(M_PI) / kLW;
+  const cv::Mat img = makeRampImage(kLW, kLH, 0.002f, 0.003f, 0.1f);
+  auto cloud = std::make_shared<Cloud>();
+  for (int col = 40; col <= 210; col += 14) {
+    for (int row = 12; row <= 50; row += 6) {
+      const float az = az_step * col, el = kLElA * row + kLElB;
+      dlio::Point p;
+      p.x = 6.f * std::cos(el) * std::cos(az);
+      p.y = 6.f * std::cos(el) * std::sin(az);
+      p.z = 6.f * std::sin(el);
+      p.reflectivity = img.at<float>(row, col) * 255.f;
+      cloud->push_back(p);
+    }
+  }
+  g.setLidarProjection(az_step, 0.f, kLElA, kLElB);
+  g.setLidarFrame(Eigen::Isometry3f::Identity());
+  g.setLidarImage(img);
+  g.setLidarFlowPrev(img, Eigen::Isometry3f::Identity());
+  g.setLidarFlowMode(true, 0);
+  g.setLidarFlowWeight(1.f);
+  g.setLidarMapWeight(1.f);
+  g.setInputSource(cloud);
+  g.setInputTarget(cloud);
+  Eigen::Matrix<double, 6, 6> H;
+  Eigen::Matrix<double, 6, 1> b;
+  EXPECT_NEAR(g.lidarMapSystem(Eigen::Isometry3f::Identity(), H, b), 0.0, 1e-9);
+  EXPECT_EQ(g.lastLidarMapCount(), static_cast<int>(cloud->size()));
+  EXPECT_NEAR(g.lidarFlowSystem(Eigen::Isometry3f::Identity(), H, b), 0.0, 1e-9);
+  EXPECT_EQ(g.lastLidarFlowCount(), static_cast<int>(cloud->size()));
+}
+
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

@@ -30,8 +30,15 @@
 #include <Eigen/Dense>
 #include <pcl/common/transforms.h>
 #include "nano_gicp/elevation_lut.h"
+#include "nano_gicp/lidar_projection.h"
 
 namespace {
+template<typename PointT>
+float photometricValue(const PointT& point, bool use_reflectivity) {
+  if (use_reflectivity) { return point.reflectivity; }
+  return std::isnan(point.intensity_corrected) ? point.intensity : point.intensity_corrected;
+}
+
 // Bilinear sample of a single-channel CV_32F image. Caller guarantees the 2x2
 // neighborhood (floor(u),floor(v))..(+1,+1) is in bounds.
 inline float bilinearSample(const cv::Mat& img, float u, float v) {
@@ -391,22 +398,32 @@ void NanoGICP<PointSource, PointTarget>::setInitialLambdaFactor(float lambda) {
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricWeight(float weight) {
+    if (weight > 1e-8f && photometric_weight_ <= 1e-8f) { target_gradients_dirty_ = true; }
     this->photometric_weight_ = weight;
 }
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setGradientKNeighbors(int k) {
+    if (k != gradient_k_neighbors_) { target_gradients_dirty_ = true; }
     this->gradient_k_neighbors_ = k;
 }
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricChannel(bool use_reflectivity) {
+    if (use_reflectivity != photometric_use_reflectivity_) { target_gradients_dirty_ = true; }
     this->photometric_use_reflectivity_ = use_reflectivity;
 }
 
 template <typename PointSource, typename PointTarget>
 void NanoGICP<PointSource, PointTarget>::setPhotometricScale(float scale) {
-    this->photometric_scale_ = (scale > 0.f) ? scale : 1.0f;
+    const float valid_scale = (std::isfinite(scale) && scale > 0.f) ? scale : 1.0f;
+    if (valid_scale != photometric_scale_) { target_gradients_dirty_ = true; }
+    this->photometric_scale_ = valid_scale;
+}
+
+template <typename PointSource, typename PointTarget>
+void NanoGICP<PointSource, PointTarget>::setLidarImageUseDedicatedChannel(bool enabled) {
+    this->lidar_image_use_dedicated_channel_ = enabled;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -839,6 +856,13 @@ void NanoGICP<PointSource, PointTarget>::shareTargetDataFrom(const NanoGICP& oth
   target_covs_ = other.target_covs_;
   target_intensity_gradients_ = other.target_intensity_gradients_;
   gradient_valid_ = other.gradient_valid_;
+  // A background target may have been built before a live parameter change,
+  // or with photometry disabled. Rebuild locally when its gradient units or
+  // channel do not match this registration instance.
+  target_gradients_dirty_ = other.target_gradients_dirty_ || !gradient_valid_ ||
+      photometric_scale_ != other.photometric_scale_ ||
+      photometric_use_reflectivity_ != other.photometric_use_reflectivity_ ||
+      gradient_k_neighbors_ != other.gradient_k_neighbors_;
   target_visual_refs_ = other.target_visual_refs_;
   target_lidar_refs_ = other.target_lidar_refs_;
 }
@@ -852,7 +876,9 @@ void NanoGICP<PointSource, PointTarget>::calculate_target_intensity_gradients() 
     }
 
     auto gradients = std::make_shared<GradientList>(target_->size(), Eigen::Vector3f::Zero());
-    auto valid = std::make_shared<std::vector<bool>>(target_->size(), false);
+    // vector<bool> packs adjacent flags into one word; concurrent OpenMP
+    // writes to different points can otherwise lose each other's bits.
+    auto valid = std::make_shared<std::vector<uint8_t>>(target_->size(), 0);
 
     #pragma omp parallel for num_threads(num_threads_) schedule(guided, 8)
     for (int i = 0; i < target_->size(); ++i) {
@@ -865,6 +891,7 @@ void NanoGICP<PointSource, PointTarget>::calculate_target_intensity_gradients() 
 
     target_intensity_gradients_ = gradients;
     gradient_valid_ = valid;
+    target_gradients_dirty_ = false;
 }
 
 template <typename PointSource, typename PointTarget>
@@ -893,7 +920,7 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
   const bool use_refl = this->photometric_use_reflectivity_;
   const float inv_scale = 1.0f / this->photometric_scale_;
   auto chan = [use_refl, inv_scale](const PointTarget& p) {
-    return (use_refl ? p.reflectivity : p.intensity) * inv_scale;
+    return photometricValue(p, use_refl) * inv_scale;
   };
 
   Eigen::MatrixXf A(found_neighbors, 4);
@@ -914,6 +941,7 @@ bool NanoGICP<PointSource, PointTarget>::estimate_spatial_intensity_gradient(
     A(j, 2) = pt.z - query_pt.z;
     A(j, 3) = 1.0f;
     i(j) = chan(pt);
+    if (!std::isfinite(i(j))) { return false; }
     mean_intensity += chan(pt);
   }
   mean_intensity /= found_neighbors;
@@ -974,6 +1002,10 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         auto covs = std::make_shared<CovarianceList>();
         calculate_covariances(target_, *target_kdtree_, *covs);
         target_covs_ = covs;
+    }
+
+    if (photometric_weight_ > 1e-8f && (target_gradients_dirty_ || !gradient_valid_)) {
+        calculate_target_intensity_gradients();
     }
 
     this->converged_ = false;
@@ -1546,9 +1578,10 @@ void NanoGICP<PointSource, PointTarget>::linearize(
         // Photometric term (channel normalized by photometric_scale_ to match
         // the units the target gradients were estimated in)
         if (use_photometric && (*gradient_valid_)[target_index]) {
-            float src_val = photometric_use_reflectivity_ ? source_pt.reflectivity : source_pt.intensity;
-            float tgt_val = photometric_use_reflectivity_ ? target_pt.reflectivity : target_pt.intensity;
+            float src_val = photometricValue(source_pt, photometric_use_reflectivity_);
+            float tgt_val = photometricValue(target_pt, photometric_use_reflectivity_);
             float intensity_diff = (src_val - tgt_val) / photometric_scale_;
+            if (!std::isfinite(intensity_diff)) { continue; }
             Eigen::Vector3f gradient = (*target_intensity_gradients_)[target_index];
             
             if (gradient.norm() > kGradientMagMin && gradient.norm() < kGradientMagMax) {
@@ -1986,8 +2019,9 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
             ref = (*kf_refs)[j];
             if (!(ref >= 0.f)) { continue; }   // NaN-safe invalid check
         } else {
-            ref = tp.reflectivity * inv_scale;
+            ref = (lidar_image_use_dedicated_channel_ ? tp.lidar_intensity : tp.reflectivity) * inv_scale;
         }
+        if (!std::isfinite(ref)) { continue; }
         const Eigen::Vector3f Pl = R_lw * p_w + T_lw.translation();
 
         const float X = Pl.x(), Y = Pl.y(), Z = Pl.z();
@@ -1998,7 +2032,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarMapResidual(
 
         const float az = std::atan2(Y, X);
         const float el = std::atan2(Z, rxy);
-        const float u = (az - lidar_az_b_) * inv_az_a;   // col
+        const float u = columnFromAzimuth(az, lidar_az_a_, lidar_az_b_, lidar_image_.cols);
         // Row from the per-row elevation LUT (non-uniform beams) or the linear
         // fallback; inv_el_eff is the local rows-per-radian used by the Jacobian.
         float v, inv_el_eff;
@@ -2171,7 +2205,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
 
         const float az = std::atan2(Y, X);
         const float el = std::atan2(Z, rxy);
-        const float u = (az - lidar_az_b_) * inv_az_a;
+        const float u = columnFromAzimuth(az, lidar_az_a_, lidar_az_b_, prev.cols);
         float v, inv_el_eff;
         if (use_el_lut) {
             float slope;
@@ -2195,7 +2229,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
             if (crxy2 < 1e-6f) { continue; }
             const float caz = std::atan2(cY, cX);
             const float cel = std::atan2(cZ, std::sqrt(crxy2));
-            u_ref = (caz - lidar_az_b_) * inv_az_a;
+            u_ref = columnFromAzimuth(caz, lidar_az_a_, lidar_az_b_, cur.cols);
             if (use_el_lut) {
                 float slope;
                 if (!rowFromElevationLut(lidar_el_lut_, cel, v_ref, slope)) { continue; }
@@ -2232,7 +2266,7 @@ void NanoGICP<PointSource, PointTarget>::accumulateLidarFlowResidual(
                 gv_px[k] = 0.5f * (bilinearSample(prev, uu, vv + 1.f) - bilinearSample(prev, uu, vv - 1.f));
                 ref_px[k] = image_ref
                     ? bilinearSample(cur, u_ref + static_cast<float>(du), v_ref + static_cast<float>(dv))
-                    : sp.reflectivity * inv_scale;
+                    : (lidar_image_use_dedicated_channel_ ? sp.lidar_intensity : sp.reflectivity) * inv_scale;
                 mean_mov += mov_px[k];
                 mean_ref += ref_px[k];
             }
