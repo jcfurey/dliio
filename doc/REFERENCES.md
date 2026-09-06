@@ -139,3 +139,29 @@ GenZ-ICP and FAST-LIVO2 are 2025, and LODESTAR is 2026, despite earlier years
 in their DOIs or preprints. PG-LIO and the cited NCC revision are recorded as
 preprints. The new September memo distinguishes published methods, local
 adaptations, observed replay results, and proposed experiments.
+
+## 7. Live failure and secondary IMU fusion — checked 2026-09-06
+
+The [live-run handoff](../../../docs/dliio-tunnel-live-run-2026-09-06.md)
+separates measured attitude departure from the proposed observer feedback
+mechanism. Re-reading `lopez2023observer` (model and observer equations) and
+`chen2023dlio` (observer, deskew, and registration initialization), alongside
+local `propagateState()` and `updateState()`, supports the coupling mechanism.
+These references do not identify the initiating failure in this recording.
+
+The installed `robot_localization` package is **3.10.0 on ROS 2 Lyrical**.
+The following primary documentation was read for the BNO80 feasibility work;
+these are documentation citations, not evidence of a completed EKF experiment.
+The linked `rolling-devel` pages can change after the access date.
+
+| BibTeX key | Primary source | Reading scope and use |
+|---|---|---|
+| `robotLocalizationConfiguration` | [Configuring robot_localization](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/doc/configuring_robot_localization.rst) | Sensor selection, correlated inputs, absolute/differential orientation, and covariance consistency; avoid treating DLIO pose, twist, and its primary IMU as independent measurements |
+| `robotLocalizationSensorData` | [Preparing Your Data](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/doc/preparing_sensor_data.rst) | Sensor/body/world frames, ENU convention, IMU mounting transforms, and covariance handling; the empirical BNO80 axis fit is not reviewed hardware calibration |
+| `robotLocalizationStateEstimation` | [State Estimation Nodes](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/doc/state_estimation_nodes.rst) | Filter configuration, rejection thresholds, diagnostics, and `publish_tf`; evaluate a separate output before any integration into the mapper |
+
+The BNO80 attitude payload contains no covariance despite its topic name.
+Its raw gyro and onboard attitude estimate also share sensor information.
+An EKF needs explicit frame and uncertainty treatment; adding a second
+physical IMU does not create an independent position reference or repair
+DLIO's internal registration and deskew feedback automatically.

@@ -12,6 +12,14 @@ largest measured texture bottleneck is **missing spatial support in the
 current sweep during the displacement search**. This is an estimator
 consistency result; trajectory accuracy is still unverified.
 
+**Subsequent live validation:** the 1× ROS replay with mapping and RViz
+developed a sustained attitude departure near 657–660 seconds, followed by
+rapid divergence near 709 seconds. The offline parity result does not
+establish live pipeline stability. The workspace
+[incident report and overnight handoff](../../../docs/dliio-tunnel-live-run-2026-09-06.md)
+records the saved map prefix, timing evidence, remaining uncertainties, and
+the recovered BNO80 streams for a separate fusion experiment.
+
 Research documentation was committed at dliio `86cebfc` and workspace
 `e10419f` before this implementation. The input, retained parameter profile,
 and original results are described in the workspace
