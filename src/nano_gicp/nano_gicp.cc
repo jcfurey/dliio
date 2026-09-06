@@ -1019,6 +1019,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     const Eigen::Isometry3f trans_init = trans;
     last_surface_texture_ = {};
     last_surface_texture_ratio_ = -1.f;
+    last_geometry_diagnostics_ = {};
     SurfaceTextureConstraint surface_constraint;
 
     // Fallback: if the target was registered without precomputed covariances
@@ -1098,6 +1099,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     bool pending_convergence = false;
     bool proposal_pending = false;
     bool texture_pending = true;
+    bool geometry_diagnostics_pending = geometry_diagnostics_enabled_;
     float next_alpha = current_alpha_, next_kernel_c = current_kernel_c_;
     float next_genz_alpha = current_genz_alpha_;
     update_correspondences(trans);
@@ -1132,11 +1134,21 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             cost = 0.0;
             linearize(trans, &H, &b, &cost, &H_geo);
 
+            if (geometry_diagnostics_pending) {
+                last_geometry_diagnostics_ = analyzeGeometry(H_geo,
+                    trans.cast<double>() * geometry_diagnostics_center_.cast<double>(),
+                    geometry_diagnostics_length_);
+                geometry_diagnostics_pending = false;
+            }
+
             if (texture_pending && surface_texture_weight_ > 0.f) {
+                last_surface_texture_.status = SurfaceTextureStatus::InvalidGeometry;
                 Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(H_geo.template block<3, 3>(3, 3));
                 if (eig.info() == Eigen::Success && eig.eigenvalues().allFinite() &&
                     eig.eigenvalues()(2) > 0.0) {
                     last_surface_texture_ratio_ = eig.eigenvalues()(0) / eig.eigenvalues()(2);
+                    last_surface_texture_.status = last_surface_texture_ratio_ < surface_texture_weak_ratio_
+                        ? SurfaceTextureStatus::MultipleWeakTranslations : SurfaceTextureStatus::TranslationStrong;
                     // A tunnel supplies one weak translation axis. If two axes are
                     // weak, a 1D search cannot separate the unknown motions.
                     if (last_surface_texture_ratio_ < surface_texture_weak_ratio_ &&
@@ -1144,6 +1156,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
                         const Eigen::Vector3f axis = eig.eigenvectors().col(0).cast<float>();
                         last_surface_texture_ = matchSurfaceTexture(surface_texture_source_,
                             surface_texture_previous_, trans, axis, surface_texture_config_);
+                        if (last_surface_texture_.status == SurfaceTextureStatus::NoReference) {
+                            last_surface_texture_.status = surface_texture_missing_reference_;
+                        }
                         if (last_surface_texture_.valid) {
                             surface_constraint.axis = axis;
                             surface_constraint.center = surface_texture_center_;
@@ -1541,6 +1556,19 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         trans = corr * trans_init;  // recompose
     }
 
+    if (last_geometry_diagnostics_.valid && trans.matrix().allFinite()) {
+        auto& diagnostic = last_geometry_diagnostics_;
+        const Eigen::Matrix3d rotation = trans.linear().cast<double>() * trans_init.linear().cast<double>().transpose();
+        const Eigen::AngleAxisd angle(Eigen::Quaterniond(rotation).normalized());
+        diagnostic.correction.head<3>() = diagnostic.length_scale * angle.angle() * angle.axis();
+        const Eigen::Vector3d center = geometry_diagnostics_center_.cast<double>();
+        diagnostic.correction.tail<3>() = trans.cast<double>() * center - trans_init.cast<double>() * center;
+        diagnostic.correction_projection = diagnostic.weakest.dot(diagnostic.correction);
+        if (last_surface_texture_.valid) {
+            diagnostic.texture_projection = std::abs(surface_constraint.axis.cast<double>().dot(
+                diagnostic.weakest.tail<3>()));
+        }
+    }
     this->final_transformation_ = trans.matrix();
     pcl::transformPointCloud(*this->input_, output, this->final_transformation_);
 }

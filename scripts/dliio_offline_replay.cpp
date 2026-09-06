@@ -71,7 +71,33 @@ struct OdomNodeTestAccess {
         << ',' << n.gicp.lastSurfaceTextureMatch().inliers
         << ',' << n.gicp.lastSurfaceTextureMatch().shift
         << ',' << n.gicp.lastSurfaceTextureMatch().sigma
-        << ',' << n.gicp.lastSurfaceTextureMatch().correlation << '\n';
+        << ',' << n.gicp.lastSurfaceTextureMatch().correlation;
+    const auto& texture = n.gicp.lastSurfaceTextureMatch();
+    const auto& rejected = texture.rejected;
+    out << ',' << static_cast<int>(texture.status)
+        << ',' << rejected.examined << ',' << rejected.nonfinite << ',' << rejected.spacing
+        << ',' << rejected.neighborhood << ',' << rejected.nonplanar << ',' << rejected.axis_normal
+        << ',' << rejected.reference_support << ',' << rejected.reference_contrast
+        << ',' << rejected.repeated << ',' << rejected.source_support << ',' << rejected.source_contrast
+        << ',' << rejected.boundary << ',' << rejected.low_correlation << ',' << rejected.ambiguous
+        << ',' << rejected.flat_peak;
+    const auto& geometry = n.gicp.lastGeometryDiagnostics();
+    out << ',' << geometry.valid << ',' << geometry.length_scale;
+    for (int i = 0; i < 6; ++i) { out << ',' << geometry.eigenvalues(i); }
+    for (int i = 0; i < 6; ++i) { out << ',' << geometry.weakest(i); }
+    for (int i = 0; i < 6; ++i) { out << ',' << geometry.correction(i); }
+    out << ',' << geometry.rotation_ratio << ',' << geometry.translation_ratio
+        << ',' << geometry.schur_ratio << ',' << geometry.schur_retained
+        << ',' << geometry.half_length_ratio << ',' << geometry.double_length_ratio
+        << ',' << geometry.correction_projection << ',' << geometry.texture_projection;
+    const Eigen::Quaternionf prior_q(n.T_prior.block<3, 3>(0, 0));
+    out << ',' << n.T_prior(0, 3) << ',' << n.T_prior(1, 3) << ',' << n.T_prior(2, 3)
+        << ',' << prior_q.x() << ',' << prior_q.y() << ',' << prior_q.z() << ',' << prior_q.w()
+        << ',' << n.state.b.gyro.x() << ',' << n.state.b.gyro.y() << ',' << n.state.b.gyro.z();
+    for (int i = 0; i < 6; ++i) {
+      for (int j = i; j < 6; ++j) { out << ',' << geometry.hessian(i, j); }
+    }
+    out << '\n';
   }
 };
 }
@@ -103,7 +129,24 @@ int main(int argc, char** argv) {
   if (!out) { throw std::runtime_error("cannot open output"); }
   // Preserve sub-millisecond differences even with Unix-epoch timestamps.
   out << std::setprecision(17);
-  out << "stamp,x,y,z,qx,qy,qz,qw,state_x,state_y,state_z,vx,vy,vz,compute_ms,wait_ms,points,flow_count,flow_rms,map_count,map_rms,rescued,degenerate,photo_count,photo_rms,deskew,keyframes,scan_stamp,aligned,imu_lead,converged,bax,bay,baz,geo_rot,geo_trans,held_trans,texture_weak_ratio,texture_valid,texture_candidates,texture_supported,texture_unique,texture_inliers,texture_shift,texture_sigma,texture_correlation\n";
+  out << "stamp,x,y,z,qx,qy,qz,qw,state_x,state_y,state_z,vx,vy,vz,compute_ms,wait_ms,points,flow_count,flow_rms,map_count,map_rms,rescued,degenerate,photo_count,photo_rms,deskew,keyframes,scan_stamp,aligned,imu_lead,converged,bax,bay,baz,geo_rot,geo_trans,held_trans,texture_weak_ratio,texture_valid,texture_candidates,texture_supported,texture_unique,texture_inliers,texture_shift,texture_sigma,texture_correlation";
+  out << ",texture_status,texture_examined,texture_rej_nonfinite,texture_rej_spacing"
+         ",texture_rej_neighborhood,texture_rej_nonplanar,texture_rej_axis_normal"
+         ",texture_rej_reference_support,texture_rej_reference_contrast,texture_rej_repeated"
+         ",texture_rej_source_support,texture_rej_source_contrast,texture_rej_boundary"
+         ",texture_rej_low_correlation,texture_rej_ambiguous,texture_rej_flat_peak"
+         ",geometry_valid,geometry_length";
+  for (int i = 0; i < 6; ++i) { out << ",geometry_eig_" << i; }
+  for (int i = 0; i < 6; ++i) { out << ",geometry_mode_" << i; }
+  for (int i = 0; i < 6; ++i) { out << ",geometry_correction_" << i; }
+  out << ",geometry_rot_ratio,geometry_trans_ratio,geometry_schur_ratio,geometry_schur_retained"
+         ",geometry_half_length_ratio,geometry_double_length_ratio"
+         ",geometry_correction_projection,geometry_texture_projection"
+         ",prior_x,prior_y,prior_z,prior_qx,prior_qy,prior_qz,prior_qw,bgx,bgy,bgz";
+  for (int i = 0; i < 6; ++i) {
+    for (int j = i; j < 6; ++j) { out << ",geometry_h_" << i << '_' << j; }
+  }
+  out << '\n';
   rclcpp::init(argc, argv);
   auto node = std::make_shared<dlio::OdomNode>();
   auto clock = node->get_clock()->get_clock_handle();

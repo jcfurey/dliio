@@ -131,6 +131,7 @@ Wiring into a fusion/navigation stack: feed `dlio/odom_node/odom` to `robot_loca
 
 ## Notes & findings
 
+- [Moving-head tunnel diagnostics](doc/TUNNEL_DIAGNOSTICS.md) — centered geometry matrices, texture rejection accounting, replay parity, and measured limits on the curved-tunnel hypothesis.
 - [Curved-tunnel research, 2026-09-05](doc/TUNNEL_RESEARCH_2026-09-05.md) — September Exyn moving-head VLP-16 evidence, coupled yaw/translation ambiguity, surface-texture support, and prioritized validation experiments.
 - [References](doc/REFERENCES.md) and [tunnel bibliography](doc/tunnel_references.bib) — primary sources, publication metadata, reading scope, and differences between published methods and local adaptations.
 - `doc/VISUAL_TERM.md` — design of the optional direct-photometric anchors (camera frame-to-frame / frame-to-map, and the COIN-LIO LiDAR intensity-image term), the degeneracy-gate safety floor, parameters, and tests.

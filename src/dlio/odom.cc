@@ -386,6 +386,14 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->gicp.setSurfaceTextureConfig(textureConfig,
       this->surface_texture_enabled_ ? textureWeight : 0.f, textureWeakRatio);
 
+  bool geometryDiagnostics;
+  double geometryLength;
+  dlio::declare_param(this, "odom/gicp/geometryDiagnostics/enabled", geometryDiagnostics, false,
+      "Read-only scan-centered full geometry spectrum at the prior; requires restart");
+  dlio::declare_param(this, "odom/gicp/geometryDiagnostics/lengthScale", geometryLength, 5.0,
+      "Characteristic length for diagnostic rotation/translation scaling [m]; requires restart", 0.01, 1000.0);
+  this->gicp.setGeometryDiagnostics(geometryDiagnostics, geometryLength);
+
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
@@ -1557,6 +1565,11 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
     if (p.get_name().rfind("odom/gicp/surfaceTexture/", 0) == 0) {
       result.successful = false;
       result.reason = "Surface texture settings require a node restart";
+      return result;
+    }
+    if (p.get_name().rfind("odom/gicp/geometryDiagnostics/", 0) == 0) {
+      result.successful = false;
+      result.reason = "Geometry diagnostic settings require a node restart";
       return result;
     }
   }
@@ -2891,11 +2904,13 @@ void dlio::OdomNode::getNextPose() {
   }
 
   // Align with current submap with global IMU transformation as initial guess
+  this->gicp.setGeometryAnalysisCenter(this->T_prior.block<3, 1>(0, 3));
   this->gicp.setSurfaceTextureFrames(this->surface_texture_current_,
       (this->scan_stamp > this->surface_texture_previous_stamp_ &&
        this->scan_stamp - this->surface_texture_previous_stamp_ < 1.0)
           ? this->surface_texture_previous_ : nullptr,
-      this->T_prior.block<3, 1>(0, 3));
+      this->T_prior.block<3, 1>(0, 3), this->surface_texture_previous_
+          ? nano_gicp::SurfaceTextureStatus::FrameGap : nano_gicp::SurfaceTextureStatus::NoReference);
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
@@ -4299,6 +4314,7 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
   const auto& texture = this->gicp.lastSurfaceTextureMatch();
+  kv("Surface Texture Status", nano_gicp::surfaceTextureStatusName(texture.status));
   kv("Surface Texture Accepted", texture.valid ? "true" : "false");
   kv("Surface Texture Candidates", std::to_string(texture.candidates));
   kv("Surface Texture Supported", std::to_string(texture.supported));
@@ -4308,6 +4324,42 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Surface Texture Sigma [m]", fnum(texture.sigma, 4));
   kv("Surface Texture Correlation", fnum(texture.correlation, 4));
   kv("Surface Texture Geometry Ratio", fnum(this->gicp.lastSurfaceTextureWeakRatio(), 4));
+  const auto& rejected = texture.rejected;
+  kv("Surface Texture Anchors Examined", std::to_string(rejected.examined));
+  kv("Surface Texture Reject Nonfinite", std::to_string(rejected.nonfinite));
+  kv("Surface Texture Reject Spacing", std::to_string(rejected.spacing));
+  kv("Surface Texture Reject Neighborhood", std::to_string(rejected.neighborhood));
+  kv("Surface Texture Reject Nonplanar", std::to_string(rejected.nonplanar));
+  kv("Surface Texture Reject Axis Normal", std::to_string(rejected.axis_normal));
+  kv("Surface Texture Reject Reference Support", std::to_string(rejected.reference_support));
+  kv("Surface Texture Reject Reference Contrast", std::to_string(rejected.reference_contrast));
+  kv("Surface Texture Reject Repeated", std::to_string(rejected.repeated));
+  kv("Surface Texture Reject Source Support", std::to_string(rejected.source_support));
+  kv("Surface Texture Reject Source Contrast", std::to_string(rejected.source_contrast));
+  kv("Surface Texture Reject Boundary", std::to_string(rejected.boundary));
+  kv("Surface Texture Reject Low Correlation", std::to_string(rejected.low_correlation));
+  kv("Surface Texture Reject Ambiguous", std::to_string(rejected.ambiguous));
+  kv("Surface Texture Reject Flat Peak", std::to_string(rejected.flat_peak));
+  const auto& geometry = this->gicp.lastGeometryDiagnostics();
+  kv("Geometry Analysis Valid", geometry.valid ? "true" : "false");
+  kv("Geometry Analysis Length [m]", fnum(geometry.length_scale, 4));
+  for (int i = 0; i < 6; ++i) {
+    kv("Geometry Eigenvalue " + std::to_string(i), fnum(geometry.eigenvalues(i), 6));
+    kv("Geometry Weak Mode " + std::to_string(i), fnum(geometry.weakest(i), 6));
+    kv("Geometry Correction " + std::to_string(i), fnum(geometry.correction(i), 6));
+    for (int j = i; j < 6; ++j) {
+      kv("Geometry Centered Hessian " + std::to_string(i) + "," + std::to_string(j),
+          fnum(geometry.hessian(i, j), 6));
+    }
+  }
+  kv("Geometry Centered Rotation Ratio", fnum(geometry.rotation_ratio, 8));
+  kv("Geometry Translation Ratio", fnum(geometry.translation_ratio, 8));
+  kv("Geometry Schur Ratio", fnum(geometry.schur_ratio, 8));
+  kv("Geometry Schur Retained", fnum(geometry.schur_retained, 8));
+  kv("Geometry Half Length Ratio", fnum(geometry.half_length_ratio, 8));
+  kv("Geometry Double Length Ratio", fnum(geometry.double_length_ratio, 8));
+  kv("Geometry Correction Weak Projection [m]", fnum(geometry.correction_projection, 6));
+  kv("Geometry Texture Weak Projection", fnum(geometry.texture_projection, 6));
   kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));
   kv("Photometric Kernel Scale", fnum(this->gicp.lastKernelScale(), 4));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");

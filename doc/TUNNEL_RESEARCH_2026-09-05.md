@@ -4,6 +4,10 @@ Research date: **2026-09-05**. Implementation baseline: dliio
 `e6c70db9a42194ecc70b1b428e7d87177c72ca65`; workspace experiment record:
 `96ddc7de12a372036ff369ed0c876e32d0dd69c4`.
 
+The subsequent [diagnostic implementation and replay](TUNNEL_DIAGNOSTICS.md)
+tests the first recommendation below. Its measured rejection breakdown and
+geometry results update the hypotheses in this research snapshot.
+
 **The next experiment should measure coupled yaw/translation ambiguity and
 explain the long gaps in usable surface texture.** Increasing intensity weight
 alone is poorly justified: the current measurement is intermittent, and its

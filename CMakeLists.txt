@@ -114,6 +114,7 @@ target_link_libraries(nanoflann ${PCL_LIBRARIES})
 add_library(nano_gicp STATIC
   src/nano_gicp/nano_gicp.cc
   src/nano_gicp/surface_texture.cc
+  src/nano_gicp/geometry_diagnostics.cc
 )
 set_target_properties(nano_gicp PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_definitions(nano_gicp PRIVATE PCL_NO_PRECOMPILE)
@@ -262,6 +263,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_surface_texture test/test_surface_texture.cpp)
   target_link_libraries(test_surface_texture nano_gicp)
+
+  ament_add_gtest(test_geometry_diagnostics test/test_geometry_diagnostics.cpp)
+  target_link_libraries(test_geometry_diagnostics nano_gicp)
 
   # MapNode creates SavePCD; make its generated runtime type support available
   # even when testing the build tree before installation.

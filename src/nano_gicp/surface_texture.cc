@@ -53,18 +53,41 @@ bool sample(const TextureCloud& cloud, const Tree& tree, const Eigen::Vector3f& 
 }
 }  // namespace
 
+const char* surfaceTextureStatusName(SurfaceTextureStatus status) {
+  switch (status) {
+    case SurfaceTextureStatus::Disabled: return "disabled";
+    case SurfaceTextureStatus::NoSource: return "no_source";
+    case SurfaceTextureStatus::NoReference: return "no_reference";
+    case SurfaceTextureStatus::FrameGap: return "frame_gap";
+    case SurfaceTextureStatus::InvalidInput: return "invalid_input";
+    case SurfaceTextureStatus::InvalidGeometry: return "invalid_geometry";
+    case SurfaceTextureStatus::TranslationStrong: return "translation_strong";
+    case SurfaceTextureStatus::MultipleWeakTranslations: return "multiple_weak_translations";
+    case SurfaceTextureStatus::TooFewUnique: return "too_few_unique";
+    case SurfaceTextureStatus::ShiftDisagreement: return "shift_disagreement";
+    case SurfaceTextureStatus::TooFewInliers: return "too_few_inliers";
+    case SurfaceTextureStatus::LowConsensus: return "low_consensus";
+    case SurfaceTextureStatus::Accepted: return "accepted";
+  }
+  return "invalid_status";
+}
+
 SurfaceTextureMatch matchSurfaceTexture(
     const TextureCloud::ConstPtr& source, const TextureCloud::ConstPtr& reference,
     const Eigen::Isometry3f& source_to_reference, const Eigen::Vector3f& direction,
     const SurfaceTextureConfig& config) {
   SurfaceTextureMatch result;
-  if (!source || !reference || source->size() < 32 || reference->size() < 32 ||
+  if (!source) { result.status = SurfaceTextureStatus::NoSource; return result; }
+  if (!reference) { result.status = SurfaceTextureStatus::NoReference; return result; }
+  result.status = SurfaceTextureStatus::InvalidInput;
+  if (source->size() < 32 || reference->size() < 32 ||
       !source_to_reference.matrix().allFinite() || !direction.allFinite() ||
       direction.norm() < 0.5f || !(config.search_radius >= 0.12f) ||
       !(config.sample_radius > 0.f) || !(config.min_std > 0.f) ||
       config.max_patches < 1 || config.min_patches < 3) { return result; }
   // Bounds prevent accidental pathological work from non-ROS API callers too.
   if (config.search_radius > 2.f || config.max_patches > 1000) { return result; }
+  result.status = SurfaceTextureStatus::TooFewUnique;
   const Eigen::Vector3f axis = direction.normalized();
   const Eigen::Isometry3f inverse = source_to_reference.inverse();
   Tree source_tree(false), reference_tree(false);
@@ -78,19 +101,20 @@ SurfaceTextureMatch matchSurfaceTexture(
 
   for (size_t index = 0; index < reference->size(); index += stride) {
     if (result.candidates >= config.max_patches) { break; }
+    ++result.rejected.examined;
     const auto& anchor = (*reference)[index];
     const Eigen::Vector3f center = anchor.getVector3fMap();
-    if (!center.allFinite()) { continue; }
+    if (!center.allFinite()) { ++result.rejected.nonfinite; continue; }
     bool near = false;
     for (const auto& c : centers) {
       if ((center - c).squaredNorm() < 0.36f) { near = true; break; }
     }
-    if (near) { continue; }
+    if (near) { ++result.rejected.spacing; continue; }
 
     std::vector<int> ids(20);
     std::vector<float> distances(20);
     const int found = reference_tree.nearestKSearch(anchor, 20, ids, distances);
-    if (found < 12 || distances.back() > 0.25f) { continue; }
+    if (found < 12 || distances.back() > 0.25f) { ++result.rejected.neighborhood; continue; }
     Eigen::Vector3f mean = Eigen::Vector3f::Zero();
     for (int id : ids) { mean += (*reference)[id].getVector3fMap() - center; }
     mean /= found;
@@ -102,9 +126,9 @@ SurfaceTextureMatch matchSurfaceTexture(
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> eig(covariance);
     if (eig.info() != Eigen::Success || !eig.eigenvalues().allFinite() ||
         eig.eigenvalues()(1) < 1e-4f ||
-        eig.eigenvalues()(0) > 0.08f * eig.eigenvalues()(1)) { continue; }
+        eig.eigenvalues()(0) > 0.08f * eig.eigenvalues()(1)) { ++result.rejected.nonplanar; continue; }
     const Eigen::Vector3f normal = eig.eigenvectors().col(0);
-    if (std::abs(normal.dot(axis)) > 0.25f) { continue; }
+    if (std::abs(normal.dot(axis)) > 0.25f) { ++result.rejected.axis_normal; continue; }
     const Eigen::Vector3f along = (axis - normal * normal.dot(axis)).normalized();
     const Eigen::Vector3f across = normal.cross(along);
     std::array<Eigen::Vector3f, kSamples> positions;
@@ -120,7 +144,8 @@ SurfaceTextureMatch matchSurfaceTexture(
         valid &= sample(*reference, reference_tree, positions[k], config.sample_radius, ref(k));
       }
     }
-    if (!valid || !normalize(ref, config.min_std)) { continue; }
+    if (!valid) { ++result.rejected.reference_support; continue; }
+    if (!normalize(ref, config.min_std)) { ++result.rejected.reference_contrast; continue; }
     ++result.candidates;
     centers.push_back(center);
 
@@ -140,7 +165,7 @@ SurfaceTextureMatch matchSurfaceTexture(
         repeated = true;
       }
     }
-    if (repeated) { continue; }
+    if (repeated) { ++result.rejected.repeated; continue; }
 
     std::array<float, 2 * half_steps + 1> scores;
     for (int s = -half_steps; s <= half_steps && valid; ++s) {
@@ -153,7 +178,10 @@ SurfaceTextureMatch matchSurfaceTexture(
           valid = false; break;
         }
       }
-      if (!valid || !normalize(cur, config.min_std)) { valid = false; break; }
+      if (!valid) { ++result.rejected.source_support; break; }
+      if (!normalize(cur, config.min_std)) {
+        ++result.rejected.source_contrast; valid = false; break;
+      }
       scores[s + half_steps] = ref.dot(cur);
     }
     // Every candidate uses the identical, fully supported patch. Otherwise
@@ -161,14 +189,15 @@ SurfaceTextureMatch matchSurfaceTexture(
     if (!valid) { continue; }
     ++result.supported;
     const int best = std::max_element(scores.begin(), scores.end()) - scores.begin();
-    if (best == 0 || best == 2 * half_steps || scores[best] < 0.7f) { continue; }
+    if (best == 0 || best == 2 * half_steps) { ++result.rejected.boundary; continue; }
+    if (scores[best] < 0.7f) { ++result.rejected.low_correlation; continue; }
     float second = -1.f;
     for (int j = 0; j <= 2 * half_steps; ++j) {
       if (std::abs(j - best) * step >= 0.12f) { second = std::max(second, scores[j]); }
     }
-    if (scores[best] - second < 0.04f) { continue; }
+    if (scores[best] - second < 0.04f) { ++result.rejected.ambiguous; continue; }
     const float curvature = 2.f * scores[best] - scores[best - 1] - scores[best + 1];
-    if (!(curvature > 1e-4f)) { continue; }
+    if (!(curvature > 1e-4f)) { ++result.rejected.flat_peak; continue; }
     const float substep = std::clamp(0.5f * (scores[best + 1] - scores[best - 1]) / curvature, -0.5f, 0.5f);
     shifts.push_back((best - half_steps + substep) * step);
     correlations.push_back(scores[best]);
@@ -180,7 +209,7 @@ SurfaceTextureMatch matchSurfaceTexture(
   for (float shift : shifts) { errors.push_back(std::abs(shift - location)); }
   const float sigma = 1.4826f * median(errors);
   // Conflicting patch motions are not a confident translation measurement.
-  if (sigma > 0.08f) { return result; }
+  if (sigma > 0.08f) { result.status = SurfaceTextureStatus::ShiftDisagreement; return result; }
   std::vector<float> inliers;
   float correlation = 0.f;
   for (size_t i = 0; i < shifts.size(); ++i) {
@@ -189,7 +218,9 @@ SurfaceTextureMatch matchSurfaceTexture(
     }
   }
   result.inliers = inliers.size();
-  if (result.inliers < config.min_patches || result.inliers < 0.6f * result.unique) { return result; }
+  if (result.inliers < config.min_patches) { result.status = SurfaceTextureStatus::TooFewInliers; return result; }
+  if (result.inliers < 0.6f * result.unique) { result.status = SurfaceTextureStatus::LowConsensus; return result; }
+  result.status = SurfaceTextureStatus::Accepted;
   result.valid = true;
   result.shift = median(inliers);
   result.sigma = std::max(0.03f, sigma); // correlated samples: no sqrt(N) precision claim

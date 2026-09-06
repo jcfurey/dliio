@@ -484,6 +484,20 @@ TEST_F(PointCloudChannels, MissingChannelsCannotBeLiveEnabledOrCreateAnImage) {
   EXPECT_FALSE(Access::photometricActive(node));
 }
 
+TEST_F(PointCloudChannels, GeometryDiagnosticStartupSettingsRejectAtomicLiveChanges) {
+  auto opts = options();
+  opts.append_parameter_override("odom/gicp/geometryDiagnostics/enabled", true);
+  dlio::OdomNode node(opts);
+  const auto result = node.set_parameters_atomically({
+      rclcpp::Parameter("odom/gicp/photometricWeight", 0.3),
+      rclcpp::Parameter("odom/gicp/geometryDiagnostics/lengthScale", 10.0)});
+  EXPECT_FALSE(result.successful);
+  EXPECT_NE(result.reason.find("restart"), std::string::npos);
+  Access::applyLiveParams(node);
+  EXPECT_FALSE(Access::photometricActive(node));
+  EXPECT_DOUBLE_EQ(node.get_parameter("odom/gicp/geometryDiagnostics/lengthScale").as_double(), 5.0);
+}
+
 TEST(PointCloudScalarField, ReadsUnalignedBigEndianValues) {
   sensor_msgs::msg::PointCloud2 msg;
   msg.width = msg.height = 1;

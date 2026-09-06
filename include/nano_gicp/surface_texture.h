@@ -20,7 +20,29 @@ struct SurfaceTextureConfig {
   int min_patches = 8;
 };
 
+enum class SurfaceTextureStatus {
+  Disabled, NoSource, NoReference, FrameGap, InvalidInput, InvalidGeometry,
+  TranslationStrong, MultipleWeakTranslations, TooFewUnique, ShiftDisagreement,
+  TooFewInliers, LowConsensus, Accepted
+};
+
+const char* surfaceTextureStatusName(SurfaceTextureStatus status);
+
+// First failing check per examined anchor / candidate / supported patch.
+// examined = pre-candidate rejections + candidates
+// candidates = repeated + source_support + source_contrast + supported
+// supported = boundary + low_correlation + ambiguous + flat_peak + unique
+struct SurfaceTextureRejections {
+  int examined = 0;
+  int nonfinite = 0, spacing = 0, neighborhood = 0, nonplanar = 0, axis_normal = 0;
+  int reference_support = 0, reference_contrast = 0;
+  int repeated = 0, source_support = 0, source_contrast = 0;
+  int boundary = 0, low_correlation = 0, ambiguous = 0, flat_peak = 0;
+};
+
 struct SurfaceTextureMatch {
+  SurfaceTextureStatus status = SurfaceTextureStatus::Disabled;
+  SurfaceTextureRejections rejected;
   bool valid = false;
   int candidates = 0;
   int supported = 0;

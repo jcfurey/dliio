@@ -42,6 +42,7 @@
 
 #include "nano_gicp/nanoflann_adaptor.h"
 #include "nano_gicp/surface_texture.h"
+#include "nano_gicp/geometry_diagnostics.h"
 
 namespace nano_gicp {
 
@@ -232,13 +233,23 @@ public:
   }
   void setSurfaceTextureFrames(const TextureCloud::ConstPtr& source,
                                const TextureCloud::ConstPtr& previous,
-                               const Eigen::Vector3f& scan_center) {
+                               const Eigen::Vector3f& scan_center,
+                               SurfaceTextureStatus missing_reference = SurfaceTextureStatus::NoReference) {
     surface_texture_source_ = source;
     surface_texture_previous_ = previous;
     surface_texture_center_ = scan_center;
+    surface_texture_missing_reference_ = missing_reference;
   }
   const SurfaceTextureMatch& lastSurfaceTextureMatch() const { return last_surface_texture_; }
   float lastSurfaceTextureWeakRatio() const { return last_surface_texture_ratio_; }
+  // Optional diagnostic copy of the initial geometry system; never gates,
+  // reweights, or otherwise changes registration. Center is in source coords.
+  void setGeometryDiagnostics(bool enabled, double length_scale = 5.0) {
+    geometry_diagnostics_enabled_ = enabled;
+    geometry_diagnostics_length_ = length_scale;
+  }
+  void setGeometryAnalysisCenter(const Eigen::Vector3f& center) { geometry_diagnostics_center_ = center; }
+  const GeometryDiagnostics& lastGeometryDiagnostics() const { return last_geometry_diagnostics_; }
   // Geometric observability telemetry from the last align(): the rotation /
   // translation Hessian block's weakest-axis eigenvalue divided by the gate
   // threshold. >1 = above the gate (trusted), <1 = held as degenerate, ~1 =
@@ -619,6 +630,11 @@ protected:
   TextureCloud::ConstPtr surface_texture_source_, surface_texture_previous_;
   Eigen::Vector3f surface_texture_center_ = Eigen::Vector3f::Zero();
   SurfaceTextureMatch last_surface_texture_;
+  SurfaceTextureStatus surface_texture_missing_reference_ = SurfaceTextureStatus::NoReference;
+  bool geometry_diagnostics_enabled_ = false;
+  double geometry_diagnostics_length_ = 5.0;
+  Eigen::Vector3f geometry_diagnostics_center_ = Eigen::Vector3f::Zero();
+  GeometryDiagnostics last_geometry_diagnostics_;
   float degeneracy_thresh_ratio_;
   float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
   // Probabilistic gate (Hatleskog & Alexis RA-L 2024 adaptation); off -> the

@@ -121,6 +121,47 @@ TEST(SurfaceTexture, OpposingPatchMotionsRejectTheMeasurement) {
   const auto match = nano_gicp::matchSurfaceTexture(source, walls(0.f),
       Eigen::Isometry3f::Identity(), Eigen::Vector3f::UnitX());
   EXPECT_FALSE(match.valid);
+  // A slight majority puts the median inside one cluster, but neither
+  // incompatible wall motion supplies the required 60% agreement.
+  EXPECT_EQ(match.status, nano_gicp::SurfaceTextureStatus::LowConsensus);
+  EXPECT_GE(match.inliers, 8);
+  EXPECT_LT(match.inliers, 0.6f * match.unique);
+}
+
+TEST(SurfaceTexture, DiagnosticsSeparateTextureAbsenceRepetitionAndMissingCoverage) {
+  const auto textured = walls(0.f);
+  const auto accounting = [](const nano_gicp::SurfaceTextureMatch& m) {
+    const auto& r = m.rejected;
+    EXPECT_EQ(r.examined, r.nonfinite + r.spacing + r.neighborhood + r.nonplanar +
+        r.axis_normal + r.reference_support + r.reference_contrast + m.candidates);
+    EXPECT_EQ(m.candidates, r.repeated + r.source_support + r.source_contrast + m.supported);
+    EXPECT_EQ(m.supported, r.boundary + r.low_correlation + r.ambiguous + r.flat_peak + m.unique);
+    EXPECT_EQ(m.valid, m.status == nano_gicp::SurfaceTextureStatus::Accepted);
+  };
+  const auto match = [&](TextureCloud::Ptr source, TextureCloud::Ptr reference) {
+    const auto m = nano_gicp::matchSurfaceTexture(source, reference,
+        Eigen::Isometry3f::Identity(), Eigen::Vector3f::UnitX());
+    accounting(m);
+    return m;
+  };
+  const auto blank_reference = match(textured, walls(0.f, 0));
+  EXPECT_GT(blank_reference.rejected.reference_contrast, 0);
+  EXPECT_EQ(blank_reference.candidates, 0);
+  const auto blank_source = match(walls(0.f, 0), textured);
+  EXPECT_GT(blank_source.rejected.source_contrast, 0);
+  EXPECT_FALSE(blank_source.valid);
+  const auto periodic = match(walls(0.12f, 2), walls(0.f, 2));
+  EXPECT_GT(periodic.rejected.repeated, 0);
+  EXPECT_FALSE(periodic.valid);
+  const auto absent = match(walls(20.f), textured);
+  EXPECT_GT(absent.rejected.source_support, 0);
+  EXPECT_EQ(absent.supported, 0);
+  const auto boundary = match(walls(0.4f), textured);
+  EXPECT_GT(boundary.rejected.boundary, 0);
+  EXPECT_FALSE(boundary.valid);
+  EXPECT_TRUE(match(walls(0.13f), textured).valid);
+  EXPECT_EQ(match(nullptr, textured).status, nano_gicp::SurfaceTextureStatus::NoSource);
+  EXPECT_EQ(match(textured, nullptr).status, nano_gicp::SurfaceTextureStatus::NoReference);
 }
 
 TEST(SurfaceTexture, CommonWorldRotationAndTranslationPreserveTheMeasurement) {
@@ -203,13 +244,27 @@ TEST(SurfaceTextureRegistration, MeasurementCorrectsWeakTranslationInThePoseSolv
     ASSERT_TRUE(g.lastSurfaceTextureMatch().valid);
     EXPECT_NEAR(g.getFinalTransformation()(0, 3), motion, 0.025f);
     EXPECT_LT((g.getFinalTransformation().block<2, 1>(1, 3).norm()), 0.01f);
+    const Eigen::Matrix4f without_diagnostics = g.getFinalTransformation();
+    const auto texture_without = g.lastSurfaceTextureMatch();
+    EXPECT_FALSE(g.lastGeometryDiagnostics().valid);
+    g.setGeometryDiagnostics(true, 5.0);
+    g.align(aligned, prior);
+    ASSERT_TRUE(g.lastGeometryDiagnostics().valid);
+    EXPECT_TRUE((g.getFinalTransformation().array() == without_diagnostics.array()).all());
+    EXPECT_FLOAT_EQ(g.lastSurfaceTextureMatch().shift, texture_without.shift);
+    EXPECT_EQ(g.lastSurfaceTextureMatch().inliers, texture_without.inliers);
+    EXPECT_GE(g.lastGeometryDiagnostics().texture_projection, 0.0);
+    g.setGeometryDiagnostics(false);
     // Fully observed geometry (ratio threshold zero) must get no constraint;
     // a previous successful scan must not leave a stale measurement behind.
     g.setSurfaceTextureConfig({}, 100.f, 0.f);
     g.align(aligned, prior);
     EXPECT_FALSE(g.lastSurfaceTextureMatch().valid);
+    EXPECT_EQ(g.lastSurfaceTextureMatch().status, nano_gicp::SurfaceTextureStatus::TranslationStrong);
+    EXPECT_FALSE(g.lastGeometryDiagnostics().valid);
     g.setSurfaceTextureConfig({}, 0.f, 0.05f);
     g.align(aligned, prior);
     EXPECT_FALSE(g.lastSurfaceTextureMatch().valid);
+    EXPECT_EQ(g.lastSurfaceTextureMatch().status, nano_gicp::SurfaceTextureStatus::Disabled);
   }
 }
