@@ -1,5 +1,12 @@
 # Robustness research — papers & packages, lensed to dliio
 
+**Scope update, 2026-09-05:** this historical survey primarily concerns the
+earlier Ouster setup and water-pool failure. The September Exyn moving-head
+VLP-16 investigation has a separate
+[curved-tunnel research memo](TUNNEL_RESEARCH_2026-09-05.md) and
+[updated citation inventory](REFERENCES.md). Sensor-field assumptions and
+empirical conclusions from the two setups must be evaluated separately.
+
 > Reference survey (2026-06-17/18) of techniques from the literature and
 > open-source packages that would make dliio more robust, with a dliio-specific
 > "what's portable and how invasive" shortlist. Companion to

@@ -1,0 +1,286 @@
+% Selected sources for TUNNEL_RESEARCH_2026-09-05.md.
+% Checked 2026-09-05 against primary manuscripts, publisher/DOI records,
+% author repositories, and manufacturer documentation.
+% Read scope and implementation differences are recorded in REFERENCES.md.
+% Journal years refer to the issue, not the year embedded in the DOI.
+
+@inproceedings{chen2023dlio,
+  author = {Chen, Kenny and Nemiroff, Ryan and Lopez, Brett T.},
+  title = {{Direct LiDAR-Inertial Odometry: Lightweight LIO with Continuous-Time Motion Correction}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year = {2023},
+  pages = {3983--3989},
+  doi = {10.1109/ICRA48891.2023.10160508},
+  url = {https://arxiv.org/abs/2203.03749}
+}
+
+@misc{lopez2023observer,
+  author = {Lopez, Brett T.},
+  title = {{A Contracting Hierarchical Observer for Pose-Inertial Fusion}},
+  year = {2023},
+  eprint = {2303.02777},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2303.02777},
+  note = {Preprint}
+}
+
+@misc{koideFastGicp,
+  author = {Koide, Kenji and contributors},
+  title = {{fast\_gicp: Least-Squares Registration and FastGICP Implementation}},
+  url = {https://github.com/koide3/fast_gicp},
+  urldate = {2026-09-05},
+  note = {Software; inspected step\_lm, linearize, and compute\_error in include/fast\_gicp/gicp/impl}
+}
+
+@inproceedings{zhang2016degeneracy,
+  author = {Zhang, Ji and Kaess, Michael and Singh, Sanjiv},
+  title = {{On Degeneracy of Optimization-Based State Estimation Problems}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year = {2016},
+  pages = {809--816},
+  doi = {10.1109/ICRA.2016.7487211},
+  url = {https://www.cs.cmu.edu/~kaess/pub/Zhang16icra.pdf}
+}
+
+@article{tuna2024xicp,
+  author = {Tuna, Turcan and Nubert, Julian and Nava, Yoshua and Khattak, Shehryar and Hutter, Marco},
+  title = {{X-ICP: Localizability-Aware LiDAR Registration for Robust Localization in Extreme Environments}},
+  journal = {IEEE Transactions on Robotics},
+  year = {2024},
+  volume = {40},
+  pages = {452--471},
+  doi = {10.1109/TRO.2023.3335691},
+  url = {https://arxiv.org/abs/2211.16335}
+}
+
+@article{hatleskog2024probabilistic,
+  author = {Hatleskog, Johan and Alexis, Kostas},
+  title = {{Probabilistic Degeneracy Detection for Point-to-Plane Error Minimization}},
+  journal = {IEEE Robotics and Automation Letters},
+  year = {2024},
+  volume = {9},
+  number = {12},
+  pages = {11234--11241},
+  doi = {10.1109/LRA.2024.3484153},
+  url = {https://arxiv.org/abs/2410.10784}
+}
+
+@article{tuna2025informed,
+  author = {Tuna, Turcan and Nubert, Julian and Pfreundschuh, Patrick and Cadena, Cesar and Khattak, Shehryar and Hutter, Marco},
+  title = {{Informed, Constrained, Aligned: A Field Analysis on Degeneracy-aware Point Cloud Registration in the Wild}},
+  journal = {IEEE Transactions on Field Robotics},
+  year = {2025},
+  volume = {2},
+  pages = {485--515},
+  doi = {10.1109/TFR.2025.3576053},
+  url = {https://arxiv.org/abs/2408.11809}
+}
+
+@inproceedings{bonnabel2016covariance,
+  author = {Bonnabel, Silv{\`e}re and Barczyk, Martin and Goulette, Fran{\c{c}}ois},
+  title = {{On the Covariance of ICP-Based Scan-Matching Techniques}},
+  booktitle = {American Control Conference (ACC)},
+  year = {2016},
+  pages = {5498--5503},
+  doi = {10.1109/ACC.2016.7526532},
+  url = {https://arxiv.org/abs/1410.7632}
+}
+
+@phdthesis{mcdermott2025scanmatching,
+  author = {McDermott, Matthew C.},
+  title = {{Building LiDAR Scan Matching Algorithms for Safety-Critical Systems}},
+  school = {Tufts University},
+  year = {2025},
+  month = feb,
+  url = {https://dl.tufts.edu/downloads/w9505f71j},
+  note = {Section 2.8, printed pages 46--47: repeated structures and coupled curved-tunnel ambiguity}
+}
+
+@inproceedings{pfreundschuh2024coin,
+  author = {Pfreundschuh, Patrick and Oleynikova, Helen and Cadena, Cesar and Siegwart, Roland and Andersson, Olov},
+  title = {{COIN-LIO: Complementary Intensity-Augmented LiDAR Inertial Odometry}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year = {2024},
+  pages = {1730--1737},
+  url = {https://arxiv.org/abs/2310.01235}
+}
+
+@misc{khedekar2025pglio,
+  author = {Khedekar, Nikhil and Alexis, Kostas},
+  title = {{PG-LIO: Photometric-Geometric Fusion for Robust LiDAR-Inertial Odometry}},
+  year = {2025},
+  eprint = {2506.18583},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2506.18583},
+  note = {Preprint; author implementation is ntnu-arl/mimosa}
+}
+
+@misc{woodford2022ncc,
+  author = {Woodford, Oliver J.},
+  title = {{Least Squares Normalized Cross Correlation}},
+  year = {2022},
+  eprint = {1810.04320},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/1810.04320v3},
+  note = {Preprint, revision 3; first posted 2018; not a TPAMI publication}
+}
+
+@article{zhang2023rilio,
+  author = {Zhang, Yanfeng and Tian, Yunong and Wang, Wanguo and Yang, Guodong and Li, Zhishuo and Jing, Fengshui and Tan, Min},
+  title = {{RI-LIO: Reflectivity Image Assisted Tightly-Coupled LiDAR-Inertial Odometry}},
+  journal = {IEEE Robotics and Automation Letters},
+  year = {2023},
+  volume = {8},
+  number = {3},
+  pages = {1802--1809},
+  doi = {10.1109/LRA.2023.3243528},
+  url = {https://ieeexplore.ieee.org/document/10041769}
+}
+
+@article{chen2024igelio,
+  author = {Chen, Ziyu and Zhu, Hui and Yu, Biao and Jiang, Chunmao and Hua, Chen and Fu, Xuhui and Kuang, Xinkai},
+  title = {{IGE-LIO: Intensity Gradient Enhanced Tightly Coupled LiDAR-Inertial Odometry}},
+  journal = {IEEE Transactions on Instrumentation and Measurement},
+  year = {2024},
+  volume = {73},
+  pages = {1--11},
+  doi = {10.1109/TIM.2024.3427795},
+  url = {https://doi.org/10.1109/TIM.2024.3427795}
+}
+
+@article{lee2025genz,
+  author = {Lee, Daehan and Lim, Hyungtae and Han, Soohee},
+  title = {{GenZ-ICP: Generalizable and Degeneracy-Robust LiDAR Odometry Using an Adaptive Weighting}},
+  journal = {IEEE Robotics and Automation Letters},
+  year = {2025},
+  volume = {10},
+  number = {1},
+  pages = {152--159},
+  doi = {10.1109/LRA.2024.3498779},
+  url = {https://arxiv.org/abs/2411.06766}
+}
+
+@inproceedings{pfreundschuh2026bievr,
+  author = {Pfreundschuh, Patrick and Tuna, Turcan and {Le Gentil}, Cedric and Siegwart, Roland and Cadena, Cesar and Oleynikova, Helen},
+  title = {{BIEVR-LIO: Robust LiDAR-Inertial Odometry through Bump-Image-Enhanced Voxel Maps}},
+  booktitle = {Robotics: Science and Systems},
+  year = {2026},
+  month = jul,
+  doi = {10.15607/RSS.2026.XXII.049},
+  url = {https://www.roboticsproceedings.org/rss22/p049.html}
+}
+
+@article{kashani2015radiometric,
+  author = {Kashani, Alireza G. and Olsen, Michael J. and Parrish, Christopher E. and Wilson, Nicholas},
+  title = {{A Review of LIDAR Radiometric Processing: From Ad Hoc Intensity Correction to Rigorous Radiometric Calibration}},
+  journal = {Sensors},
+  year = {2015},
+  volume = {15},
+  number = {11},
+  pages = {28099--28128},
+  doi = {10.3390/s151128099},
+  url = {https://www.mdpi.com/1424-8220/15/11/28099}
+}
+
+@manual{velodyne2022vlp16,
+  author = {{Velodyne Lidar, Inc.}},
+  title = {{VLP-16 User Manual}},
+  year = {2022},
+  organization = {Velodyne Lidar},
+  number = {63-9243 Rev. F},
+  url = {https://data.ouster.io/downloads/velodyne/user-manual/vlp-16-user-manual-revf.pdf},
+  note = {Updated 2022-03-07; manufacturer-hosted document marked DRAFT; section 6.1, page 34}
+}
+
+@manual{ousterSensorData,
+  author = {{Ouster}},
+  title = {{Sensor Data: Calibrated Reflectivity and Signal Photons}},
+  url = {https://static.ouster.dev/sensor-docs/image_route1/image_route2/sensor_data/sensor-data.html},
+  urldate = {2026-09-05},
+  note = {Manufacturer documentation; packet-field width and calibration depend on sensor/profile}
+}
+
+@article{zheng2025fastlivo2,
+  author = {Zheng, Chunran and Xu, Wei and Zou, Zuhao and Hua, Tong and Yuan, Chongjian and He, Dongjiao and Zhou, Bingyang and Liu, Zheng and Lin, Jiarong and Zhu, Fangcheng and Ren, Yunfan and Wang, Rong and Meng, Fanle and Zhang, Fu},
+  title = {{FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry}},
+  journal = {IEEE Transactions on Robotics},
+  year = {2025},
+  volume = {41},
+  pages = {326--346},
+  doi = {10.1109/TRO.2024.3502198},
+  url = {https://arxiv.org/abs/2408.14035}
+}
+
+@article{lee2026lodestar,
+  author = {Lee, Eungchang Mason and Marsim, Kevin Christiansen and Myung, Hyun},
+  title = {{LODESTAR: Degeneracy-Aware LiDAR-Inertial Odometry With Adaptive Schmidt-Kalman Filter and Data Exploitation}},
+  journal = {IEEE Robotics and Automation Letters},
+  year = {2026},
+  volume = {11},
+  number = {1},
+  pages = {922--929},
+  doi = {10.1109/LRA.2025.3634906},
+  url = {https://arxiv.org/abs/2511.09142}
+}
+
+@inproceedings{nissov2024radar,
+  author = {Nissov, Morten and Khedekar, Nikhil and Alexis, Kostas},
+  title = {{Degradation Resilient LiDAR-Radar-Inertial Odometry}},
+  booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+  year = {2024},
+  pages = {8587--8594},
+  doi = {10.1109/ICRA57147.2024.10611444},
+  url = {https://arxiv.org/abs/2403.05332}
+}
+
+@inproceedings{zhang2018evaluation,
+  author = {Zhang, Zichao and Scaramuzza, Davide},
+  title = {{A Tutorial on Quantitative Trajectory Evaluation for Visual(-Inertial) Odometry}},
+  booktitle = {IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)},
+  year = {2018},
+  pages = {7244--7251},
+  doi = {10.1109/IROS.2018.8593941},
+  url = {https://www.ifi.uzh.ch/dam/jcr:89d3db14-37b1-431d-94c3-8be9f37466d3/IROS18_Zhang.pdf}
+}
+
+@misc{enwideDataset,
+  author = {{ETH Zurich Autonomous Systems Lab}},
+  title = {{ENWIDE LiDAR Inertial Dataset}},
+  url = {https://projects.asl.ethz.ch/datasets/enwide/},
+  urldate = {2026-09-05},
+  note = {Dataset accompanying COIN-LIO; total-station prism position reference and prism extrinsics}
+}
+
+@misc{chen2024geode,
+  author = {Chen, Zhiqiang and Qi, Yuhua and Feng, Dapeng and Zhuang, Xuebin and Chen, Hongbo and Hu, Xiangcheng and Wu, Jin and Peng, Kelin and Lu, Peng},
+  title = {{Heterogeneous LiDAR Dataset for Benchmarking Robust Localization in Diverse Degenerate Scenarios}},
+  year = {2024},
+  eprint = {2409.04961},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2409.04961},
+  note = {Cites the inspected preprint; dataset instructions are maintained in PengYu-Team/GEODE_dataset}
+}
+
+@article{yao2026giflio,
+  author = {Yao, Hekai and Zhang, Xuetao and Sun, Gang and Liu, Yisha and Zhuang, Yan},
+  title = {{GIF-LIO: Geometry-Intensity Fused LiDAR-Inertial Odometry With Degeneracy-Constrained State Estimation}},
+  journal = {IEEE Transactions on Instrumentation and Measurement},
+  year = {2026},
+  volume = {75},
+  pages = {1--12},
+  doi = {10.1109/TIM.2026.3671940},
+  url = {https://doi.org/10.1109/TIM.2026.3671940}
+}
+
+@article{ding2026adaptiveintensity,
+  author = {Ding, Peng and Liu, Fengyu and Zheng, Peng and He, Weiwei},
+  title = {{Degeneracy-Aware Intensity-Assisted LiDAR-Inertial Odometry with Adaptive Photometric Weighting}},
+  journal = {Electronics},
+  year = {2026},
+  volume = {15},
+  number = {17},
+  pages = {3970},
+  doi = {10.3390/electronics15173970},
+  url = {https://www.mdpi.com/2079-9292/15/17/3970},
+  note = {Published 2026-09-03; recent result, not independently reproduced here}
+}
