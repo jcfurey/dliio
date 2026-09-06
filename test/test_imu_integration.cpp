@@ -106,6 +106,24 @@ TEST(ImuIntegration, GravityIsSubtracted) {
   }
 }
 
+TEST(ImuIntegration, VelocitySamplesMatchPoseTimesUnderJerk) {
+  auto imu = makeImuStream(1.0, 400.0, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero());
+  for (auto& sample : imu) { sample.lin_accel.x() = 0.8f + 0.6f * sample.stamp; }
+  const std::vector<double> stamps{0.037, 0.3, 0.453, 0.9};
+  std::vector<Eigen::Vector3f> velocities{Eigen::Vector3f::Ones()};
+  const auto poses = dlio::OdomNode::integrateImuInternal(
+      Eigen::Quaternionf::Identity(), Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero(),
+      stamps, imu, 0.0, &velocities);
+  ASSERT_EQ(poses.size(), stamps.size());
+  ASSERT_EQ(velocities.size(), stamps.size());
+  for (size_t i = 0; i < stamps.size(); ++i) {
+    const double t = stamps[i];
+    EXPECT_NEAR(velocities[i].x(), 0.8 * t + 0.3 * t * t, 2e-5);
+    EXPECT_NEAR(poses[i](0, 3), 0.4 * t * t + 0.1 * t * t * t, 2e-5);
+    EXPECT_NEAR(velocities[i].tail<2>().norm(), 0.f, 1e-6);
+  }
+}
+
 // --- Spline-order verification (VERIFICATION_2026-06-27) ---
 // The deskew kernel is a piecewise CUBIC in position (constant jerk per IMU
 // interval; Chen, Nemiroff & Lopez, ICRA 2023) -- an analytic continuous-time

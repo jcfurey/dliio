@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -20,6 +21,15 @@ class PhotometricGICP : public nano_gicp::NanoGICP<dlio::Point, dlio::Point> {
 public:
   const nano_gicp::GradientList& gradients() const { return *target_intensity_gradients_; }
   bool valid(size_t i) const { return (*gradient_valid_)[i] != 0; }
+  int correspondenceCount() const {
+    return std::count_if(correspondences_.begin(), correspondences_.end(), [](int i) { return i >= 0; });
+  }
+  void useWeakPlaneCovariances() {
+    Eigen::Matrix4f covariance = Eigen::Matrix4f::Zero();
+    covariance.diagonal() << 1e6f, 1e6f, 1e-3f, 1.f;
+    source_covs_.assign(input_->size(), covariance);
+    setTargetCovariances(std::make_shared<nano_gicp::CovarianceList>(target_->size(), covariance));
+  }
 };
 
 dlio::Point makePoint(float x, float y, float z) {
@@ -95,6 +105,47 @@ nano_gicp::NanoGICP<dlio::Point, dlio::Point> makeGICP() {
 }
 
 }  // namespace
+
+TEST(NanoGICP, NoOverlapIsNotConvergence) {
+  auto target = makeCorner(1.f, 0.1f);
+  auto source = std::make_shared<Cloud>(*target);
+  for (auto& p : *source) { p.x += 5.f; }
+  PhotometricGICP g;
+  g.setNumThreads(1);
+  g.setMaxCorrespondenceDistance(0.5f);
+  g.setInputSource(source);
+  g.setInputTarget(target);
+  Cloud aligned;
+  g.align(aligned);
+  EXPECT_FALSE(g.hasConverged());
+  EXPECT_EQ(g.correspondenceCount(), 0);
+  EXPECT_LT((g.getFinalTransformation() - Eigen::Matrix4f::Identity()).norm(), 1e-6f);
+}
+
+TEST(NanoGICP, LocalPhotometricExtrapolationCannotConvergeByLosingEveryMatch) {
+  auto target = makePlane(1.f, 0.1f);
+  for (auto& p : *target) { p.intensity = 0.4f + 0.05f * p.x; }
+  auto source = std::make_shared<Cloud>(*target);
+  for (auto& p : *source) { p.intensity += 0.5f; }
+  PhotometricGICP g;
+  g.setNumThreads(1);
+  g.setPhotometricScale(1.f);
+  g.setPhotometricWeight(1e8f);
+  g.setPhotometricHuberDelta(0.f);
+  g.setMaxCorrespondenceDistance(0.5f);
+  g.setMaximumIterations(30);
+  g.setInputSource(source);
+  g.setInputTarget(target);
+  g.useWeakPlaneCovariances();
+  Cloud aligned;
+  g.align(aligned);
+  // An affine brightness fit extrapolates to x=10 m, beyond this finite wall.
+  // The old solver dropped every match there, called zero error convergence,
+  // and returned the 10 m jump. This is a failed local registration.
+  EXPECT_FALSE(g.hasConverged());
+  EXPECT_EQ(g.correspondenceCount(), static_cast<int>(source->size()));
+  EXPECT_LT((g.getFinalTransformation() - Eigen::Matrix4f::Identity()).norm(), 1e-6f);
+}
 
 TEST(NanoGICP, RecoversSmallTransformOnCornerGeometry) {
   auto target = makeCorner(1.0f, 0.05f);

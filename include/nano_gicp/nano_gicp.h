@@ -41,6 +41,7 @@
 #include <pcl/registration/registration.h>
 
 #include "nano_gicp/nanoflann_adaptor.h"
+#include "nano_gicp/surface_texture.h"
 
 namespace nano_gicp {
 
@@ -222,6 +223,22 @@ public:
   // Unweighted photometric residual RMS from the last align() (brightness-
   // constancy fit quality; lower is better). 0 if the term did not engage.
   float lastPhotometricRms() const;
+  // Unorganized, motion-compensated 3D intensity patches. Separate from the
+  // Ouster image term; disabled unless weight > 0 and consecutive frames exist.
+  void setSurfaceTextureConfig(const SurfaceTextureConfig& config, float weight, float weak_ratio) {
+    surface_texture_config_ = config;
+    surface_texture_weight_ = weight;
+    surface_texture_weak_ratio_ = weak_ratio;
+  }
+  void setSurfaceTextureFrames(const TextureCloud::ConstPtr& source,
+                               const TextureCloud::ConstPtr& previous,
+                               const Eigen::Vector3f& scan_center) {
+    surface_texture_source_ = source;
+    surface_texture_previous_ = previous;
+    surface_texture_center_ = scan_center;
+  }
+  const SurfaceTextureMatch& lastSurfaceTextureMatch() const { return last_surface_texture_; }
+  float lastSurfaceTextureWeakRatio() const { return last_surface_texture_ratio_; }
   // Geometric observability telemetry from the last align(): the rotation /
   // translation Hessian block's weakest-axis eigenvalue divided by the gate
   // threshold. >1 = above the gate (trusted), <1 = held as degenerate, ~1 =
@@ -595,6 +612,13 @@ protected:
   float photometric_ref_count_;        // mass-normalization nominal count; 0 = off (raw)
   int last_photometric_count_;         // valid-gradient residuals in the last align()
   float last_photometric_rms_;         // telemetry: unweighted photometric residual RMS
+  SurfaceTextureConfig surface_texture_config_;
+  float surface_texture_weight_ = 0.f;
+  float surface_texture_weak_ratio_ = 0.05f;
+  float last_surface_texture_ratio_ = -1.f;
+  TextureCloud::ConstPtr surface_texture_source_, surface_texture_previous_;
+  Eigen::Vector3f surface_texture_center_ = Eigen::Vector3f::Zero();
+  SurfaceTextureMatch last_surface_texture_;
   float degeneracy_thresh_ratio_;
   float degeneracy_softness_;          // soft-gate band half-width; 0 = binary gate
   // Probabilistic gate (Hatleskog & Alexis RA-L 2024 adaptation); off -> the

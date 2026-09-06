@@ -45,6 +45,47 @@ struct OdomNodeTestAccess {
   static bool useReflectivity(const OdomNode& node) { return node.use_reflectivity_; }
   static bool photometricActive(const OdomNode& node) { return node.photometric_active_; }
   static void applyLiveParams(OdomNode& node) { node.applyLiveParams(); }
+  static void checkSurfaceTextureLifecycle(OdomNode& node) {
+    auto cloud = std::make_shared<pcl::PointCloud<PointType>>();
+    PointType point;
+    point.x = 1.f; point.y = 2.f; point.z = 3.f; point.intensity = 0.2f;
+    cloud->push_back(point);
+    point.x = 2.f; point.intensity = 0.6f;
+    cloud->push_back(point);
+    point.intensity = std::numeric_limits<float>::quiet_NaN();
+    cloud->push_back(point);
+    node.deskewed_scan = cloud;
+    node.deskew_status = true;
+    node.surface_texture_enabled_ = true;
+    node.surface_texture_scale_ = 1.0;
+    node.prepareSurfaceTexture();
+    ASSERT_TRUE(node.surface_texture_current_);
+    ASSERT_EQ(node.surface_texture_current_->size(), 2u);
+    const auto snapshot = node.surface_texture_current_;
+    node.T_corr.setIdentity();
+    node.T_corr.block<3, 1>(0, 3) = Eigen::Vector3f(3.f, -2.f, 1.f);
+    node.scan_stamp = 10.;
+    node.fuse_tripped_scan_ = false;
+    node.rememberSurfaceTexture();
+    ASSERT_TRUE(node.surface_texture_previous_);
+    for (size_t i = 0; i < snapshot->size(); ++i) {
+      const auto& source = (*snapshot)[i];
+      const auto& reference = (*node.surface_texture_previous_)[i];
+      EXPECT_NEAR(reference.x, source.x + 3.f, 1e-6f);
+      EXPECT_NEAR(reference.y, source.y - 2.f, 1e-6f);
+      EXPECT_FLOAT_EQ(reference.intensity, source.intensity);
+    }
+    EXPECT_FLOAT_EQ((*snapshot)[0].x, 1.f); // promotion cannot mutate the source
+    EXPECT_DOUBLE_EQ(node.surface_texture_previous_stamp_, 10.);
+    node.fuse_tripped_scan_ = true;
+    node.rememberSurfaceTexture();
+    EXPECT_FALSE(node.surface_texture_previous_);
+    node.deskew_status = false;
+    node.prepareSurfaceTexture();
+    EXPECT_FALSE(node.surface_texture_current_);
+    node.rememberSurfaceTexture();
+    EXPECT_FALSE(node.surface_texture_previous_);
+  }
   static double firstDeskewStamp(OdomNode& node) {
     node.imu_buffer.push_back({9.0, 0.01, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero()});
     node.deskewPointcloud();
@@ -76,6 +117,7 @@ struct OdomNodeTestAccess {
     const Eigen::Vector3f expected_error(innovation, 0.f, 0.f);
     EXPECT_LT((node.state.p - expected_position - 0.1f * node.geo_Kp_ * expected_error).norm(), 1e-6f);
     EXPECT_NEAR(node.state.v.lin.w.x(), speed + 0.1f * node.geo_Kv_ * innovation, 1e-6f);
+    EXPECT_NEAR(node.geo.prev_scan_vel.x(), speed + 0.1f * node.geo_Kv_ * innovation, 1e-6f);
     const Eigen::Vector3f expected_bias = -0.1f * node.geo_Kab_ *
         node.lidarPose.q.conjugate()._transformVector(expected_error);
     EXPECT_LT((node.state.b.accel - expected_bias).norm(), 1e-6f);
@@ -86,6 +128,50 @@ struct OdomNodeTestAccess {
     node.imu_buffer.push_back({0.0, 0.01, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero()});
     node.preprocessPoints();
     return *node.current_scan;
+  }
+  static void checkAcceleratingPrior(OdomNode& node, double lag, bool deskew) {
+    constexpr float acceleration = 0.8f;
+    node.geo.prev_state_stamp = 10.0;
+    node.geo.prev_p.setZero();
+    node.geo.prev_q.setIdentity();
+    node.geo.prev_vel.setZero();
+    node.scan_stamp = 10.3;
+    node.prev_scan_stamp = 10.0;
+    node.imu_stamp = rclcpp::Time(static_cast<int64_t>((10.3 + lag) * 1e9));
+    node.state.p = Eigen::Vector3f(0.5f * acceleration * (0.3 + lag) * (0.3 + lag), 0.f, 0.f);
+    node.state.q.setIdentity();
+    node.state.v.lin.w = Eigen::Vector3f(acceleration * (0.3 + lag), 0.f, 0.f);
+    node.state.b.accel.setZero();
+    node.state.b.gyro.setZero();
+    node.lidarPose.p = Eigen::Vector3f(0.5f * acceleration * 0.3f * 0.3f, 0.f, 0.f);
+    node.lidarPose.q.setIdentity();
+    for (int k = -2; k <= 160; ++k) {
+      node.imu_buffer.push_front({10.0 + k * 0.005, 0.005,
+          Eigen::Vector3f::Zero(), Eigen::Vector3f(acceleration, 0.f, 9.80665f)});
+    }
+    node.updateState();
+    EXPECT_TRUE(node.observer_time_aligned_);
+    EXPECT_NEAR(node.geo.prev_scan_vel.x(), acceleration * 0.3f, 1e-5);
+    EXPECT_NEAR(node.geo.prev_vel.x(), acceleration * (0.3 + lag), 1e-5);
+
+    // Exercise both production prior paths at the next scan. Its zero-offset
+    // points all share a measurement time, so rigid and deskewed inputs must
+    // start at the same correct pose regardless of the previous IMU lead.
+    node.prev_scan_stamp = node.scan_stamp;
+    node.first_valid_scan = true;
+    node.deskew_ = deskew;
+    node.scan_header_stamp = rclcpp::Time(10'600'000'000LL);
+    node.sensor = dlio::SensorType::VELODYNE;
+    auto scan = std::make_shared<pcl::PointCloud<PointType>>();
+    for (int i = 0; i < 20; ++i) {
+      PointType point;
+      point.x = 2.f + 0.01f * i; point.y = point.z = 0.f;
+      point.time = 0.f;
+      scan->push_back(point);
+    }
+    node.original_scan = scan;
+    node.preprocessPoints();
+    EXPECT_NEAR(node.T_prior(0, 3), 0.5f * acceleration * 0.6f * 0.6f, 2e-5);
   }
 };
 }  // namespace dlio
@@ -170,6 +256,16 @@ TEST_F(PointCloudChannels, ObserverDoesNotInterpretScanLatencyAsMotionError) {
   }
   dlio::OdomNode node(options());
   Access::checkDelayedConstantMotion(node, 0.05, 0.02f);  // real innovations still update velocity/bias
+}
+
+TEST_F(PointCloudChannels, ScanPriorUsesVelocityAtTheRegisteredPoseTime) {
+  for (bool deskew : {false, true}) {
+    for (double lag : {0.0, 0.05, 0.15, 0.22}) {
+      SCOPED_TRACE(::testing::Message() << "lag=" << lag << " deskew=" << deskew);
+      dlio::OdomNode node(options());
+      Access::checkAcceleratingPrior(node, lag, deskew);
+    }
+  }
 }
 
 pcl::PointCloud<PointType> mapChannelCloud() {
@@ -354,6 +450,25 @@ TEST_F(PointCloudChannels, LiveEnableUsesChannelResolvedWhileDisabled) {
   ASSERT_TRUE(node.set_parameter(rclcpp::Parameter("odom/gicp/photometricWeight", 0.3)).successful);
   Access::applyLiveParams(node);
   EXPECT_TRUE(Access::photometricActive(node));
+}
+
+TEST_F(PointCloudChannels, SurfaceTextureKeepsCorrectedImmutableReferencesAndClearsInvalidFrames) {
+  dlio::OdomNode node(options());
+  Access::checkSurfaceTextureLifecycle(node);
+}
+
+TEST_F(PointCloudChannels, SurfaceTextureStartupSettingsRejectAtomicLiveChanges) {
+  auto opts = options();
+  opts.append_parameter_override("odom/gicp/surfaceTexture/enabled", true);
+  dlio::OdomNode node(opts);
+  const auto result = node.set_parameters_atomically({
+      rclcpp::Parameter("odom/gicp/photometricWeight", 0.3),
+      rclcpp::Parameter("odom/gicp/surfaceTexture/weakRatio", 0.15)});
+  EXPECT_FALSE(result.successful);
+  EXPECT_NE(result.reason.find("restart"), std::string::npos);
+  Access::applyLiveParams(node);
+  EXPECT_FALSE(Access::photometricActive(node));
+  EXPECT_DOUBLE_EQ(node.get_parameter("odom/gicp/photometricWeight").as_double(), 0.0);
 }
 
 TEST_F(PointCloudChannels, MissingChannelsCannotBeLiveEnabledOrCreateAnImage) {

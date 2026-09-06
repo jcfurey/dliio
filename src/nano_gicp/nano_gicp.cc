@@ -1017,6 +1017,9 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     trans.matrix() = guess;
     // IMU-prior initial guess, snapshotted for the per-scan correction clamp below.
     const Eigen::Isometry3f trans_init = trans;
+    last_surface_texture_ = {};
+    last_surface_texture_ratio_ = -1.f;
+    SurfaceTextureConstraint surface_constraint;
 
     // Fallback: if the target was registered without precomputed covariances
     // (or with a mismatched set), compute them here.
@@ -1093,12 +1096,24 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
     double prev_rescued_t = 0.0, prev_rescued_r = 0.0;
     double prev_partial_t = 0.0, prev_partial_r = 0.0;
     bool pending_convergence = false;
+    bool proposal_pending = false;
+    bool texture_pending = true;
+    float next_alpha = current_alpha_, next_kernel_c = current_kernel_c_;
+    float next_genz_alpha = current_genz_alpha_;
+    update_correspondences(trans);
+    const auto has_geometry = [&]() {
+        return std::any_of(correspondences_.begin(), correspondences_.end(),
+                           [](int index) { return index >= 0; });
+    };
+    bool base_has_geometry = has_geometry();
 
     // The extra evaluation validates the final proposed step as well. Never
     // return an untested last step merely because it is small or the iteration
     // budget ran out. Rejected steps also restore their rescue budgets.
     for (int i = 0; i <= this->max_iterations_; ++i) {
-        update_correspondences(trans);
+        // A trial must retain its base correspondences and covariance metrics.
+        // Re-associating first can erase difficult residuals (even ALL of them)
+        // and falsely accept a jump into empty space as a zero-cost fit.
 
         // Accumulated, solved, and gated in double; see linearize() for why.
         Eigen::Matrix<double, 6, 6> H;
@@ -1111,82 +1126,123 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         // masks the degeneracy, the gate releases its prior-hold, and the pose
         // diverges along the (still physically unobservable) axis.
         Eigen::Matrix<double, 6, 6> H_geo;
-        linearize(trans, &H, &b, &cost, &H_geo);
+        const auto evaluate = [&]() {
+            const float alpha = current_alpha_, kernel_c = current_kernel_c_;
+            const float genz_alpha = current_genz_alpha_;
+            cost = 0.0;
+            linearize(trans, &H, &b, &cost, &H_geo);
 
-        // GenZ-ICP adaptive blend weight (lagged one iteration, like the kernel):
-        // from the geometric translation block's conditioning (lambda_min/lambda_max
-        // of H_geo[3:6,3:6]), set how much point-to-plane vs point-to-point the NEXT
-        // linearize() mixes. Off (genz_floor_ >= 1) -> alpha stays 1 -> pure
-        // point-to-plane (bit-identical). Adapted from GenZ-ICP (Lee et al., RA-L
-        // 2025): degenerate scan -> blend in an isotropic point-to-point metric to
-        // regularize the unconstrained axis. See nano_gicp/genz_weight.h.
-        if (this->genz_enabled_) {
-            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_g(H_geo.template block<3, 3>(3, 3));
-            const double lmax = eig_g.eigenvalues()(2);
-            const double ratio = (lmax > 0.0) ? (eig_g.eigenvalues()(0) / lmax) : 0.0;
-            this->current_genz_alpha_ = static_cast<float>(
-                genzPlaneWeight(ratio, static_cast<double>(this->genz_floor_),
-                                static_cast<double>(this->genz_knee_)));
-        }
-
-        // Direct visual (camera) photometric term: accumulate into the SAME
-        // H/b that linearize() built, BEFORE damping and the degeneracy gate,
-        // so a camera-constrained axis can be detected (and rescued) by the
-        // gate below. Include the same image residuals in step acceptance: a
-        // useful texture-driven step can increase the weak geometric cost.
-        // No-op unless setVisualEnabled(true) and both frames are set.
-        if (visual_enabled_) {
-            accumulateVisualResidual(trans, &H, &b, &cost);
-        }
-        // Frame-to-MAP camera term (absolute anchor): also into H/b before the
-        // gate, so it can rescue the degenerate axis with map landmarks.
-        if (visual_map_weight_ > 0.f) {
-            accumulateVisualMapResidual(trans, &H, &b, &cost);
-        }
-        // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
-        if (lidar_map_weight_ > 0.f) {
-            if (lidar_cond_scale_enabled_ || lidar_dir_separated_enabled_) {
-                // Reweight the term before adding, judged from the GEOMETRIC
-                // eigenbasis (H_geo, before any term): conditionScale BOOSTS it
-                // toward the weak axes so it can clear the gate's rescue bar there;
-                // directionSeparate RESTRICTS it to the weak subspace (LOFF-style,
-                // so it can only move the degenerate axis, never perturb the strong
-                // ones). Either or both; the per-scan rescue budget still bounds the
-                // resulting motion. See REVIEW.md #8, EXPLORATION_2026-06-26 #2.
-                Eigen::Matrix<double, 6, 6> H_lid = Eigen::Matrix<double, 6, 6>::Zero();
-                Eigen::Matrix<double, 6, 1> b_lid = Eigen::Matrix<double, 6, 1>::Zero();
-                accumulateLidarMapResidual(trans, &H_lid, &b_lid, &cost);
-                if (lidar_cond_scale_enabled_) {
-                    conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
-                                       static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
+            if (texture_pending && surface_texture_weight_ > 0.f) {
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(H_geo.template block<3, 3>(3, 3));
+                if (eig.info() == Eigen::Success && eig.eigenvalues().allFinite() &&
+                    eig.eigenvalues()(2) > 0.0) {
+                    last_surface_texture_ratio_ = eig.eigenvalues()(0) / eig.eigenvalues()(2);
+                    // A tunnel supplies one weak translation axis. If two axes are
+                    // weak, a 1D search cannot separate the unknown motions.
+                    if (last_surface_texture_ratio_ < surface_texture_weak_ratio_ &&
+                        eig.eigenvalues()(1) > surface_texture_weak_ratio_ * eig.eigenvalues()(2)) {
+                        const Eigen::Vector3f axis = eig.eigenvectors().col(0).cast<float>();
+                        last_surface_texture_ = matchSurfaceTexture(surface_texture_source_,
+                            surface_texture_previous_, trans, axis, surface_texture_config_);
+                        if (last_surface_texture_.valid) {
+                            surface_constraint.axis = axis;
+                            surface_constraint.center = surface_texture_center_;
+                            surface_constraint.position = axis.cast<double>().dot(
+                                (trans * surface_texture_center_).cast<double>()) + last_surface_texture_.shift;
+                            surface_constraint.information = surface_texture_weight_ /
+                                (last_surface_texture_.sigma * last_surface_texture_.sigma);
+                        }
+                    }
                 }
+            }
+            texture_pending = false;
+            // Freeze the measured position for ALL LM evaluations, including
+            // rejected/final steps. Never re-match it to the proposed pose.
+            surface_constraint.accumulate(trans, &H, &b, &cost);
+
+            // GenZ-ICP adaptive blend weight (lagged one iteration, like the kernel):
+            // from the geometric translation block's conditioning (lambda_min/lambda_max
+            // of H_geo[3:6,3:6]), set how much point-to-plane vs point-to-point the NEXT
+            // linearize() mixes. Off (genz_floor_ >= 1) -> alpha stays 1 -> pure
+            // point-to-plane (bit-identical). Adapted from GenZ-ICP (Lee et al., RA-L
+            // 2025): degenerate scan -> blend in an isotropic point-to-point metric to
+            // regularize the unconstrained axis. See nano_gicp/genz_weight.h.
+            if (this->genz_enabled_) {
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_g(H_geo.template block<3, 3>(3, 3));
+                const double lmax = eig_g.eigenvalues()(2);
+                const double ratio = (lmax > 0.0) ? (eig_g.eigenvalues()(0) / lmax) : 0.0;
+                this->current_genz_alpha_ = static_cast<float>(
+                    genzPlaneWeight(ratio, static_cast<double>(this->genz_floor_),
+                                    static_cast<double>(this->genz_knee_)));
+            }
+
+            // Direct visual (camera) photometric term: accumulate into the SAME
+            // H/b that linearize() built, BEFORE damping and the degeneracy gate,
+            // so a camera-constrained axis can be detected (and rescued) by the
+            // gate below. Include the same image residuals in step acceptance: a
+            // useful texture-driven step can increase the weak geometric cost.
+            // No-op unless setVisualEnabled(true) and both frames are set.
+            if (visual_enabled_) {
+                accumulateVisualResidual(trans, &H, &b, &cost);
+            }
+            // Frame-to-MAP camera term (absolute anchor): also into H/b before the
+            // gate, so it can rescue the degenerate axis with map landmarks.
+            if (visual_map_weight_ > 0.f) {
+                accumulateVisualMapResidual(trans, &H, &b, &cost);
+            }
+            // COIN-LIO LiDAR intensity-image term (absolute anchor via reflectivity).
+            if (lidar_map_weight_ > 0.f) {
+                if (lidar_cond_scale_enabled_ || lidar_dir_separated_enabled_) {
+                    // Reweight the term before adding, judged from the GEOMETRIC
+                    // eigenbasis (H_geo, before any term): conditionScale BOOSTS it
+                    // toward the weak axes so it can clear the gate's rescue bar there;
+                    // directionSeparate RESTRICTS it to the weak subspace (LOFF-style,
+                    // so it can only move the degenerate axis, never perturb the strong
+                    // ones). Either or both; the per-scan rescue budget still bounds the
+                    // resulting motion. See REVIEW.md #8, EXPLORATION_2026-06-26 #2.
+                    Eigen::Matrix<double, 6, 6> H_lid = Eigen::Matrix<double, 6, 6>::Zero();
+                    Eigen::Matrix<double, 6, 1> b_lid = Eigen::Matrix<double, 6, 1>::Zero();
+                    accumulateLidarMapResidual(trans, &H_lid, &b_lid, &cost);
+                    if (lidar_cond_scale_enabled_) {
+                        conditionScaleTerm(H_geo, static_cast<double>(lidar_cs_power_),
+                                           static_cast<double>(lidar_cs_cap_), &H_lid, &b_lid);
+                    }
+                    if (lidar_dir_separated_enabled_) {
+                        directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
+                                              &H_lid, &b_lid);
+                    }
+                    H += H_lid;
+                    b += b_lid;
+                } else {
+                    accumulateLidarMapResidual(trans, &H, &b, &cost);
+                }
+            }
+
+            // Frame-to-FRAME LiDAR flow term (EXPLORATION #2): accumulate into its own
+            // H_flow/b_flow, then direction-separate (when enabled) so the flow only
+            // constrains the geometrically-weak axis -- it observes the along-tunnel
+            // motion, fused only where it's needed. Weight 0 (default) -> no-op /
+            // bit-identical. Judged from H_geo (before any term), like the lidar term.
+            if (lidar_flow_weight_ > 0.f) {
+                Eigen::Matrix<double, 6, 6> H_flow = Eigen::Matrix<double, 6, 6>::Zero();
+                Eigen::Matrix<double, 6, 1> b_flow = Eigen::Matrix<double, 6, 1>::Zero();
+                accumulateLidarFlowResidual(trans, &H_flow, &b_flow, &cost);
                 if (lidar_dir_separated_enabled_) {
                     directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
-                                          &H_lid, &b_lid);
+                                          &H_flow, &b_flow);
                 }
-                H += H_lid;
-                b += b_lid;
-            } else {
-                accumulateLidarMapResidual(trans, &H, &b, &cost);
+                H += H_flow;
+                b += b_flow;
             }
-        }
-
-        // Frame-to-FRAME LiDAR flow term (EXPLORATION #2): accumulate into its own
-        // H_flow/b_flow, then direction-separate (when enabled) so the flow only
-        // constrains the geometrically-weak axis -- it observes the along-tunnel
-        // motion, fused only where it's needed. Weight 0 (default) -> no-op /
-        // bit-identical. Judged from H_geo (before any term), like the lidar term.
-        if (lidar_flow_weight_ > 0.f) {
-            Eigen::Matrix<double, 6, 6> H_flow = Eigen::Matrix<double, 6, 6>::Zero();
-            Eigen::Matrix<double, 6, 1> b_flow = Eigen::Matrix<double, 6, 1>::Zero();
-            accumulateLidarFlowResidual(trans, &H_flow, &b_flow, &cost);
-            if (lidar_dir_separated_enabled_) {
-                directionSeparateTerm(H_geo, static_cast<double>(lidar_ds_ratio_),
-                                      &H_flow, &b_flow);
-            }
-            H += H_flow;
-            b += b_flow;
-        }
+            // Adaptive fits belong to the next accepted model. Applying them
+            // between base and trial evaluations would change the objective
+            // even though the geometric correspondence set remained fixed.
+            next_alpha = current_alpha_; next_kernel_c = current_kernel_c_;
+            next_genz_alpha = current_genz_alpha_;
+            current_alpha_ = alpha; current_kernel_c_ = kernel_c;
+            current_genz_alpha_ = genz_alpha;
+        };
+        evaluate();
 
         if (!std::isfinite(cost) || cost > prev_cost + 1e-10 * std::max(1.0, prev_cost)) {
             trans = prev_trans;
@@ -1195,9 +1251,41 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             xicp_partial_t_used = prev_partial_t;
             xicp_partial_r_used = prev_partial_r;
             pending_convergence = false;
+            proposal_pending = false;
             lambda *= kLambdaScale;
-            if (lambda > kLambdaMax) { break; }
+            if (lambda > kLambdaMax) { evaluate(); break; }
             continue;
+        }
+        // A zero-information system is not a converged registration.
+        if (H.isZero(0.0)) { trans = prev_trans; break; }
+        const bool improved = cost < prev_cost;
+        if (proposal_pending) {
+            update_correspondences(trans);
+            if (base_has_geometry && !has_geometry()) {
+                trans = prev_trans;
+                update_correspondences(trans);
+                rescued_t_used = prev_rescued_t;
+                rescued_r_used = prev_rescued_r;
+                xicp_partial_t_used = prev_partial_t;
+                xicp_partial_r_used = prev_partial_r;
+                pending_convergence = false;
+                proposal_pending = false;
+                lambda *= kLambdaScale;
+                if (lambda > kLambdaMax) { evaluate(); break; }
+                continue;
+            }
+            // The accepted pose defines a NEW local ICP model. Its objective
+            // becomes the baseline for the next trial; costs from different
+            // correspondence sets must not decide acceptance against each other.
+            current_alpha_ = next_alpha; current_kernel_c_ = next_kernel_c;
+            current_genz_alpha_ = next_genz_alpha;
+            evaluate();
+            base_has_geometry = has_geometry();
+            proposal_pending = false;
+        }
+        if (!std::isfinite(cost) || !H.allFinite() || !b.allFinite() || H.isZero(0.0)) {
+            trans = prev_trans;
+            break;
         }
         if (pending_convergence) {
             this->converged_ = true;
@@ -1205,7 +1293,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
         }
         if (i == this->max_iterations_) { break; }
         // Do not undo increased damping when re-evaluating a reverted pose.
-        if (cost < prev_cost) { lambda = std::max(lambda / kLambdaScale, base_lambda); }
+        if (improved) { lambda = std::max(lambda / kLambdaScale, base_lambda); }
         prev_cost = cost;
         prev_trans = trans;
         prev_rescued_t = rescued_t_used;
@@ -1403,6 +1491,7 @@ void NanoGICP<PointSource, PointTarget>::computeTransformation(
             trans.prerotate(Eigen::AngleAxisf(angle, rot_step / angle));
         }
         trans.pretranslate(dx.tail<3>().cast<float>());
+        proposal_pending = true;
 
         // Check convergence: rotation step (dx.head) vs rotation_epsilon_,
         // translation step (dx.tail) vs transformation_epsilon_.

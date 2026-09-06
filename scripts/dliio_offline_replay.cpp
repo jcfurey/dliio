@@ -1,4 +1,4 @@
-// Estimator-only replay with fixed input order for dliio_ouster_cache.py output.
+// Estimator-only replay with fixed input order for Ouster or Exyn caches.
 // Compile against the exact branch under test; do not mix OdomNode layouts.
 #include <chrono>
 #include <fstream>
@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <vector>
 #include <rcl/time.h>
+#include <rclcpp/serialization.hpp>
 #include "dlio/odom.h"
 
 namespace dlio {
@@ -21,6 +22,31 @@ struct OdomNodeTestAccess {
     return !n.T.allFinite() || n.T.block<3, 1>(0, 3).norm() > 1000.f;
   }
   static void sample(OdomNode& n, std::ostream& out, double stamp, double ms, double wait_ms) {
+    // Diagnose the first gross registration correction without paying for a
+    // second target kd-tree on ordinary scans. Count actual spatial overlap
+    // before and after the correction; disappearing matches are not a fit.
+    static bool reported_jump = false;
+    if (!reported_jump && (n.T.block<3, 1>(0, 3) - n.T_prior.block<3, 1>(0, 3)).norm() > 5.f) {
+      const auto target = n.gicp.getInputTarget();
+      if (target && !target->empty()) {
+        nanoflann::KdTreeFLANN<PointType> tree(false);
+        tree.setInputCloud(target);
+        int before = 0, after = 0;
+        std::vector<int> ids(1);
+        std::vector<float> distances(1);
+        const float max_sq = n.gicp_max_corr_dist_ * n.gicp_max_corr_dist_;
+        for (const auto& point : *n.current_scan) {
+          if (tree.nearestKSearch(point, 1, ids, distances) == 1 && distances[0] < max_sq) { ++before; }
+          PointType corrected = point;
+          corrected.getVector3fMap() = (n.T_corr * point.getVector4fMap()).head<3>();
+          if (tree.nearestKSearch(corrected, 1, ids, distances) == 1 && distances[0] < max_sq) { ++after; }
+        }
+        std::cerr << "gross correction at scan " << std::setprecision(17) << n.scan_stamp
+                  << ": overlap " << before << " -> " << after << " / " << n.current_scan->size()
+                  << ", converged=" << n.gicp.hasConverged() << '\n';
+        reported_jump = true;
+      }
+    }
     const Eigen::Quaternionf q(n.T.block<3, 3>(0, 0));
     out << stamp << ',' << n.T(0, 3) << ',' << n.T(1, 3) << ',' << n.T(2, 3)
         << ',' << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w()
@@ -31,7 +57,21 @@ struct OdomNodeTestAccess {
         << ',' << n.gicp.lastLidarMapCount() << ',' << n.gicp.lastLidarMapRms()
         << ',' << n.gicp.lastVisualRescuedDirections() << ',' << n.gicp.lastDegenerateDirections()
         << ',' << n.gicp.lastPhotometricCount() << ',' << n.gicp.lastPhotometricRms()
-        << ',' << n.deskew_status << ',' << n.keyframes.size() << '\n';
+        << ',' << n.deskew_status << ',' << n.keyframes.size()
+        << ',' << n.scan_stamp << ',' << n.observer_time_aligned_
+        << ',' << n.observer_lag_seconds_ << ',' << n.gicp.hasConverged()
+        << ',' << n.state.b.accel.x() << ',' << n.state.b.accel.y() << ',' << n.state.b.accel.z()
+        << ',' << n.gicp.lastGeoRotMargin() << ',' << n.gicp.lastGeoTransMargin()
+        << ',' << n.gicp.lastDegenTransDirs().size()
+        << ',' << n.gicp.lastSurfaceTextureWeakRatio()
+        << ',' << n.gicp.lastSurfaceTextureMatch().valid
+        << ',' << n.gicp.lastSurfaceTextureMatch().candidates
+        << ',' << n.gicp.lastSurfaceTextureMatch().supported
+        << ',' << n.gicp.lastSurfaceTextureMatch().unique
+        << ',' << n.gicp.lastSurfaceTextureMatch().inliers
+        << ',' << n.gicp.lastSurfaceTextureMatch().shift
+        << ',' << n.gicp.lastSurfaceTextureMatch().sigma
+        << ',' << n.gicp.lastSurfaceTextureMatch().correlation << '\n';
   }
 };
 }
@@ -45,15 +85,25 @@ int main(int argc, char** argv) {
   }
   const std::string cache = argv[1];
   const double seconds = std::stod(argv[3]);
-  std::ifstream frames(cache + "/frames.bin", std::ios::binary), imu_file(cache + "/imu.bin", std::ios::binary);
+  // clouds.cdr retains the adapted PointCloud2 schema, organization and signed
+  // relative time offsets. Each record is a little-endian uint64 header stamp,
+  // uint32 CDR length, then that many serialized bytes. Unlike an Ouster frame,
+  // an Exyn sweep is unorganized and its header is at the END of acquisition.
+  std::ifstream cdr_frames(cache + "/clouds.cdr", std::ios::binary);
+  const bool use_cdr = cdr_frames.is_open();
+  std::ifstream frames;
+  if (use_cdr) { frames = std::move(cdr_frames); }
+  else { frames.open(cache + "/frames.bin", std::ios::binary); }
+  std::ifstream imu_file(cache + "/imu.bin", std::ios::binary);
   if (!frames || !imu_file) { throw std::runtime_error("cannot open cache"); }
   std::vector<ImuRecord> imus;
   ImuRecord rec;
   while (imu_file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) { imus.push_back(rec); }
   std::ofstream out(argv[2]);
   if (!out) { throw std::runtime_error("cannot open output"); }
-  out << std::setprecision(12);
-  out << "stamp,x,y,z,qx,qy,qz,qw,state_x,state_y,state_z,vx,vy,vz,compute_ms,wait_ms,points,flow_count,flow_rms,map_count,map_rms,rescued,degenerate,photo_count,photo_rms,deskew,keyframes\n";
+  // Preserve sub-millisecond differences even with Unix-epoch timestamps.
+  out << std::setprecision(17);
+  out << "stamp,x,y,z,qx,qy,qz,qw,state_x,state_y,state_z,vx,vy,vz,compute_ms,wait_ms,points,flow_count,flow_rms,map_count,map_rms,rescued,degenerate,photo_count,photo_rms,deskew,keyframes,scan_stamp,aligned,imu_lead,converged,bax,bay,baz,geo_rot,geo_trans,held_trans,texture_weak_ratio,texture_valid,texture_candidates,texture_supported,texture_unique,texture_inliers,texture_shift,texture_sigma,texture_correlation\n";
   rclcpp::init(argc, argv);
   auto node = std::make_shared<dlio::OdomNode>();
   auto clock = node->get_clock()->get_clock_handle();
@@ -72,24 +122,48 @@ int main(int argc, char** argv) {
   field("t", 16, 6); field("reflectivity", 20, 4); field("ring", 22, 4);
   field("ambient", 24, 4); field("range", 28, 6);
   msg->data.resize(msg->row_step * msg->height);
+  rclcpp::Serialization<sensor_msgs::msg::PointCloud2> serialization;
   size_t next_imu = 0, scans = 0;
   bool diverged = false;
   uint64_t stamp, rx, first = 0;
   const auto start = std::chrono::steady_clock::now();
-  while (rclcpp::ok() && frames.read(reinterpret_cast<char*>(&stamp), 8) && frames.read(reinterpret_cast<char*>(&rx), 8)) {
+  while (rclcpp::ok()) {
+    if (!frames.read(reinterpret_cast<char*>(&stamp), 8)) {
+      if (frames.gcount() != 0 || !frames.eof()) { throw std::runtime_error("partial cache stamp"); }
+      break;
+    }
     if (!first) { first = stamp; }
     if (seconds > 0 && (stamp - first) * 1e-9 > seconds) { break; }
-    if (!frames.read(reinterpret_cast<char*>(msg->data.data()), msg->data.size())) { throw std::runtime_error("partial cache record"); }
+    if (use_cdr) {
+      uint32_t size = 0;
+      if (!frames.read(reinterpret_cast<char*>(&size), 4) || size == 0 || size > 64 * 1024 * 1024) {
+        throw std::runtime_error("invalid CDR cache length");
+      }
+      rclcpp::SerializedMessage serialized(size);
+      auto& raw = serialized.get_rcl_serialized_message();
+      raw.buffer_length = size;
+      if (!frames.read(reinterpret_cast<char*>(raw.buffer), size)) { throw std::runtime_error("partial CDR record"); }
+      serialization.deserialize_message(&serialized, msg.get());
+      if (static_cast<uint64_t>(rclcpp::Time(msg->header.stamp).nanoseconds()) != stamp) {
+        throw std::runtime_error("CDR header disagrees with cache stamp");
+      }
+    } else {
+      if (!frames.read(reinterpret_cast<char*>(&rx), 8) ||
+          !frames.read(reinterpret_cast<char*>(msg->data.data()), msg->data.size())) {
+        throw std::runtime_error("partial cache record");
+      }
+    }
     // One sample beyond the end of the sweep supplies the interpolation bracket.
     while (next_imu < imus.size()) {
       const auto& v = imus[next_imu++];
       auto m = std::make_shared<sensor_msgs::msg::Imu>();
-      m->header.stamp = rclcpp::Time(v.stamp, RCL_ROS_TIME); m->header.frame_id = "os_imu";
+      m->header.stamp = rclcpp::Time(v.stamp, RCL_ROS_TIME);
+      m->header.frame_id = use_cdr ? "imu" : "os_imu";
       m->linear_acceleration.x = v.a[0]; m->linear_acceleration.y = v.a[1]; m->linear_acceleration.z = v.a[2];
       m->angular_velocity.x = v.w[0]; m->angular_velocity.y = v.w[1]; m->angular_velocity.z = v.w[2];
       set_clock(v.stamp);
       dlio::OdomNodeTestAccess::imu(*node, m);
-      if (v.stamp >= stamp + 100000000) { break; }
+      if (v.stamp >= stamp + (use_cdr ? 0 : 100000000)) { break; }
     }
     msg->header.stamp = rclcpp::Time(stamp, RCL_ROS_TIME);
     const auto t0 = std::chrono::steady_clock::now();

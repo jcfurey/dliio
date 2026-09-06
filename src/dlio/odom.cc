@@ -368,6 +368,24 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->gicp_temp.setPhotometricRefCount(static_cast<float>(photometricRefCount));
   this->gicp_temp.setRegularizationMethod(reg_method);
 
+  dlio::declare_param(this, "odom/gicp/surfaceTexture/enabled", this->surface_texture_enabled_, false,
+      "Experimental 3D intensity patch matching between motion-compensated sweeps");
+  double textureWeight, textureWeakRatio, textureRadius, textureMinStd;
+  dlio::declare_param(this, "odom/gicp/surfaceTexture/weight", textureWeight, 100.0,
+      "Inverse-variance texture constraint multiplier (0 disables fusion)", 0.0, 10000.0);
+  dlio::declare_param(this, "odom/gicp/surfaceTexture/weakRatio", textureWeakRatio, 0.05,
+      "Maximum geometric translation eigenvalue ratio for 1D texture search", 0.0, 1.0);
+  dlio::declare_param(this, "odom/gicp/surfaceTexture/searchRadius", textureRadius, 0.4,
+      "Texture search radius around the IMU prior [m]", 0.12, 2.0);
+  dlio::declare_param(this, "odom/gicp/surfaceTexture/minStd", textureMinStd, 0.006,
+      "Minimum patch standard deviation in normalized intensity units", 0.0001, 1.0);
+  nano_gicp::SurfaceTextureConfig textureConfig;
+  textureConfig.search_radius = textureRadius;
+  textureConfig.min_std = textureMinStd;
+  this->surface_texture_scale_ = photometricScale;
+  this->gicp.setSurfaceTextureConfig(textureConfig,
+      this->surface_texture_enabled_ ? textureWeight : 0.f, textureWeakRatio);
+
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
@@ -1533,6 +1551,15 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   };
   rcl_interfaces::msg::SetParametersResult result;
   result.successful = true;  // ranges already validated by rclcpp before this
+  // These settings initialize a retained frame pair and are startup-only.
+  // Reject the whole update before queuing any live settings in the same call.
+  for (const auto& p : params) {
+    if (p.get_name().rfind("odom/gicp/surfaceTexture/", 0) == 0) {
+      result.successful = false;
+      result.reason = "Surface texture settings require a node restart";
+      return result;
+    }
+  }
   std::lock_guard<std::mutex> lock(this->live_mtx_);
   for (const auto& p : params) {
     if (kLive.count(p.get_name())) {
@@ -1564,6 +1591,8 @@ void dlio::OdomNode::applyLiveParams() {
       this->gicp.setPhotometricHuberDelta(static_cast<float>(v));
       this->gicp_temp.setPhotometricHuberDelta(static_cast<float>(v));
     } else if (name == "odom/gicp/photometricScale") {
+      this->surface_texture_scale_ = v;
+      this->surface_texture_previous_.reset(); // previous patches used different intensity units
       this->gicp.setPhotometricScale(static_cast<float>(v));
       this->gicp_temp.setPhotometricScale(static_cast<float>(v));
     } else if (name == "odom/gicp/degeneracyThreshRatio") {
@@ -1783,7 +1812,7 @@ void dlio::OdomNode::preprocessPoints() {
       // IMU prior for second scan onwards
     std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
       frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                                this->geo.prev_vel.cast<float>(), {this->scan_stamp});
+                                this->geo.prev_scan_vel, {this->scan_stamp});
 
     if (frames.size() > 0) {
       this->T_prior = frames.back();
@@ -1971,7 +2000,7 @@ void dlio::OdomNode::deskewPointcloud() {
   // IMU prior & deskewing for second scan onwards
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> frames;
   frames = this->integrateImu(this->prev_scan_stamp, this->lidarPose.q, this->lidarPose.p,
-                              this->geo.prev_vel.cast<float>(), timestamps);
+                              this->geo.prev_scan_vel, timestamps);
   this->deskew_size = frames.size(); // if integration successful, equal to timestamps.size()
 
   // if there are no frames between the start and end of the sweep
@@ -2132,10 +2161,12 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
   // Set new frame as input source
   this->setInputSource();
+  this->prepareSurfaceTexture();
 
   // Set initial frame as first keyframe
   if (this->keyframes.size() == 0) {
     this->initializeInputTarget();
+    this->rememberSurfaceTexture();
     this->setMainLoopRunning(false);
     this->submap_future =
       std::async( std::launch::async, &dlio::OdomNode::buildKeyframesAndSubmap, this, this->snapshotState() );
@@ -2860,6 +2891,11 @@ void dlio::OdomNode::getNextPose() {
   }
 
   // Align with current submap with global IMU transformation as initial guess
+  this->gicp.setSurfaceTextureFrames(this->surface_texture_current_,
+      (this->scan_stamp > this->surface_texture_previous_stamp_ &&
+       this->scan_stamp - this->surface_texture_previous_stamp_ < 1.0)
+          ? this->surface_texture_previous_ : nullptr,
+      this->T_prior.block<3, 1>(0, 3));
   pcl::PointCloud<PointType>::Ptr aligned = std::make_shared<pcl::PointCloud<PointType>>();
   this->gicp.align(*aligned);
 
@@ -3025,11 +3061,52 @@ void dlio::OdomNode::getNextPose() {
 
   // Update next global pose
   // Both source and target clouds are in the global frame now, so tranformation is global
+  this->rememberSurfaceTexture();
   this->propagateGICP();
 
   // Geometric observer update
   this->updateState();
 
+}
+
+void dlio::OdomNode::prepareSurfaceTexture() {
+  this->surface_texture_current_.reset();
+  if (!this->surface_texture_enabled_ || !this->deskew_status ||
+      !this->photometric_channel_available_ || !this->deskewed_scan) { return; }
+  auto dense = std::make_shared<nano_gicp::TextureCloud>();
+  dense->reserve(this->deskewed_scan->size());
+  for (const auto& point : *this->deskewed_scan) {
+    // Use recorded intensity after the upstream per-return gimbal correction
+    // and DLIO's vehicle deskew. No fictitious fixed scanner origin/range law.
+    if (!point.getVector3fMap().allFinite() || !std::isfinite(point.intensity)) { continue; }
+    pcl::PointXYZI p;
+    p.getVector3fMap() = point.getVector3fMap();
+    p.intensity = point.intensity / this->surface_texture_scale_;
+    dense->push_back(p);
+  }
+  auto filtered = std::make_shared<nano_gicp::TextureCloud>();
+  pcl::VoxelGrid<pcl::PointXYZI> voxel;
+  voxel.setLeafSize(0.06f, 0.06f, 0.06f);
+  voxel.setDownsampleAllData(true);
+  voxel.setInputCloud(dense);
+  voxel.filter(*filtered);
+  // Bound retained memory even for a long initial seed or dense sensor.
+  if (filtered->size() > 120000) {
+    auto bounded = std::make_shared<nano_gicp::TextureCloud>();
+    const size_t stride = (filtered->size() + 119999) / 120000;
+    for (size_t i = 0; i < filtered->size(); i += stride) { bounded->push_back((*filtered)[i]); }
+    filtered = bounded;
+  }
+  this->surface_texture_current_ = filtered;
+}
+
+void dlio::OdomNode::rememberSurfaceTexture() {
+  this->surface_texture_previous_.reset();
+  if (!this->surface_texture_current_ || this->fuse_tripped_scan_ || !this->T_corr.allFinite()) { return; }
+  auto corrected = std::make_shared<nano_gicp::TextureCloud>();
+  pcl::transformPointCloud(*this->surface_texture_current_, *corrected, this->T_corr);
+  this->surface_texture_previous_ = corrected;
+  this->surface_texture_previous_stamp_ = this->scan_stamp;
 }
 
 bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
@@ -3082,9 +3159,11 @@ bool dlio::OdomNode::imuMeasFromTimeRange(double start_time, double end_time,
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init,
-                             Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps) {
+                             Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps,
+                             std::vector<Eigen::Vector3f>* velocities) {
 
   const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
+  if (velocities) { velocities->clear(); }
 
   if (sorted_timestamps.empty() || start_time > sorted_timestamps.front()) {
     // invalid input, return empty vector
@@ -3152,16 +3231,17 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, this->gravity_);
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, this->gravity_, velocities);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
 dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                                      const std::vector<double>& sorted_timestamps,
                                      const std::vector<ImuMeas>& imu,
-                                     double gravity) {
+                                     double gravity, std::vector<Eigen::Vector3f>* velocities) {
 
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> imu_se3;
+  if (velocities) { velocities->clear(); }
 
   // Initialization
   Eigen::Quaternionf q = q_init;
@@ -3239,6 +3319,7 @@ dlio::OdomNode::integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f 
       T.block(0, 3, 3, 1) = p_i;
 
       imu_se3.push_back(T);
+      if (velocities) { velocities->push_back(v + a0*idt + 0.5*j*idt*idt); }
 
       stamp_it++;
     }
@@ -3331,16 +3412,20 @@ void dlio::OdomNode::updateState() {
   // Reconstruct the observer prediction at the measurement time from the
   // preceding corrected observer state, using the same buffered IMU data.
   Eigen::Vector3f predicted_position = this->state.p;
+  const Eigen::Vector3f velocity_before_correction = this->state.v.lin.w;
+  Eigen::Vector3f predicted_velocity = velocity_before_correction;
   this->observer_lag_seconds_ = rclcpp::Time(this->imu_stamp).seconds() - this->scan_stamp;
   this->observer_time_aligned_ = std::abs(this->observer_lag_seconds_) < 1e-6;
   if (this->geo.prev_state_stamp >= 0.0 &&
       this->geo.prev_state_stamp < this->scan_stamp &&
       this->scan_stamp <= rclcpp::Time(this->imu_stamp).seconds()) {
+    std::vector<Eigen::Vector3f> velocities;
     const auto prediction = this->integrateImu(this->geo.prev_state_stamp,
-        this->geo.prev_q, this->geo.prev_p, this->geo.prev_vel, {this->scan_stamp});
+        this->geo.prev_q, this->geo.prev_p, this->geo.prev_vel, {this->scan_stamp}, &velocities);
     if (prediction.size() == 1) {
       this->observer_time_aligned_ = true;
       predicted_position = prediction.front().block<3, 1>(0, 3);
+      predicted_velocity = velocities.front();
       qhat = Eigen::Quaternionf(prediction.front().block<3, 3>(0, 0));
       qhat.normalize();
     }
@@ -3411,6 +3496,7 @@ void dlio::OdomNode::updateState() {
   // Update state
   this->state.p += dt * this->geo_Kp_ * err;
   this->state.v.lin.w += dt * this->geo_Kv_ * err;
+  Eigen::Vector3f scan_velocity = predicted_velocity + (this->state.v.lin.w - velocity_before_correction);
 
   // Velocity FLYWHEEL kill (doc/RUNTIME_GUARDS.md): along a held axis the
   // registration supplies no correction, so the velocity state free-integrates
@@ -3421,6 +3507,9 @@ void dlio::OdomNode::updateState() {
     this->state.v.lin.w = dlio::attenuateAlongHeldAxes(
         this->state.v.lin.w, this->gicp.lastDegenTransDirs(),
         1.f - static_cast<float>(this->geo_degen_vel_damp_));
+    scan_velocity = dlio::attenuateAlongHeldAxes(
+        scan_velocity, this->gicp.lastDegenTransDirs(),
+        1.f - static_cast<float>(this->geo_degen_vel_damp_));
   }
   // Slosh-guard response: while the detector is engaged, damp the velocity
   // along the TRACKED axis (persists across gate misses) -- the oscillation's
@@ -3430,6 +3519,8 @@ void dlio::OdomNode::updateState() {
     const float along = this->slosh_axis_.dot(this->state.v.lin.w);
     this->state.v.lin.w -=
         this->slosh_axis_ * (along * static_cast<float>(this->slosh_vel_damp_));
+    scan_velocity -= this->slosh_axis_ *
+        (this->slosh_axis_.dot(scan_velocity) * static_cast<float>(this->slosh_vel_damp_));
   }
 
   this->state.q.w() += dt * this->geo_Kq_ * qcorr.w();
@@ -3442,6 +3533,11 @@ void dlio::OdomNode::updateState() {
   this->geo.prev_p = this->state.p;
   this->geo.prev_q = this->state.q;
   this->geo.prev_vel = this->state.v.lin.w;
+  // Deskew's initial pose is lidarPose at scan_stamp. Pair it with velocity
+  // at that same instant, including this scan's observer/damping correction.
+  // prev_vel remains at prev_state_stamp for observer prediction. Reusing it
+  // for deskew double-counted the acceleration over the IMU lead interval.
+  this->geo.prev_scan_vel = scan_velocity;
   this->geo.prev_state_stamp = rclcpp::Time(this->imu_stamp).seconds();
 
   // Degeneracy covariance inflation (under geo.mtx, read by publishPose): mark
@@ -4202,6 +4298,16 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Lidar Image Channel", this->lidar_image_effective_channel_);
   kv("Photometric Points", std::to_string(this->gicp.lastPhotometricCount()));
   kv("Photometric Residual RMS", fnum(this->gicp.lastPhotometricRms(), 4));
+  const auto& texture = this->gicp.lastSurfaceTextureMatch();
+  kv("Surface Texture Accepted", texture.valid ? "true" : "false");
+  kv("Surface Texture Candidates", std::to_string(texture.candidates));
+  kv("Surface Texture Supported", std::to_string(texture.supported));
+  kv("Surface Texture Unique", std::to_string(texture.unique));
+  kv("Surface Texture Inliers", std::to_string(texture.inliers));
+  kv("Surface Texture Shift [m]", fnum(texture.shift, 4));
+  kv("Surface Texture Sigma [m]", fnum(texture.sigma, 4));
+  kv("Surface Texture Correlation", fnum(texture.correlation, 4));
+  kv("Surface Texture Geometry Ratio", fnum(this->gicp.lastSurfaceTextureWeakRatio(), 4));
   kv("Photometric Kernel Alpha", fnum(this->gicp.lastKernelAlpha(), 3));
   kv("Photometric Kernel Scale", fnum(this->gicp.lastKernelScale(), 4));
   kv("Visual Active", (this->visual_enabled_ && this->gicp.lastVisualCount() > 0) ? "1" : "0");

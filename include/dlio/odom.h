@@ -70,12 +70,13 @@ public:
 
   // Pure constant-jerk / constant-angular-acceleration integration between
   // IMU samples, evaluated at sorted_timestamps (the DLIO paper's analytic
-  // deskew kernel). Static and side-effect-free.
+  // deskew kernel). Optional velocities are evaluated at the same timestamps
+  // as the returned poses; the output vector is cleared before integration.
   static std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                          const std::vector<double>& sorted_timestamps,
                          const std::vector<ImuMeas>& imu,
-                         double gravity);
+                         double gravity, std::vector<Eigen::Vector3f>* velocities = nullptr);
 
   // Radiometric intensity correction (range + optional incidence angle), the
   // Kashani et al. model  I' = I * (r/r_ref)^alpha / max(cos_incidence, cos_min)
@@ -191,7 +192,8 @@ private:
   bool imuMeasFromTimeRange(double start_time, double end_time, std::vector<ImuMeas>& imu_range);
   std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
-                 const std::vector<double>& sorted_timestamps);
+                 const std::vector<double>& sorted_timestamps,
+                 std::vector<Eigen::Vector3f>* velocities = nullptr);
   void propagateGICP();
 
   void propagateState(const builtin_interfaces::msg::Time& stamp);
@@ -421,6 +423,7 @@ private:
     Eigen::Vector3f prev_p;
     Eigen::Quaternionf prev_q;
     Eigen::Vector3f prev_vel;
+    Eigen::Vector3f prev_scan_vel = Eigen::Vector3f::Zero();  // velocity at the previous LiDAR pose time
     double prev_state_stamp = -1.0;  // time of the stored observer state (latest IMU), not the LiDAR midpoint
   }; Geo geo;
 
@@ -614,6 +617,12 @@ private:
   bool use_reflectivity_;
   // Photometric term enabled (weight > 0 and a readable channel was resolved).
   bool photometric_active_;
+  bool surface_texture_enabled_ = false;
+  double surface_texture_scale_ = 1.0;
+  double surface_texture_previous_stamp_ = 0.0;
+  nano_gicp::TextureCloud::ConstPtr surface_texture_current_, surface_texture_previous_;
+  void prepareSurfaceTexture();
+  void rememberSurfaceTexture();
   // One-time intensity<->reflectivity fallback resolution against the actual
   // cloud fields (set on the first nonempty scan; see getScanFromROS).
   bool channel_resolved_ = false;
