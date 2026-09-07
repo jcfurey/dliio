@@ -210,3 +210,22 @@ resolves translation along the tunnel's primary curve.
 The [workspace follow-up](../../../docs/dliio-timed-observer-experiments.md)
 translates these leads into proposed tests and a possible bounded keyframe
 state model. None is silently credited to the current conditional observer.
+
+## 9. Offline revisit verification — checked 2026-09-07
+
+The [workspace investigation](../../../docs/dliio-global-tilt-revisits.md)
+uses held observations, multiple registration initializations, reverse checks,
+and point-to-plane geometry to distinguish useful revisit evidence from tunnel
+sliding. These are diagnostic checks, not calibrated graph-factor covariance.
+
+| BibTeX key | Primary source | Reading scope and use |
+|---|---|---|
+| `suenderhauf2012switchable` | [Author manuscript](https://nikosuenderhauf.github.io/assets/papers/IROS12-switchableConstraints.pdf) | §II: loop switch variables and switch priors; §IV, especially IV-D: convergence and failures in sparsely connected structures. A robust backend still needs careful correspondence validation; it is not a guarantee against repeated-tunnel aliases |
+| `kim2018scancontext` | [Author README](https://github.com/gisbi-kim/scancontext_tro) | Description/search stages, coarse yaw alignment and reverse-revisit candidate retrieval. Original paper not read in this follow-up. No code imported; the repository's terms must be reviewed before reuse |
+| `bonnabel2016covariance` | [Manuscript](https://arxiv.org/pdf/1410.7632v3) | Revisited point-to-point false information and point-to-plane degeneracy. Our centered/scaled Hessian eigenvalues characterize local geometry; they are not a covariance estimate for an edge built from shared observations |
+| `shan2020liosam` | [§III-E](https://arxiv.org/pdf/2007.00258v3) | Revisit-to-submap registration supplies a relative constraint before graph optimization. The current mapper still has no pose-revision backend |
+
+The offline tool uses OpenCV FLANN with one KD tree and unlimited checks.
+The [authoritative implementation](https://github.com/opencv/opencv/blob/4.x/modules/flann/include/opencv2/flann/kdtree_index.h)
+selects exact search for `FLANN_CHECKS_UNLIMITED`; a synthetic test compares its
+neighbors against brute force. This is an implementation citation, not new SLAM theory.
