@@ -72,9 +72,31 @@ struct OdomNodeTestAccess {
     n.scan_stamp = stamp;
     n.lidarPose.p.x() = static_cast<float>(stamp);
     n.deskewed_scan = cloud;
-    n.gicp_hasConverged.store(true);
     n.queueMappingPublish();
     if (n.publish_mapping_thread.joinable()) { n.publish_mapping_thread.join(); }
+  }
+  static bool alignMapping(OdomNode& n, bool overlap = true) {
+    auto target = std::make_shared<pcl::PointCloud<PointType>>();
+    for (int a = 1; a <= 6; ++a) {
+      for (int b = 1; b <= 6; ++b) {
+        PointType point{};
+        point.x = .1f*a; point.y = .1f*b; point.z = 0.f; target->push_back(point);
+        point.x = 0.f; point.y = .1f*a; point.z = .1f*b; target->push_back(point);
+        point.x = .1f*a; point.y = 0.f; point.z = .1f*b; target->push_back(point);
+      }
+    }
+    auto source = std::make_shared<pcl::PointCloud<PointType>>(*target);
+    if (!overlap) { for (auto& point : *source) { point.x += 5.f; } }
+    n.gicp.setNumThreads(1);
+    n.gicp.setCorrespondenceRandomness(10);
+    n.gicp.setMaxCorrespondenceDistance(.5);
+    n.gicp.setInputTarget(target);
+    n.gicp.setInputSource(source);
+    pcl::PointCloud<PointType> aligned;
+    n.gicp.align(aligned);
+    const bool converged = n.gicp.hasConverged();
+    n.gicp_hasConverged.store(!converged); // deliberately stale diagnostic status
+    return converged;
   }
   static void initializeTarget(OdomNode& n) { n.initializeInputTarget(); }
   static size_t registrationPoints(OdomNode& n) { return n.keyframes.back().second->size(); }
@@ -260,14 +282,19 @@ TEST_F(OutputContract, DenseKeyframeKeepsNearbyReturnsAndFrozenRegistration) {
 }
 
 TEST_F(OutputContract, InitialTargetPublishesDenseCloudButRetainsSparseRegistrationHistory) {
-  dlio::OdomNode node(options());
+  using Observation = direct_lidar_inertial_odometry::msg::MappingObservation;
+  auto opts = options(); opts.append_parameter_override("map/observation/enabled", true);
+  dlio::OdomNode node(opts);
   auto sink = std::make_shared<rclcpp::Node>("initial_dense_keyframe_sink");
   Cloud::ConstSharedPtr received;
   Pose::ConstSharedPtr pose;
+  std::vector<Observation::ConstSharedPtr> observations;
   auto sub = sink->create_subscription<Cloud>("kf_cloud", 10, [&](Cloud::ConstSharedPtr m) { received = m; });
   auto psub = sink->create_subscription<Pose>("kf_pose_stamped", 10, [&](Pose::ConstSharedPtr m) { pose = m; });
+  auto osub = sink->create_subscription<Observation>("mapping_observation", 8,
+      [&](Observation::ConstSharedPtr m) { observations.push_back(m); });
   rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
-  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node); }));
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::keyframeConnected(node) && Access::observationConnected(node); }));
   auto dense = cloud(); dense->push_back(dense->front());
   Access::captureKeyframe(node, dense, cloud(), false);
   Access::initializeTarget(node);
@@ -276,6 +303,13 @@ TEST_F(OutputContract, InitialTargetPublishesDenseCloudButRetainsSparseRegistrat
   EXPECT_EQ(received->header, pose->header);
   EXPECT_EQ(Access::registrationPoints(node), 1u);
   EXPECT_EQ(Access::keyframeCount(node), 1u);
+  ASSERT_TRUE(Access::alignMapping(node));
+  Access::queueMapping(node, dense, 11.05);
+  ASSERT_TRUE(waitFor(exec, [&] { return !observations.empty(); }));
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations.front()->observation_id, 0u);
+  EXPECT_EQ(observations.front()->header.stamp.sec, 11);
+  EXPECT_TRUE(observations.front()->registration_converged);
 }
 
 TEST_F(OutputContract, DenseKeyframeHonorsOptionalGhostFilterWithCapturedCenter) {
@@ -363,7 +397,7 @@ TEST_F(OutputContract, AtomicMappingOutputFreezesPoseQualityAndReportsUnknownCov
   checkChannels(received->cloud);
 }
 
-TEST_F(OutputContract, AtomicMappingSequencesShareOneFrontendSession) {
+TEST_F(OutputContract, AtomicMappingSequencesUseCurrentRegistrationInOneSession) {
   using Observation = direct_lidar_inertial_odometry::msg::MappingObservation;
   auto opts = options(); opts.append_parameter_override("map/observation/enabled", true);
   dlio::OdomNode node(opts);
@@ -373,13 +407,20 @@ TEST_F(OutputContract, AtomicMappingSequencesShareOneFrontendSession) {
       [&](Observation::ConstSharedPtr m) { received.push_back(m); });
   rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
   ASSERT_TRUE(waitFor(exec, [&] { return Access::observationConnected(node); }));
+  ASSERT_TRUE(Access::alignMapping(node));
   Access::queueMapping(node, cloud(), 10.05);
   Access::queueMapping(node, cloud(), 11.05);
-  ASSERT_TRUE(waitFor(exec, [&] { return received.size() == 2; }));
+  ASSERT_FALSE(Access::alignMapping(node, false));
+  Access::queueMapping(node, cloud(), 12.05);
+  ASSERT_TRUE(waitFor(exec, [&] { return received.size() == 3; }));
   EXPECT_EQ(received[0]->observation_id, 0u);
   EXPECT_EQ(received[1]->observation_id, 1u);
   EXPECT_EQ(received[0]->source_session_id, received[1]->source_session_id);
   EXPECT_TRUE(received[0]->registration_converged);
+  EXPECT_TRUE(received[1]->registration_converged);
+  EXPECT_FALSE(received[2]->registration_converged);
+  EXPECT_EQ(received[2]->observation_id, 2u);
+  EXPECT_EQ(received[0]->source_session_id, received[2]->source_session_id);
   EXPECT_EQ(received[0]->header.stamp.sec, 10);
   EXPECT_EQ(received[1]->header.stamp.sec, 11);
 }

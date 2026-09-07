@@ -24,6 +24,23 @@ subscribes to `/dlio/odom_node/mapping_observation`. Its
   when available. The frontend currently reports **UNKNOWN**, because its
   observer state and covariance do not describe the registered scan pose.
 
+Registered mapping observations begin after the first scan-to-map solve. The
+initial scan seeds the registration target and still publishes the legacy
+keyframe, but it has no registration result to report. Each later observation
+captures the current GICP result directly, before the diagnostic status cache
+is refreshed. An actual failed registration remains explicitly false and
+continues to reject graph optimization.
+
+The first Exyn replay of `b6bf902` exposed two false startup failure flags: the
+unregistered target and a stale status on the next observation. The startup
+publication/status fix preserves those old archives and their metadata; it
+does not reinterpret existing false flags as successful registration.
+The corrected Exyn short replay retained 165/165 observed mapping messages,
+all with current successful registration flags and absent covariance. Graph
+initialization on a sealed copy then passed with zero loop factors, preserving
+the original records and reconstructed geometry to numerical precision. This
+checks transport and graph readiness, not tunnel accuracy.
+
 The matrix convention is a **right/local SE(3) perturbation**:
 `T_true = T_est * Exp(delta)`, ordered `[tx, ty, tz, rx, ry, rz]` in metres and
 radians. This is explicitly different from the fixed/world-axis convention

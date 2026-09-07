@@ -1277,7 +1277,9 @@ void dlio::OdomNode::queueMappingPublish() {
   KeyframeOutput output{this->snapshotScanOutput(this->deskewed_scan),
       this->T_prior.block<2, 1>(0, 3), this->subfloor_reject_enabled_ && this->gravity_align_};
   output.observation_id = this->mapping_sequence_++;
-  output.registration_converged = this->gicp_hasConverged.load();
+  // The diagnostic cache is refreshed later in callbackPointCloud. Capture
+  // this scan's registration result before handing the snapshot to the worker.
+  output.registration_converged = this->gicp.hasConverged();
   output.degenerate_translation_modes = static_cast<uint8_t>(this->gicp.lastDegenTransDirs().size());
   output.degenerate_rotation_modes = static_cast<uint8_t>(this->gicp.lastDegenRotDirs().size());
   if (this->publish_mapping_thread.joinable()) { this->publish_mapping_thread.join(); }
@@ -2200,7 +2202,9 @@ void dlio::OdomNode::initializeInputTarget() {
     this->keyframe_lidar_refs.push_back(this->sampleKeyframeLidarRefs(this->current_scan, T_lw, img));
   }
   this->queueKeyframePublish();
-  this->queueMappingPublish();
+  // This scan seeds the target; no scan-to-map registration has happened yet.
+  // Keep the legacy initial keyframe, and begin registered mapping observations
+  // after the first actual solve instead of labelling initialization a failure.
 }
 
 void dlio::OdomNode::setInputSource() {

@@ -316,7 +316,7 @@ private:
   std::atomic<bool> first_imu_received;
   std::atomic<bool> imu_calibrated;
   std::atomic<bool> submap_hasChanged;
-  std::atomic<bool> gicp_hasConverged;
+  std::atomic<bool> gicp_hasConverged{false};
   std::atomic<bool> deskew_status;
   std::atomic<int> deskew_size;
 
