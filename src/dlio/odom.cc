@@ -394,6 +394,64 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Characteristic length for diagnostic rotation/translation scaling [m]; requires restart", 0.01, 1000.0);
   this->gicp.setGeometryDiagnostics(geometryDiagnostics, geometryLength);
 
+  dlio::declare_param(this, "odom/auxGravity/enabled", this->auxiliary_gravity_enabled_, false,
+      "Experimental bounded gravity-direction correction before observer/map updates; requires restart");
+  dlio::declare_param(this, "odom/auxGravity/gain", this->auxiliary_gravity_gain_, 1.,
+      "Tilt correction rate constant [1/s]; zero monitors without changing the pose", 0., 20.);
+  dlio::declare_param(this, "odom/auxGravity/maxCorrectionRateDeg", this->auxiliary_gravity_max_rate_, 5.,
+      "Maximum auxiliary tilt correction [deg/s], independent of physical rotation", 0., 100.);
+  dlio::declare_param(this, "odom/auxGravity/maxDisagreementDeg", this->auxiliary_gravity_max_disagreement_, 30.,
+      "Reject auxiliary gravity disagreement above this angle [deg]", 0., 90.);
+  dlio::declare_param(this, "odom/auxGravity/maxBracketGap", this->auxiliary_gravity_max_gap_, .05,
+      "Maximum acquisition interval bracketing the scan midpoint [s]; no extrapolation", .0001, .5);
+  std::string gravity_topic;
+  dlio::declare_param(this, "odom/auxGravity/topic", gravity_topic, std::string("/dliio/auxiliary_gravity"),
+      "Vector3Stamped world-up direction already expressed in frames/baselink");
+  if (!std::isfinite(this->auxiliary_gravity_gain_) || !std::isfinite(this->auxiliary_gravity_max_rate_) ||
+      !std::isfinite(this->auxiliary_gravity_max_disagreement_) || !std::isfinite(this->auxiliary_gravity_max_gap_))
+    throw std::invalid_argument("Auxiliary gravity parameters must be finite");
+  if (this->auxiliary_gravity_enabled_) {
+    this->gravity_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions gravity_options;
+    gravity_options.callback_group = this->gravity_cb_group_;
+    this->gravity_sub_ = this->create_subscription<geometry_msgs::msg::Vector3Stamped>(gravity_topic,
+        rclcpp::SensorDataQoS().keep_last(100),
+        std::bind(&dlio::OdomNode::callbackGravity, this, std::placeholders::_1), gravity_options);
+  }
+
+  dlio::declare_param(this, "odom/observer/measurementTimeUpdates", this->timed_observer_enabled_, false,
+      "Experimental geometric observer with scan-time corrections, raw-IMU replay, and conditional covariance");
+  dlio::ObserverSettings observer_settings;
+  observer_settings.gravity = this->gravity_;
+  observer_settings.kp = this->geo_Kp_; observer_settings.kv = this->geo_Kv_;
+  observer_settings.kq = this->geo_Kq_; observer_settings.kab = this->geo_Kab_;
+  observer_settings.kgb = this->geo_Kgb_;
+  observer_settings.accel_bias_limit = this->geo_abias_max_;
+  observer_settings.gyro_bias_limit = this->geo_gbias_max_;
+  dlio::declare_param(this, "odom/observer/accelNoiseDensity", observer_settings.accel_density, .03,
+      "Assumed body accelerometer noise density [m/s^2/sqrt(Hz)]; not calibrated from this bag", 0., 10.);
+  dlio::declare_param(this, "odom/observer/gyroNoiseDensity", observer_settings.gyro_density, .002,
+      "Assumed body gyro noise density [rad/s/sqrt(Hz)]", 0., 1.);
+  dlio::declare_param(this, "odom/observer/accelBiasWalk", observer_settings.accel_bias_walk, .0005,
+      "Assumed accelerometer bias random walk [m/s^2/sqrt(s)]", 0., 1.);
+  dlio::declare_param(this, "odom/observer/gyroBiasWalk", observer_settings.gyro_bias_walk, .00005,
+      "Assumed gyro bias random walk [rad/s/sqrt(s)]", 0., 1.);
+  std::vector<double> observer_pose_noise;
+  dlio::declare_param(this, "odom/observer/poseNoise", observer_pose_noise,
+      std::vector<double>{.09, .09, .09, .01, .01, .01},
+      "Assumed external registration covariance diagonal [world XYZ, world rotation]; excludes reused-map correlations");
+  if (observer_pose_noise.size() != 6 || std::any_of(observer_pose_noise.begin(), observer_pose_noise.end(),
+      [](double x) { return !std::isfinite(x) || x <= 0.; }))
+    throw std::invalid_argument("Observer pose noise must contain six finite positive variances");
+  this->timed_pose_noise_.setZero();
+  for (int i = 0; i < 6; ++i) this->timed_pose_noise_(i, i) = observer_pose_noise[i];
+  if (this->timed_observer_enabled_) {
+    if (this->geo_degen_obs_gain_ != 1. || this->geo_degen_vel_damp_ != 0. || this->slosh_enabled_ ||
+        (this->degen_gov_enabled_ && (this->degen_gov_cov_pos_var_ > 0. || this->degen_gov_cov_rot_var_ > 0.)))
+      throw std::invalid_argument("Measurement-time observer currently requires unattenuated gains and no extra covariance inflation");
+    this->timed_observer_ = std::make_unique<dlio::TimedObserver>(observer_settings);
+  }
+
   this->lidar_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   auto lidar_sub_opt = rclcpp::SubscriptionOptions();
   lidar_sub_opt.callback_group = this->lidar_cb_group;
@@ -1073,11 +1131,24 @@ void dlio::OdomNode::publishPose() {
   const bool cov_inflate = this->degen_gov_enabled_ &&
       (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0);
   std::array<double, 36> cov_extra{};
+  dlio::PoseCovariance timed_pose, timed_twist;
   {
     std::lock_guard<std::mutex> lock(this->geo.mtx);
     st = this->state;
     stamp = this->imu_stamp;
     if (cov_inflate) { cov_extra = this->degen_cov_extra_; }
+    if (this->timed_observer_enabled_) {
+      if (!this->timed_observer_->initialized() || !this->timed_observer_->latest().covariance_valid) return;
+      timed_pose = dlio::TimedObserver::poseCovariance(this->timed_observer_->latest());
+      timed_twist = dlio::TimedObserver::twistCovariance(this->timed_observer_->latest());
+    }
+  }
+
+  if (this->timed_observer_enabled_) {
+    for (int r = 0; r < 6; ++r) for (int c = 0; c < 6; ++c) {
+      this->odom_ros.pose.covariance[r*6+c] = timed_pose(r, c);
+      this->odom_ros.twist.covariance[r*6+c] = timed_twist(r, c);
+    }
   }
 
   // Degeneracy cov inflation: base diagonal + the rank-1 held-axis terms. Only
@@ -1562,6 +1633,17 @@ dlio::OdomNode::onSetParams(const std::vector<rclcpp::Parameter>& params) {
   // These settings initialize a retained frame pair and are startup-only.
   // Reject the whole update before queuing any live settings in the same call.
   for (const auto& p : params) {
+    if (p.get_name().rfind("odom/observer/", 0) == 0 ||
+        (this->timed_observer_enabled_ && p.get_name().rfind("odom/geo/", 0) == 0)) {
+      result.successful = false;
+      result.reason = "Measurement-time observer settings and gains require a node restart";
+      return result;
+    }
+    if (p.get_name().rfind("odom/auxGravity/", 0) == 0) {
+      result.successful = false;
+      result.reason = "Auxiliary gravity settings require a node restart";
+      return result;
+    }
     if (p.get_name().rfind("odom/gicp/surfaceTexture/", 0) == 0) {
       result.successful = false;
       result.reason = "Surface texture settings require a node restart";
@@ -2281,13 +2363,18 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::msg::PointCloud2::Sha
 
 void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw) {
 
+  this->imu_delivery_.receipt(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
   // transformImu uses the baselink<-imu extrinsic; wait until it's resolved
   // (tf mode). Drops the brief startup window before tf is available.
-  if (!this->extrinsics_ready_.load()) { return; }
+  if (!this->extrinsics_ready_.load()) { this->imu_delivery_.waitingExtrinsics(); return; }
 
-  if (imu_raw->header.stamp.sec < 0 || imu_raw->header.stamp.nanosec >= 1000000000u) { return; }
+  if (imu_raw->header.stamp.sec < 0 || imu_raw->header.stamp.nanosec >= 1000000000u) {
+    this->imu_delivery_.rejectedTime(); return;
+  }
   const int64_t input_ns = rclcpp::Time(imu_raw->header.stamp).nanoseconds();
   if (input_ns <= this->last_imu_input_ns_) {
+    this->imu_delivery_.rejectedTime();
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
         "Skipping duplicate or backward IMU timestamp; restart for a new session");
     return;
@@ -2297,10 +2384,11 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
     this->prev_imu_stamp = this->first_imu_stamp;
   }
   this->last_imu_input_ns_ = input_ns;
+  this->imu_delivery_.accepted(input_ns);
   this->first_imu_received = true;
 
   sensor_msgs::msg::Imu::SharedPtr imu = this->transformImu( imu_raw );
-  if (!this->geo.first_opt_done) {
+  if (!this->timed_observer_enabled_ && !this->geo.first_opt_done) {
     // Before propagation starts, the initialized state is stationary. Once
     // running, publish the timestamp atomically with the propagated state.
     std::lock_guard<std::mutex> lock(this->geo.mtx);
@@ -2448,22 +2536,67 @@ void dlio::OdomNode::callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu_raw)
 
     this->imu_meas.lin_accel = lin_accel_corrected;
     this->imu_meas.ang_vel = ang_vel_corrected;
+    this->imu_meas.raw_accel = this->imu_accel_sm_ * lin_accel;
+    this->imu_meas.raw_gyro = ang_vel;
+    this->imu_meas.raw_valid = this->imu_meas.raw_accel.allFinite() && this->imu_meas.raw_gyro.allFinite();
 
     // Store calibrated IMU measurements into imu buffer for manual integration later.
     this->mtx_imu.lock();
     this->imu_buffer.push_front(this->imu_meas);
     this->mtx_imu.unlock();
+    this->imu_delivery_.buffered(input_ns);
 
     // Notify the callbackPointCloud thread that IMU data exists for this time
     this->cv_imu_stamp.notify_one();
 
-    if (this->geo.first_opt_done) {
+    if (this->timed_observer_enabled_ || this->geo.first_opt_done) {
       // Geometric Observer: Propagate State
       this->propagateState(imu->header.stamp);
     }
 
   }
 
+}
+
+void dlio::OdomNode::callbackGravity(const geometry_msgs::msg::Vector3Stamped::SharedPtr gravity) {
+  ++this->gravity_received_;
+  if (gravity->header.frame_id != this->baselink_frame || gravity->header.stamp.sec < 0 ||
+      gravity->header.stamp.nanosec >= 1000000000u ||
+      !this->gravity_buffer_.push(rclcpp::Time(gravity->header.stamp).nanoseconds(),
+          Eigen::Vector3d(gravity->vector.x, gravity->vector.y, gravity->vector.z))) {
+    ++this->gravity_rejected_;
+  }
+}
+
+void dlio::OdomNode::applyAuxiliaryGravity() {
+  this->gravity_raw_registration_q_ = Eigen::Quaternionf(this->T.block<3, 3>(0, 0));
+  this->gravity_raw_registration_q_.normalize();
+  this->gravity_applied_angle_ = 0.;
+  this->gravity_disagreement_ = 0.;
+  this->gravity_lower_ns_ = this->gravity_upper_ns_ = -1;
+  if (!this->auxiliary_gravity_enabled_) { this->gravity_status_ = "disabled"; return; }
+  Eigen::Vector3d up_body;
+  if (!this->gravity_buffer_.at(std::llround(this->scan_stamp*1e9),
+      std::llround(this->auxiliary_gravity_max_gap_*1e9), up_body,
+      this->gravity_lower_ns_, this->gravity_upper_ns_)) {
+    this->gravity_status_ = "missing or stale bracket"; return;
+  }
+  constexpr double radians = M_PI/180.;
+  const auto correction = dlio::correctGravity(this->gravity_raw_registration_q_.cast<double>(),
+      up_body, this->scan_stamp-this->prev_scan_stamp, this->auxiliary_gravity_gain_,
+      this->auxiliary_gravity_max_rate_*radians, this->auxiliary_gravity_max_disagreement_*radians);
+  this->gravity_disagreement_ = correction.disagreement/radians;
+  this->gravity_applied_angle_ = correction.applied_angle/radians;
+  if (!correction.accepted) { this->gravity_status_ = "rejected pose, interval, or disagreement"; return; }
+  this->gravity_status_ = "monitor";
+  if (correction.applied_angle > 0.) {
+    this->gravity_status_ = "applied bounded tilt correction";
+    ++this->gravity_corrections_;
+    this->T.block<3, 3>(0, 0) = correction.orientation.toRotationMatrix().cast<float>();
+    // Every downstream cloud, mapping pose, observer correction, and next
+    // deskew seed must refer to the same adjusted registration.
+    this->T_corr = this->T * this->T_prior.inverse();
+  }
 }
 
 void dlio::OdomNode::callbackImage(const sensor_msgs::msg::Image::SharedPtr img) {
@@ -2945,6 +3078,7 @@ void dlio::OdomNode::getNextPose() {
   const Eigen::Matrix4f T_prev_governed = this->T;   // previous (governed) output pose
   this->T_corr = this->gicp.getFinalTransformation(); // "correction" transformation
   this->T = this->T_corr * this->T_prior;
+  this->applyAuxiliaryGravity();
 
   // Degeneracy GOVERNOR: cap per-scan output motion along the eigen-directions
   // the gate held to the IMU prior, so a held axis cannot dead-reckon into the
@@ -3180,16 +3314,68 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   const std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>> empty;
   if (velocities) { velocities->clear(); }
 
-  if (sorted_timestamps.empty() || start_time > sorted_timestamps.front()) {
+  if (sorted_timestamps.empty()) {
     // invalid input, return empty vector
     return empty;
   }
 
   std::vector<ImuMeas> imu_range;
-  if (this->imuMeasFromTimeRange(start_time, sorted_timestamps.back(), imu_range) == false) {
+  if (this->imuMeasFromTimeRange(std::min(start_time, sorted_timestamps.front()),
+      std::max(start_time, sorted_timestamps.back()), imu_range) == false) {
     // not enough IMU measurements, return empty vector
     return empty;
   }
+
+  if (this->timed_observer_enabled_) {
+    Eigen::Vector3f ba, bg;
+    {
+      std::lock_guard<std::mutex> lock(this->geo.mtx);
+      ba = this->state.b.accel; bg = this->state.b.gyro;
+      if (this->timed_observer_->initialized()) {
+        ba = this->timed_observer_->scan().state.ba.cast<float>();
+        bg = this->timed_observer_->scan().state.bg.cast<float>();
+      }
+    }
+    for (auto& sample : imu_range) {
+      if (!sample.raw_valid) return empty;
+      sample.lin_accel = sample.raw_accel-ba;
+      sample.ang_vel = sample.raw_gyro-bg;
+    }
+  }
+
+  return integrateImuWindow(start_time, q_init, p_init, v_init, sorted_timestamps,
+                            std::move(imu_range), this->gravity_, velocities);
+}
+
+std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+dlio::OdomNode::integrateImuWindow(double start_time, Eigen::Quaternionf q_init,
+    Eigen::Vector3f p_init, Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps,
+    std::vector<ImuMeas> imu_range, double gravity, std::vector<Eigen::Vector3f>* velocities) {
+  if (velocities) velocities->clear();
+  if (sorted_timestamps.empty() || imu_range.size() < 2 ||
+      !std::is_sorted(sorted_timestamps.begin(), sorted_timestamps.end())) return {};
+  if (start_time > sorted_timestamps.front()) {
+    if (sorted_timestamps.back() > start_time) return {};  // no mixed-direction window
+    // Reverse time s=-t: velocity and angular velocity change sign, whereas
+    // acceleration and gravity do not. Reuse the exact forward deskew kernel.
+    std::reverse(imu_range.begin(), imu_range.end());
+    for (size_t i = 0; i < imu_range.size(); ++i) {
+      imu_range[i].stamp = -imu_range[i].stamp;
+      imu_range[i].ang_vel = -imu_range[i].ang_vel;
+      if (i) imu_range[i].dt = imu_range[i].stamp-imu_range[i-1].stamp;
+    }
+    std::vector<double> reversed;
+    for (auto it = sorted_timestamps.rbegin(); it != sorted_timestamps.rend(); ++it) reversed.push_back(-*it);
+    auto result = integrateImuWindow(-start_time, q_init, p_init, -v_init, reversed,
+                                    std::move(imu_range), gravity, velocities);
+    std::reverse(result.begin(), result.end());
+    if (velocities) {
+      std::reverse(velocities->begin(), velocities->end());
+      for (auto& velocity : *velocities) velocity = -velocity;
+    }
+    return result;
+  }
+  if (imu_range.front().stamp > start_time || imu_range.back().stamp < sorted_timestamps.back()) return {};
 
   // Backwards integration to find pose at first IMU sample
   const ImuMeas& f1 = imu_range[0];
@@ -3231,11 +3417,11 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
 
   // Acceleration at first IMU sample
   Eigen::Vector3f a1 = q_init._transformVector(f1.lin_accel);
-  a1[2] -= this->gravity_;
+  a1[2] -= gravity;
 
   // Acceleration at second IMU sample
   Eigen::Vector3f a2 = q2._transformVector(f2.lin_accel);
-  a2[2] -= this->gravity_;
+  a2[2] -= gravity;
 
   // Jerk between first two IMU samples
   Eigen::Vector3f j = (a2 - a1) / dt;
@@ -3246,7 +3432,7 @@ dlio::OdomNode::integrateImu(double start_time, Eigen::Quaternionf q_init, Eigen
   // Set p_init to position at first IMU sample (go backwards from start_time)
   p_init -= v_init*idt + 0.5*a1*idt*idt + (1/6.)*j*idt*idt*idt;
 
-  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, this->gravity_, velocities);
+  return integrateImuInternal(q_init, p_init, v_init, sorted_timestamps, imu_range, gravity, velocities);
 }
 
 std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
@@ -3373,6 +3559,25 @@ void dlio::OdomNode::propagateState(const builtin_interfaces::msg::Time& stamp) 
 
   // Lock thread to prevent state from being accessed by UpdateState
   std::lock_guard<std::mutex> lock( this->geo.mtx );
+  if (this->timed_observer_enabled_ && !this->timed_observer_->initialized()) {
+    // The sample is now in imu_buffer. Publish the startup timestamp only
+    // after buffering, under the same lock used to initialize/replay state.
+    this->imu_stamp = stamp;
+    return;
+  }
+  if (this->timed_observer_enabled_ && this->timed_observer_->initialized()) {
+    const auto& measurement = this->imu_meas;
+    if (!measurement.raw_valid || !this->timed_observer_->append({measurement.stamp, measurement.dt,
+        measurement.raw_accel.cast<double>(), measurement.raw_gyro.cast<double>()})) {
+      ++this->timed_input_rejected_;
+      this->timed_observer_->invalidate();
+      return;
+    }
+    this->imu_stamp = stamp;
+    this->syncTimedState();
+    this->imu_delivery_.propagated();
+    return;
+  }
   this->imu_stamp = stamp;
 
   double dt = this->imu_meas.dt;
@@ -3406,12 +3611,88 @@ void dlio::OdomNode::propagateState(const builtin_interfaces::msg::Time& stamp) 
   this->state.v.ang.b = this->imu_meas.ang_vel;
   this->state.v.ang.w = this->state.q.toRotationMatrix() * this->state.v.ang.b;
 
+  this->imu_delivery_.propagated();
+
+}
+
+void dlio::OdomNode::syncTimedState() {
+  const auto& latest = this->timed_observer_->latest();
+  const auto& value = latest.state;
+  this->state.p = value.p.cast<float>();
+  this->state.q = value.q.cast<float>();
+  this->state.v.lin.w = value.v.cast<float>();
+  this->state.v.lin.b = (value.q.conjugate()*value.v).cast<float>();
+  this->state.b.accel = value.ba.cast<float>();
+  this->state.b.gyro = value.bg.cast<float>();
+  this->state.v.ang.b = (latest.measured_gyro-value.bg).cast<float>();
+  this->state.v.ang.w = this->state.q*this->state.v.ang.b;
+}
+
+void dlio::OdomNode::updateTimedState() {
+  auto& observer = *this->timed_observer_;
+  const double latest_stamp = rclcpp::Time(this->imu_stamp).seconds();
+  this->observer_lag_seconds_ = latest_stamp-this->scan_stamp;
+  this->observer_time_aligned_ = false;
+  this->observer_innovation_stamp_ = this->scan_stamp;
+  if (!observer.initialized()) {
+    if (this->scan_stamp > latest_stamp) { ++this->timed_update_rejected_; return; }
+    dlio::ObserverSnapshot seed;
+    seed.stamp = this->scan_stamp;
+    seed.state.p = this->lidarPose.p.cast<double>();
+    seed.state.q = this->lidarPose.q.cast<double>().normalized();
+    seed.state.v = this->state.v.lin.w.cast<double>();
+    seed.state.ba = this->state.b.accel.cast<double>();
+    seed.state.bg = this->state.b.gyro.cast<double>();
+    // Explicit initialization assumptions, not uncertainty measured from the bag.
+    dlio::PoseCovariance coordinates = dlio::PoseCovariance::Identity();
+    coordinates.block<3, 3>(3, 3) = seed.state.q.toRotationMatrix().transpose();
+    seed.covariance.topLeftCorner<6, 6>() = coordinates*this->timed_pose_noise_*coordinates.transpose();
+    seed.covariance.diagonal().segment<3>(6).setConstant(.25);
+    seed.covariance.diagonal().segment<3>(9).setConstant(.04);
+    seed.covariance.diagonal().segment<3>(12).setConstant(.0001);
+    observer.initialize(seed);
+    std::vector<ImuMeas> retained;
+    {
+      std::lock_guard<decltype(this->mtx_imu)> lock(this->mtx_imu);
+      retained.assign(this->imu_buffer.rbegin(), this->imu_buffer.rend());
+    }
+    // An IMU callback can have buffered a sample while waiting for geo.mtx.
+    // Replay only through the state stamp already owned by this observer.
+    for (const auto& sample : retained) {
+      if (sample.stamp <= seed.stamp || sample.stamp > latest_stamp) continue;
+      if (!sample.raw_valid || !observer.append({sample.stamp, sample.dt,
+          sample.raw_accel.cast<double>(), sample.raw_gyro.cast<double>()})) {
+        ++this->timed_input_rejected_; observer.invalidate(); break;
+      }
+    }
+    if (std::abs(observer.latest().stamp-latest_stamp) > 1e-6) observer.invalidate();
+    this->observer_position_innovation_.setZero();
+    this->observer_orientation_innovation_.setIdentity();
+    this->observer_time_aligned_ = true;
+  } else {
+    dlio::ObserverSnapshot predicted;
+    if (!observer.at(this->scan_stamp, predicted)) { ++this->timed_update_rejected_; return; }
+    this->observer_position_innovation_ = this->lidarPose.p-predicted.state.p.cast<float>();
+    this->observer_orientation_innovation_ = predicted.state.q.cast<float>().conjugate()*this->lidarPose.q;
+    if (!observer.correct(this->scan_stamp, this->lidarPose.p.cast<double>(),
+        this->lidarPose.q.cast<double>().normalized(), this->timed_pose_noise_)) {
+      ++this->timed_update_rejected_; return;
+    }
+    this->observer_time_aligned_ = true;
+  }
+  this->syncTimedState();
+  this->geo.prev_p = this->state.p;
+  this->geo.prev_q = this->state.q;
+  this->geo.prev_vel = this->state.v.lin.w;
+  this->geo.prev_scan_vel = observer.scan().state.v.cast<float>();
+  this->geo.prev_state_stamp = observer.latest().stamp;
 }
 
 void dlio::OdomNode::updateState() {
 
   // Lock thread to prevent state from being accessed by PropagateState
   std::lock_guard<std::mutex> lock( this->geo.mtx );
+  if (this->timed_observer_enabled_) { this->updateTimedState(); return; }
 
   Eigen::Vector3f pin = this->lidarPose.p;
   Eigen::Quaternionf qin = this->lidarPose.q;
@@ -3432,17 +3713,23 @@ void dlio::OdomNode::updateState() {
   this->observer_lag_seconds_ = rclcpp::Time(this->imu_stamp).seconds() - this->scan_stamp;
   this->observer_time_aligned_ = std::abs(this->observer_lag_seconds_) < 1e-6;
   if (this->geo.prev_state_stamp >= 0.0 &&
-      this->geo.prev_state_stamp < this->scan_stamp &&
       this->scan_stamp <= rclcpp::Time(this->imu_stamp).seconds()) {
-    std::vector<Eigen::Vector3f> velocities;
-    const auto prediction = this->integrateImu(this->geo.prev_state_stamp,
-        this->geo.prev_q, this->geo.prev_p, this->geo.prev_vel, {this->scan_stamp}, &velocities);
-    if (prediction.size() == 1) {
+    if (std::abs(this->geo.prev_state_stamp-this->scan_stamp) < 1e-9) {
       this->observer_time_aligned_ = true;
-      predicted_position = prediction.front().block<3, 1>(0, 3);
-      predicted_velocity = velocities.front();
-      qhat = Eigen::Quaternionf(prediction.front().block<3, 3>(0, 0));
-      qhat.normalize();
+      predicted_position = this->geo.prev_p;
+      predicted_velocity = this->geo.prev_vel;
+      qhat = this->geo.prev_q;
+    } else {
+      std::vector<Eigen::Vector3f> velocities;
+      const auto prediction = this->integrateImu(this->geo.prev_state_stamp,
+          this->geo.prev_q, this->geo.prev_p, this->geo.prev_vel, {this->scan_stamp}, &velocities);
+      if (prediction.size() == 1) {
+        this->observer_time_aligned_ = true;
+        predicted_position = prediction.front().block<3, 1>(0, 3);
+        predicted_velocity = velocities.front();
+        qhat = Eigen::Quaternionf(prediction.front().block<3, 3>(0, 0));
+        qhat.normalize();
+      }
     }
   }
 
@@ -4258,12 +4545,29 @@ void dlio::OdomNode::publishDiagnostics() {
     std::ostringstream os; os << std::fixed << std::setprecision(prec) << v; return os.str();
   };
 
+  State observed;
+  builtin_interfaces::msg::Time observed_stamp;
+  dlio::ObserverSnapshot covariance_snapshot;
+  bool covariance_ready = false;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    observed = this->state;
+    observed_stamp = this->imu_stamp;
+    if (this->timed_observer_enabled_ && this->timed_observer_->initialized()) {
+      covariance_snapshot = this->timed_observer_->latest();
+      covariance_ready = true;
+    }
+  }
+
   // Health: WARN while the degeneracy gate is active or the per-scan budget
   // (the LiDAR period) is blown; ERROR if GICP failed to converge.
   double scan_period_ms = (lidar_rate > 0.0) ? 1000.0 / lidar_rate : 0.0;
   const size_t held_dirs = this->gicp.lastDegenTransDirs().size() +
                            this->gicp.lastDegenRotDirs().size();
-  if (!this->gicp_hasConverged.load()) {
+  if (covariance_ready && !covariance_snapshot.covariance_valid) {
+    st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    st.message = "Observer covariance model invalid; odometry publication withheld until restart";
+  } else if (!this->gicp_hasConverged.load()) {
     st.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
     st.message = "GICP did not converge";
   } else if (this->loc_gate_axes_current_ > 0) {
@@ -4292,21 +4596,52 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Keyframes", std::to_string(this->keyframes.size()));
   kv("Deskewed Points", std::to_string(this->deskew_size.load()));
   kv("Observer Time Aligned", this->observer_time_aligned_ ? "1" : "0");
-  kv("Odometry Covariance Model", this->degen_gov_enabled_ &&
+  kv("Odometry Covariance Model", this->timed_observer_enabled_
+      ? "conditional geometric observer; independent external pose noise assumed"
+      : this->degen_gov_enabled_ &&
       (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0)
       ? "configured diagonal plus held-axis inflation" : "configured diagonal");
-  kv("Observer Covariance Propagated", "false");
+  kv("Observer Covariance Propagated", covariance_ready ? "true" : "false");
+  kv("Observer Covariance Valid", covariance_ready && covariance_snapshot.covariance_valid ? "true" : "false");
+  kv("Observer Rejected Raw IMU", std::to_string(this->timed_input_rejected_.load()));
+  kv("Observer Rejected Pose Update", std::to_string(this->timed_update_rejected_.load()));
+  if (covariance_ready) {
+    std::ostringstream joint;
+    joint << std::setprecision(17);
+    for (int r = 0; r < 15; ++r) for (int c = 0; c < 15; ++c) {
+      if (r || c) joint << ',';
+      joint << covariance_snapshot.covariance(r, c);
+    }
+    kv("Observer Joint Covariance Row Major [p_world,theta_body,v_world,ba_body,bg_body]", joint.str());
+  }
+  kv("Auxiliary Gravity Status", this->gravity_status_);
+  kv("Auxiliary Gravity Received", std::to_string(this->gravity_received_.load()));
+  kv("Auxiliary Gravity Rejected Input", std::to_string(this->gravity_rejected_.load()));
+  kv("Auxiliary Gravity Corrections", std::to_string(this->gravity_corrections_));
+  kv("Auxiliary Gravity Disagreement (deg)", fnum(this->gravity_disagreement_, 6));
+  kv("Auxiliary Gravity Applied (deg)", fnum(this->gravity_applied_angle_, 6));
+  kv("Auxiliary Gravity Lower Stamp (ns)", std::to_string(this->gravity_lower_ns_));
+  kv("Auxiliary Gravity Upper Stamp (ns)", std::to_string(this->gravity_upper_ns_));
+  for (int i = 0; i < 4; ++i)
+    kv("Raw GICP Quaternion " + std::string(1, "xyzw"[i]), fnum(this->gravity_raw_registration_q_.coeffs()[i], 9));
+  const auto delivery = this->imu_delivery_.snapshot();
+  kv("IMU Callback Received", std::to_string(delivery.received));
+  kv("IMU Waiting Extrinsics", std::to_string(delivery.waiting_extrinsics));
+  kv("IMU Rejected Timestamp", std::to_string(delivery.rejected_time));
+  kv("IMU Accepted", std::to_string(delivery.accepted));
+  kv("IMU Buffered", std::to_string(delivery.buffered));
+  kv("IMU Propagated", std::to_string(delivery.propagated));
+  kv("IMU First Accepted Stamp (ns)", std::to_string(delivery.first_accepted_ns));
+  kv("IMU Last Accepted Stamp (ns)", std::to_string(delivery.last_accepted_ns));
+  kv("IMU Last Buffered Stamp (ns)", std::to_string(delivery.last_buffered_ns));
+  kv("IMU Max Acquisition Gap (ms)", fnum(delivery.max_acquisition_gap_ns * 1e-6, 6));
+  kv("IMU Max Gap Stamp (ns)", std::to_string(delivery.max_gap_stamp_ns));
+  kv("IMU Last Receipt Steady (ns)", std::to_string(delivery.last_receipt_ns));
+  kv("IMU Max Receipt Gap (ms)", fnum(delivery.max_receipt_gap_ns * 1e-6, 6));
   kv("Observer IMU Lead (ms)", fnum(1000.0 * this->observer_lag_seconds_, 2));
   // Preserve a coherent state/time snapshot for live failure investigations.
   // State propagation can advance beyond the scan midpoint before this
   // callback publishes; keep both timestamps explicit.
-  State observed;
-  builtin_interfaces::msg::Time observed_stamp;
-  {
-    std::lock_guard<std::mutex> lock(this->geo.mtx);
-    observed = this->state;
-    observed_stamp = this->imu_stamp;
-  }
   kv("Registration Stamp (s)", fnum(this->scan_stamp, 9));
   kv("Observer Innovation Stamp (s)", fnum(this->observer_innovation_stamp_, 9));
   kv("Observer State Stamp (s)", fnum(rclcpp::Time(observed_stamp).seconds(), 9));

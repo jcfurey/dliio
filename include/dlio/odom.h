@@ -22,11 +22,15 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include "dlio/imu_delivery.h"
+#include "dlio/auxiliary_gravity.h"
+#include "dlio/timed_observer.h"
 #include <deque>
 #include <map>
 #include <tf2_ros/transform_broadcaster.h>
@@ -66,12 +70,19 @@ public:
     double dt; // defined as the difference between the current and the previous measurement
     Eigen::Vector3f ang_vel;
     Eigen::Vector3f lin_accel;
+    Eigen::Vector3f raw_accel = Eigen::Vector3f::Zero(), raw_gyro = Eigen::Vector3f::Zero();
+    bool raw_valid = false;
   };
 
   // Pure constant-jerk / constant-angular-acceleration integration between
   // IMU samples, evaluated at sorted_timestamps (the DLIO paper's analytic
   // deskew kernel). Optional velocities are evaluated at the same timestamps
   // as the returned poses; the output vector is cleared before integration.
+  static std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
+    integrateImuWindow(double start_time, Eigen::Quaternionf q_init, Eigen::Vector3f p_init,
+                       Eigen::Vector3f v_init, const std::vector<double>& sorted_timestamps,
+                       std::vector<ImuMeas> imu, double gravity,
+                       std::vector<Eigen::Vector3f>* velocities = nullptr);
   static std::vector<Eigen::Matrix4f, Eigen::aligned_allocator<Eigen::Matrix4f>>
     integrateImuInternal(Eigen::Quaternionf q_init, Eigen::Vector3f p_init, Eigen::Vector3f v_init,
                          const std::vector<double>& sorted_timestamps,
@@ -136,6 +147,8 @@ private:
 
   void callbackPointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr pc);
   void callbackImu(const sensor_msgs::msg::Imu::SharedPtr imu);
+  void callbackGravity(const geometry_msgs::msg::Vector3Stamped::SharedPtr gravity);
+  void applyAuxiliaryGravity();
   void callbackImage(const sensor_msgs::msg::Image::SharedPtr img);
   // Set up the visual term on `gicp` for this scan (picks the image nearest
   // scan_stamp, computes the camera transforms). Returns true if the visual
@@ -198,6 +211,8 @@ private:
 
   void propagateState(const builtin_interfaces::msg::Time& stamp);
   void updateState();
+  void updateTimedState();  // called with geo.mtx held
+  void syncTimedState();   // called with geo.mtx held
 
   void setAdaptiveParams();
 
@@ -243,6 +258,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub;
   rclcpp::CallbackGroup::SharedPtr lidar_cb_group, imu_cb_group, image_cb_group;
+  rclcpp::CallbackGroup::SharedPtr gravity_cb_group_;
+  rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr gravity_sub_;
   // Optional raw Livox CustomMsg ingestion (built only with livox_ros_driver2).
   // Type-erased so odom.h carries no livox_ros_driver2 dependency and the class
   // layout is identical with or without it; wired up in the constructor (.cc).
@@ -389,6 +406,7 @@ private:
   // Each input stream is ordered independently. Replaying a new time epoch
   // requires a fresh node; never integrate duplicate or backward measurements.
   int64_t last_imu_input_ns_ = -1;
+  dlio::ImuDeliveryAudit imu_delivery_;
   int64_t last_scan_input_ns_ = -1;
 
   // Per-instance running state that used to live in function-local statics --
@@ -537,6 +555,23 @@ private:
   Eigen::Vector3f observer_position_innovation_ = Eigen::Vector3f::Zero();
   Eigen::Quaternionf observer_orientation_innovation_ = Eigen::Quaternionf::Identity();
   double observer_innovation_stamp_ = -1.0;
+
+  // Optional, acquisition-time tilt correction before updating the observer
+  // and retaining this registration in the map. All settings require restart.
+  bool auxiliary_gravity_enabled_ = false;
+  double auxiliary_gravity_gain_ = 1., auxiliary_gravity_max_rate_ = 5.;
+  double auxiliary_gravity_max_disagreement_ = 30., auxiliary_gravity_max_gap_ = .05;
+  dlio::GravityBuffer gravity_buffer_;
+  std::atomic<uint64_t> gravity_received_{0}, gravity_rejected_{0};
+  uint64_t gravity_corrections_ = 0;
+  std::string gravity_status_ = "disabled";
+  double gravity_disagreement_ = 0., gravity_applied_angle_ = 0.;
+  int64_t gravity_lower_ns_ = -1, gravity_upper_ns_ = -1;
+  Eigen::Quaternionf gravity_raw_registration_q_ = Eigen::Quaternionf::Identity();
+  bool timed_observer_enabled_ = false;
+  std::unique_ptr<dlio::TimedObserver> timed_observer_;
+  dlio::PoseCovariance timed_pose_noise_ = dlio::PoseCovariance::Identity();
+  std::atomic<uint64_t> timed_input_rejected_{0}, timed_update_rejected_{0};
 
   bool adaptive_params_;
 

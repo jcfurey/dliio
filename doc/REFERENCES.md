@@ -52,7 +52,7 @@ used Lyrical; this section is not a record of that build environment.
 | Logging | [Logging](https://docs.ros.org/en/jazzy/Concepts/Intermediate/About-Logging.html) | Replacement for the printf/ANSI dashboard; `RCLCPP_*_THROTTLE` |
 | Diagnostics | [diagnostic_updater](https://docs.ros.org/en/jazzy/p/diagnostic_updater/) | The right home for the rates/CPU/RAM/degeneracy dashboard |
 | ament_cmake / ament_cmake_auto | [ament_cmake user docs](https://docs.ros.org/en/jazzy/How-To-Guides/Ament-CMake-Documentation.html) | Build-system conventions this package half-follows (REVIEW §III.30) |
-| Linters & tests | [ament_lint_auto](https://github.com/ament/ament_lint/blob/jazzy/ament_lint_auto/doc/index.rst) · [Testing](https://docs.ros.org/en/jazzy/Tutorials/Intermediate/Testing/Testing-Main.html) | Test integration; the September implementation passed 22 CTest targets / 386 cases (see the workspace experiment report) |
+| Linters & tests | [ament_lint_auto](https://github.com/ament/ament_lint/blob/jazzy/ament_lint_auto/doc/index.rst) · [Testing](https://docs.ros.org/en/jazzy/Tutorials/Intermediate/Testing/Testing-Main.html) | Test integration; dated workspace reports record the suites used for each build |
 | rosidl interfaces | [About interfaces](https://docs.ros.org/en/jazzy/Concepts/Basic/About-Interfaces.html) | `srv/SavePCD.srv` generation (`rosidl_generate_interfaces`) |
 | REP 105 (frames) | [REP 105](https://www.ros.org/reps/rep-0105.html) | `odom` → `base_link` conventions the TF tree follows |
 | REP 145 (IMU) | [REP 145](https://www.ros.org/reps/rep-0145.html) | IMU frame/orientation conventions `transformImu` should be checked against |
@@ -98,7 +98,7 @@ framework link or historical paper above.
 | `tuna2024xicp` | [X-ICP, T-RO 2024](https://arxiv.org/html/2211.16335v4) | Methods, especially §V-A; scan centering and correspondence contributions. Also splits rotation and translation |
 | `hatleskog2024probabilistic` | [Hatleskog & Alexis, RA-L 2024](https://arxiv.org/html/2410.10784v2) | Methods; noise-aware information and directional confidence. Local `probGate` is a simplified adaptation |
 | `tuna2025informed` | [Informed, Constrained, Aligned, T-FR 2025](https://arxiv.org/html/2408.11809v3) | Methods, field results, §VI limitations; initialization and method-dependent tuning matter |
-| `bonnabel2016covariance` | [Bonnabel, Barczyk, Goulette, ACC 2016](https://arxiv.org/abs/1410.7632) | Abstract and publication record; covariance warnings when ICP rematches points |
+| `bonnabel2016covariance` | [Bonnabel, Barczyk, Goulette, ACC 2016](https://arxiv.org/abs/1410.7632) | Initially abstract and publication record; extended to v3 methods on September 7 (see §8) |
 | `mcdermott2025scanmatching` | [McDermott, Tufts dissertation, 2025](https://dl.tufts.edu/downloads/w9505f71j) | §2.8, printed pp. 46–47; coupled curved-tunnel and repeated-structure ambiguities |
 | `lee2025genz` | [GenZ-ICP, RA-L 2025](https://arxiv.org/html/2411.06766v1) | Methods, §III-E; published blend uses planar-correspondence fraction, unlike the local Hessian-based blend |
 | `pfreundschuh2026bievr` | [BIEVR-LIO, RSS 2026](https://www.roboticsproceedings.org/rss22/p049.html) · [manuscript](https://arxiv.org/html/2604.14421v2) | Methods and limitations; finer geometry is a useful controlled experiment, not proof of Exyn observability |
@@ -173,6 +173,40 @@ and [filter base](https://github.com/cra-ros-pkg/robot_localization/blob/rolling
 measurement selection, angle wrapping, Mahalanobis rejection, prediction,
 initialization, and covariance update. The standalone probe uses the installed
 library, with declared experimental noise; it does not reproduce the ROS
-frontend or establish statistical consistency. `bonnabel2016covariance`
-remains an abstract/publication-record citation for rematching caveats,
-not a derived covariance model for this observer and its reused map.
+frontend or establish statistical consistency. At this stage,
+`bonnabel2016covariance` had been read only through its abstract/publication
+record; the later methods review is recorded below.
+
+## 8. Measurement-time observer — checked 2026-09-07 UTC
+
+The [implementation note](TIMED_OBSERVER.md) distinguishes the local observer
+covariance derivation and synthetic checks from the cited theory. Re-reading
+`lopez2023observer` §§II–III establishes the mean observer coupling and its
+assumed upstream pose input; it does not establish uncertainty in the reused
+GICP map. The later full-PDF review of `bonnabel2016covariance` does not change
+the current observer's declared measurement-noise model.
+
+| BibTeX key | Primary source | Reading scope and use |
+|---|---|---|
+| `sola2017quaternion` | [Quaternion kinematics for the error-state Kalman filter](https://arxiv.org/html/1711.02508v1) | §§4.4 and 5: local/right versus global/left perturbations, IMU error coordinates, and covariance transport. Our fixed-gain observer is not the paper's ESKF |
+| `rosRep103` | [REP-103 source](https://github.com/ros-infrastructure/rep/blob/master/rep-0103.rst) | SI units, body axes, fixed-axis rotation covariance, and row-major ROS covariance ordering. Official rendered site denied automated access; official source was read |
+| `bonnabel2016covariance` | [Inspected v3 manuscript](https://arxiv.org/pdf/1410.7632v3) | §§II–IV: full noise covariance in Eq. (8), point-to-plane rematching theorem, and its surface/curvature assumptions; no reused-map covariance derivation |
+
+The new 800-particle consistency check validates the code only under its
+declared independent pose/IMU noise model. It does not measure the real BNO
+attitude covariance, remove registration-to-map correlations, or calibrate
+global tunnel uncertainty. No new citation is evidence that gravity alone
+resolves translation along the tunnel's primary curve.
+
+### Map correlation and consistency follow-up
+
+| BibTeX key | Primary source | Reading scope and use |
+|---|---|---|
+| `geneva2019schmidt` | [SEVIS, CVPR 2019](https://openaccess.thecvf.com/content_CVPR_2019/html/Geneva_An_Efficient_Schmidt-EKF_for_3D_Visual-Inertial_SLAM_CVPR_2019_paper.html) · [manuscript](https://arxiv.org/html/1903.08636v1) | §§3.1, 4.3.2, 4.4: active/map cross-covariance, zero map-state gain, and bounded per-update work. This is visual feature SLAM, not an implemented GICP uncertainty model |
+| `barrau2016consistent` | [An EKF-SLAM algorithm with consistency properties, inspected v3](https://arxiv.org/html/1510.06263v3) | §§3–5: false observability, alternative invariant error, and preservation of global-frame unobservable directions. The presented point-landmark SLAM model does not establish tunnel correspondence robustness |
+| `huang2010observability` | [Observability-based rules, IJRR 2010](https://journals.sagepub.com/doi/10.1177/0278364909353640) | Publisher abstract and issue metadata: OC-EKF/FEJ and spurious covariance reduction. Full paper not read through the publisher's restricted-access page |
+| `shan2020liosam` | [LIO-SAM v3](https://arxiv.org/pdf/2007.00258v3) · [author implementation](https://github.com/TixiaoShan/LIO-SAM) | §§III-A/B and III-E: graph states, IMU factors, and loop constraints. Author README distinguishes rebuilt global maps from accumulated clouds whose old poses remain unchanged. No loop backend is implemented here |
+
+The [workspace follow-up](../../../docs/dliio-timed-observer-experiments.md)
+translates these leads into proposed tests and a possible bounded keyframe
+state model. None is silently credited to the current conditional observer.

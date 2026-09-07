@@ -29,6 +29,15 @@ fields explicitly identify the configured diagonal and optional held-axis
 inflation: **no observer covariance is propagated**. A full 6×6 matrix on the
 ROS message must not be confused with a tracked joint uncertainty estimate.
 
+The next [measurement-time observer experiment](TIMED_OBSERVER.md) adds
+opt-in joint conditional covariance, raw-IMU replay, and bounded auxiliary
+gravity support. Its diagnostics distinguish the propagated model from the
+unchanged default configured covariance. Both modes now record DLIO's own
+IMU receipt, startup rejection, acceptance, buffering, propagation, and
+maximum acquisition/receipt gaps. The [full-bag report](../../../docs/dliio-timed-observer-experiments.md)
+records the live repeats and separates numerical covariance validity from
+unresolved map correlation and statistical calibration.
+
 Research documentation was committed at dliio `86cebfc` and workspace
 `e10419f` before this implementation. The input, retained parameter profile,
 and original results are described in the workspace

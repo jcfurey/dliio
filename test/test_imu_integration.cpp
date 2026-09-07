@@ -106,6 +106,27 @@ TEST(ImuIntegration, GravityIsSubtracted) {
   }
 }
 
+TEST(ImuIntegration, BackwardWindowRecoversPositionVelocityAndAttitude) {
+  constexpr double anchor = .937, omega = .8, gravity = 9.80665;
+  auto imu = makeImuStream(1., 400., Eigen::Vector3f(0., 0., omega), Eigen::Vector3f::Zero());
+  // Constant WORLD acceleration under rotation, plus a vertical jerk.
+  auto position = [](double t) { return Eigen::Vector3f(.4*t*t, -.2*t*t, .05*t*t*t); };
+  auto velocity = [](double t) { return Eigen::Vector3f(.8*t, -.4*t, .15*t*t); };
+  auto rotation = [](double t) { return Eigen::Quaternionf(Eigen::AngleAxisf(omega*t, Eigen::Vector3f::UnitZ())); };
+  for (auto& sample : imu)
+    sample.lin_accel = rotation(sample.stamp).conjugate()*Eigen::Vector3f(.8, -.4, gravity+.3*sample.stamp);
+  const std::vector<double> stamps{.113, .456, .902};
+  std::vector<Eigen::Vector3f> velocities;
+  const auto poses = dlio::OdomNode::integrateImuWindow(anchor, rotation(anchor), position(anchor),
+      velocity(anchor), stamps, imu, gravity, &velocities);
+  ASSERT_EQ(poses.size(), stamps.size()); ASSERT_EQ(velocities.size(), stamps.size());
+  for (size_t i = 0; i < stamps.size(); ++i) {
+    EXPECT_LT((poses[i].block<3, 1>(0, 3)-position(stamps[i])).norm(), 2e-5);
+    EXPECT_LT((velocities[i]-velocity(stamps[i])).norm(), 2e-5);
+    EXPECT_LT(Eigen::Quaternionf(poses[i].block<3, 3>(0, 0)).angularDistance(rotation(stamps[i])), 2e-5);
+  }
+}
+
 TEST(ImuIntegration, VelocitySamplesMatchPoseTimesUnderJerk) {
   auto imu = makeImuStream(1.0, 400.0, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero());
   for (auto& sample : imu) { sample.lin_accel.x() = 0.8f + 0.6f * sample.stamp; }

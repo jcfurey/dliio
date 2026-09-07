@@ -135,6 +135,7 @@ ament_auto_add_library(dlio_components SHARED
   src/dlio/odom.cc
   src/dlio/map.cc
   src/dlio/components.cc
+  src/dlio/timed_observer.cc
 )
 target_compile_definitions(dlio_components PRIVATE PCL_NO_PRECOMPILE)
 target_link_libraries(dlio_components
@@ -187,6 +188,17 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_handoff_launch test/test_handoff_launch.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_core test/test_mapping_core.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
+  ament_add_gtest(test_imu_delivery test/test_imu_delivery.cpp)
+  target_include_directories(test_imu_delivery PRIVATE include)
+  find_package(Eigen3 REQUIRED)
+  ament_add_gtest(test_auxiliary_gravity test/test_auxiliary_gravity.cpp)
+  target_include_directories(test_auxiliary_gravity PRIVATE include)
+  target_link_libraries(test_auxiliary_gravity Eigen3::Eigen)
+  ament_add_gtest(test_observer_timing test/test_observer_timing.cpp)
+  target_compile_definitions(test_observer_timing PRIVATE PCL_NO_PRECOMPILE)
+  target_link_libraries(test_observer_timing dlio_components)
+  ament_add_gtest(test_timed_observer test/test_timed_observer.cpp)
+  target_link_libraries(test_timed_observer dlio_components)
   ament_add_gtest(test_nano_gicp test/test_nano_gicp.cpp)
   target_compile_definitions(test_nano_gicp PRIVATE PCL_NO_PRECOMPILE)
   target_link_libraries(test_nano_gicp
