@@ -1,6 +1,11 @@
 /**:
   ros__parameters:
     frames/map: map
+    # The Ouster mapping launch selects the atomic observation transport.
+    # Paired cloud/PoseStamped remains available for legacy bags and previews.
+    mapping/transport: paired
+    # Exactly one mapper/backend may publish the dynamic map -> odom transform.
+    mapping/publish_tf: true
     # 0 keeps every received keyframe point; a positive value enables voxel means.
     # Registration has a separate filter. Full keyframes/poses remain on disk.
     mapping/voxel_size: 0.0

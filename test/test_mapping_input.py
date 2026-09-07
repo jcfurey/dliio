@@ -10,7 +10,58 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import PointCloud2, PointField
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from dliio_mapping.input import Pairer, decode_cloud, decode_pose, stamp_ns
+from dliio_mapping.input import Pairer, decode_cloud, decode_pose, decode_observation, pose_message, stamp_ns
+
+
+@pytest.mark.parametrize('rotation', [np.eye(3), np.diag([1., -1., -1.]), np.diag([-1., 1., -1.]),
+                                    np.diag([-1., -1., 1.]), np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])])
+def test_pose_encoding_handles_identity_quarter_turn_and_pi(rotation):
+    matrix = np.eye(4)
+    matrix[:3, :3], matrix[:3, 3] = rotation, [3., 4., 5.]
+    message = PoseStamped(pose=pose_message(matrix))
+    np.testing.assert_allclose(decode_pose(message), matrix, atol=1e-12)
+
+
+def observation():
+    from types import SimpleNamespace
+    from copy import deepcopy
+    import uuid
+    cloud = wire_cloud()
+    cloud.header.frame_id, cloud.header.stamp.sec = 'odom', 12
+    return SimpleNamespace(header=deepcopy(cloud.header), cloud=cloud,
+        base_frame_id='base', source_session_id=str(uuid.uuid4()), observation_id=4,
+        registered_pose=pose_message(np.eye(4)), covariance_kind=0,
+        covariance_model='unavailable', pose_covariance=[0.]*36, registration_converged=True,
+        degenerate_translation_modes=1, degenerate_rotation_modes=0)
+
+
+def test_atomic_observation_carries_exact_pose_cloud_quality_and_unknown_covariance():
+    message = observation()
+    stamp, pose, points, provenance = decode_observation(message, 'odom', 'base', 10, 1000)
+    assert stamp == 12000000000 and len(points) == 4
+    np.testing.assert_array_equal(pose, np.eye(4))
+    assert provenance['source_sequence'] == 4
+    assert provenance['covariance'] is None
+    assert provenance['quality']['degenerate_translation_modes'] == 1
+
+
+@pytest.mark.parametrize('mutation', ['stamp', 'cloud_frame', 'pose_frame', 'base_frame', 'covariance', 'kind'])
+def test_atomic_observation_rejects_inconsistent_frames_times_and_uncertainty(mutation):
+    message = observation()
+    if mutation == 'stamp':
+        message.cloud.header.stamp.nanosec += 1
+    elif mutation == 'cloud_frame':
+        message.cloud.header.frame_id = 'lidar'
+    elif mutation == 'pose_frame':
+        message.header.frame_id = 'map'
+    elif mutation == 'base_frame':
+        message.base_frame_id = 'lidar'
+    elif mutation == 'covariance':
+        message.pose_covariance[0] = 1.
+    else:
+        message.covariance_kind = 5
+    with pytest.raises(ValueError):
+        decode_observation(message, 'odom', 'base', 10, 1000)
 
 
 def wire_cloud(big_endian=False):

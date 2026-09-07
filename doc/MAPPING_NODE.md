@@ -7,9 +7,12 @@ and disk work run in a worker in a separate process from odometry. NumPy and
 SQLite are the only additional implementation libraries; there is no external
 mapping, transform, database, or fusion node.
 
-This is the mapping foundation. It does not yet detect loop closures, optimize
-poses, relocalize, or correct odometry drift. `map -> odom` is an identity static
-transform. Do not run another publisher for that transform with this mapper.
+The mapper accepts externally supplied, versioned pose corrections and rebuilds
+geometry from its original local observations. It does not yet detect loop
+closures or optimize poses itself. It owns dynamic `map -> odom`, initially
+identity; set `mapping/publish_tf:=false` when another backend owns this transform.
+See [pose revisions](POSE_REVISIONS.md) for the correction services, uncertainty
+contract, offline reconstruction, and rollback.
 
 ## Run
 
@@ -188,13 +191,19 @@ filtered before ingestion. These are processed keyframes, not lossless raw
 Ouster returns: ring, ambient/near-IR, range, and acquisition offsets are not
 present on the frontend's processed keyframe topic.
 
-Version 1 uses three SQLite tables:
+Version 2 retains the original three tables and adds correction/provenance
+tables. Version 1 archives remain readable and can be upgraded through the
+offline copy workflow in [POSE_REVISIONS.md](POSE_REVISIONS.md).
 
 | Table | Retained data |
 |---|---|
-| `metadata` | Format/version, session UUID, configured `extrinsics/*`, `imu/*`, and `frames/*` parameters, fields, counts, voxel size, identity map-to-odom transform, pose revision 0 |
+| `metadata` | Format/version, session UUID, calibration, fields, counts, voxel size, committed map-to-odom correction and pose revision |
 | `keyframes` | Contiguous stable ID, exact integer nanosecond stamp, submap ID, registered base pose in odom, local cloud, point count and CRC32 |
 | `submaps` | Stable ID, anchor pose, first/last keyframe IDs, latest measurement stamp, samples or voxel means, point count and CRC32 |
+| `observations` | Frontend session/sequence, covariance kind/model/full matrix when available, and quality flags |
+| `optimized_poses` | Current map pose for every archived observation |
+| `pose_revisions` | Revision number, request identity/digest, optimized prefix extent, correction, and provenance |
+| `revision_poses` | Immutable optimized pose snapshots used for validation and rollback |
 
 Poses are float64 rigid 4x4 matrices. Reload checks the SQLite format and
 integrity, sizes before fetching point blobs, CRCs, proper rotations, finite

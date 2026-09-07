@@ -23,7 +23,10 @@ recording. The [persistent mapper](doc/MAPPING_NODE.md) retains local keyframes
 and poses, limits the live submap window, and supports archive save/reload and
 full PCD export. It selects full-resolution deskewed mapping observations independently of
 odometry keyframes and fuses their overlap on a shared configurable grid (2 cm by default). Source retention,
-output fusion, and odometry downsampling are separate. Loop closure is the next stage. The original
+output fusion, and odometry downsampling are separate. The mapper supports
+[versioned pose corrections and reconstruction](doc/POSE_REVISIONS.md), including
+rollback, while automatic loop detection and graph optimization remain the next
+stage. The original
 `dlio_ouster.launch.py` retains the legacy accumulated-map preview by default.
 
 # Modifications

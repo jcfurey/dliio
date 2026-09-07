@@ -6,6 +6,7 @@ import time
 import numpy as np
 
 from .core import FIELDS, rigid_pose
+from .uncertainty import KINDS, observation_metadata
 
 
 def stamp_ns(header):
@@ -68,6 +69,49 @@ def decode_pose(message):
                      [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]]
     result[:3, 3] = values[:3]
     return rigid_pose(result)
+
+
+def pose_message(matrix):
+    """Encode a checked rigid transform, including rotations near pi."""
+    from geometry_msgs.msg import Pose
+    matrix = rigid_pose(matrix)
+    rotation = matrix[:3, :3]
+    # Davenport's symmetric quaternion matrix, in [x,y,z,w] order.
+    r = rotation
+    k = np.array([[r[0, 0]-r[1, 1]-r[2, 2], r[0, 1]+r[1, 0], r[0, 2]+r[2, 0], r[2, 1]-r[1, 2]],
+                  [r[0, 1]+r[1, 0], r[1, 1]-r[0, 0]-r[2, 2], r[1, 2]+r[2, 1], r[0, 2]-r[2, 0]],
+                  [r[0, 2]+r[2, 0], r[1, 2]+r[2, 1], r[2, 2]-r[0, 0]-r[1, 1], r[1, 0]-r[0, 1]],
+                  [r[2, 1]-r[1, 2], r[0, 2]-r[2, 0], r[1, 0]-r[0, 1], np.trace(r)]])
+    _, vectors = np.linalg.eigh(k)
+    q = vectors[:, -1]
+    if q[3] < 0:
+        q = -q
+    message = Pose()
+    message.position.x, message.position.y, message.position.z = map(float, matrix[:3, 3])
+    message.orientation.x, message.orientation.y, message.orientation.z, message.orientation.w = map(float, q)
+    return message
+
+
+def decode_observation(message, odom_frame, base_frame, max_points, max_bytes):
+    from types import SimpleNamespace
+    stamp = stamp_ns(message.header)
+    if (message.header.frame_id != odom_frame or message.cloud.header != message.header or
+            message.base_frame_id != base_frame):
+        raise ValueError('Observation pose/cloud frames or measurement timestamps differ')
+    kind = message.covariance_kind
+    if not 0 <= kind < len(KINDS):
+        raise ValueError('Unknown observation covariance kind')
+    matrix = np.asarray(message.pose_covariance, dtype=np.float64).reshape(6, 6)
+    if kind == 0 and not np.array_equal(matrix, np.zeros((6, 6))):
+        raise ValueError('Unavailable covariance must have an all-zero wire payload')
+    provenance = observation_metadata(dict(source_session_id=message.source_session_id,
+        source_sequence=int(message.observation_id), covariance_kind=KINDS[kind],
+        covariance_model=message.covariance_model, covariance=None if kind == 0 else matrix,
+        quality=dict(registration_converged=message.registration_converged,
+                     degenerate_translation_modes=int(message.degenerate_translation_modes),
+                     degenerate_rotation_modes=int(message.degenerate_rotation_modes))))
+    return (stamp, decode_pose(SimpleNamespace(pose=message.registered_pose)),
+            decode_cloud(message.cloud, max_points, max_bytes), provenance)
 
 
 class Pairer:

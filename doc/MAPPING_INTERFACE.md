@@ -1,7 +1,7 @@
 # Mapping input contract
 
-This contract describes the output after the 2026-09-05 correctness pass on
-`cam-dev`. The [persistent mapper](MAPPING_NODE.md) now consumes this interface;
+This contract describes the registered output and the atomic mapping observation
+interface on `cam-dev`. The [persistent mapper](MAPPING_NODE.md) consumes this interface;
 `MapNode` remains available as the legacy accumulated-cloud preview.
 
 ## Frames and measurement times
@@ -19,6 +19,7 @@ Frame names remain configurable; the table uses `odom` and `base_link`.
 | `pointcloud/keyframe` | Registered keyframe XYZ already in `odom` | Keyframe's scan reference time |
 | `mapping_pose` | Registered base pose for a dense mapping observation | Exact same header as its mapping cloud |
 | `pointcloud/mapping` | Full-resolution registered observation in `odom` | Mapping observation scan reference time |
+| `mapping_observation` | Atomic cloud, registered pose, frontend session/sequence, quality, and explicit covariance availability | One captured mapping observation; both headers match exactly |
 | `path` | Recent registered scan poses | Individual scan reference times |
 | `keyframes` | Recent keyframe poses as a legacy `PoseArray` | Header describes only the newest entry |
 
@@ -123,11 +124,16 @@ requires a finite positive leaf size.
 ## Persistent backend and next interface
 
 The persistent mapper archives a session ID, stable keyframe ID, scan reference
-stamp, registered pose, and local deskewed cloud. Registration quality and
-observability still need an extended frontend interface. A single message or acknowledged archive
-would make pose/cloud delivery and replay explicit. Reported registration
-Hessians and default odometry covariances are not calibrated independent sensor
-uncertainties.
+stamp, registered pose, and local deskewed cloud. The default persistent Ouster
+launch consumes `MappingObservation`: one message carries the cloud, pose,
+frontend session/sequence, convergence flag, held-mode counts, and covariance
+provenance. The frontend currently labels registered-pose covariance UNKNOWN;
+it does not substitute observer covariance or a registration Hessian. Source
+sequences may have transport gaps and differ from the archive's contiguous IDs.
+
+The mapper's [pose revision interface](POSE_REVISIONS.md) accepts corrected
+poses, reconstructs archived geometry, and updates dynamic `map -> odom`.
+Automatic loop detection and graph optimization are not yet connected.
 
 Keep these responsibilities outside the odometry callback:
 

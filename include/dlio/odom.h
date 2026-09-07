@@ -31,6 +31,7 @@
 #include "dlio/imu_delivery.h"
 #include "dlio/auxiliary_gravity.h"
 #include "dlio/timed_observer.h"
+#include <direct_lidar_inertial_odometry/msg/mapping_observation.hpp>
 #include <deque>
 #include <map>
 #include <tf2_ros/transform_broadcaster.h>
@@ -174,6 +175,10 @@ private:
     ScanOutput scan;
     Eigen::Vector2f prior_xy;
     bool reject_subfloor;
+    uint64_t observation_id = 0;
+    bool registration_converged = false;
+    uint8_t degenerate_translation_modes = 0;
+    uint8_t degenerate_rotation_modes = 0;
   };
   rclcpp::Time scanReferenceStamp() const;
   ScanOutput snapshotScanOutput(pcl::PointCloud<PointType>::ConstPtr cloud);
@@ -184,6 +189,7 @@ private:
   void publishMapping(KeyframeOutput output);
   void publishRegisteredCloud(const KeyframeOutput& output,
       const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher);
+  sensor_msgs::msg::PointCloud2 registeredCloudMessage(const KeyframeOutput& output);
   State snapshotState();
   void setMainLoopRunning(bool running);
   void publishToROS(ScanOutput output);
@@ -276,6 +282,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr kf_cloud_pub;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_cloud_pub;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr mapping_pose_pub;
+  rclcpp::Publisher<direct_lidar_inertial_odometry::msg::MappingObservation>::SharedPtr mapping_observation_pub;
+  std::string mapping_source_session_;
+  uint64_t mapping_sequence_ = 0;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr deskewed_pub;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub;
 

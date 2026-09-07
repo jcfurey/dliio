@@ -23,6 +23,8 @@
 #include <unordered_map>
 #include <limits>
 #include <cstdint>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include <queue>
 
@@ -499,6 +501,9 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
   this->kf_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("kf_cloud", 1);
   this->mapping_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("mapping_cloud", 8);
   this->mapping_pose_pub = this->create_publisher<geometry_msgs::msg::PoseStamped>("mapping_pose", 8);
+  this->mapping_observation_pub = this->create_publisher<direct_lidar_inertial_odometry::msg::MappingObservation>(
+      "mapping_observation", 8);
+  this->mapping_source_session_ = boost::uuids::to_string(boost::uuids::random_generator()());
   // Dense map messages can briefly occupy the DDS transport. Match the scan
   // pose's bounded history so an unacknowledged scan survives those bursts.
   this->deskewed_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("deskewed", 10);
@@ -1271,12 +1276,38 @@ void dlio::OdomNode::queueMappingPublish() {
   if (!this->mappingObservationDue()) { return; }
   KeyframeOutput output{this->snapshotScanOutput(this->deskewed_scan),
       this->T_prior.block<2, 1>(0, 3), this->subfloor_reject_enabled_ && this->gravity_align_};
+  output.observation_id = this->mapping_sequence_++;
+  output.registration_converged = this->gicp_hasConverged.load();
+  output.degenerate_translation_modes = static_cast<uint8_t>(this->gicp.lastDegenTransDirs().size());
+  output.degenerate_rotation_modes = static_cast<uint8_t>(this->gicp.lastDegenRotDirs().size());
   if (this->publish_mapping_thread.joinable()) { this->publish_mapping_thread.join(); }
   this->publish_mapping_thread = std::thread(&dlio::OdomNode::publishMapping, this, std::move(output));
 }
 
 void dlio::OdomNode::publishMapping(KeyframeOutput output) {
-  this->publishRegisteredCloud(output, this->mapping_cloud_pub);
+  if (this->mapping_cloud_pub->get_subscription_count() || this->mapping_observation_pub->get_subscription_count()) {
+    auto cloud = this->registeredCloudMessage(output);
+    if (cloud.width * cloud.height > 0) {
+      if (this->mapping_cloud_pub->get_subscription_count()) { this->mapping_cloud_pub->publish(cloud); }
+      if (this->mapping_observation_pub->get_subscription_count()) {
+        direct_lidar_inertial_odometry::msg::MappingObservation observation;
+        observation.header = output.scan.pose.header;
+        observation.source_session_id = this->mapping_source_session_;
+        observation.observation_id = output.observation_id;
+        observation.base_frame_id = this->baselink_frame;
+        observation.registered_pose = output.scan.pose.pose;
+        observation.cloud = std::move(cloud);
+        // The observer covariance belongs to another state and timestamp.
+        // No calibrated scan-registration covariance is available here.
+        observation.covariance_kind = observation.UNKNOWN;
+        observation.covariance_model = "registered scan pose: covariance unavailable";
+        observation.registration_converged = output.registration_converged;
+        observation.degenerate_translation_modes = output.degenerate_translation_modes;
+        observation.degenerate_rotation_modes = output.degenerate_rotation_modes;
+        this->mapping_observation_pub->publish(observation);
+      }
+    }
+  }
   this->mapping_pose_pub->publish(output.scan.pose);
 }
 
@@ -1449,8 +1480,16 @@ void dlio::OdomNode::publishKeyframe(KeyframeOutput output) {
 
 void dlio::OdomNode::publishRegisteredCloud(const KeyframeOutput& output,
     const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr& publisher) {
+  if (publisher->get_subscription_count() > 0) {
+    auto message = this->registeredCloudMessage(output);
+    if (message.width * message.height > 0) { publisher->publish(message); }
+  }
+}
+
+sensor_msgs::msg::PointCloud2 dlio::OdomNode::registeredCloudMessage(const KeyframeOutput& output) {
   const auto& scan = output.scan;
-  if (publisher->get_subscription_count() > 0 && scan.cloud &&
+  sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
+  if (scan.cloud &&
       scan.cloud->points.size() == scan.cloud->width * scan.cloud->height) {
     auto source = scan.cloud;
     if (output.reject_subfloor && !source->empty()) {
@@ -1472,13 +1511,11 @@ void dlio::OdomNode::publishRegisteredCloud(const KeyframeOutput& output,
     }
     pcl::PointCloud<PointType> registered;
     pcl::transformPointCloud(*source, registered, scan.correction);
-    sensor_msgs::msg::PointCloud2 keyframe_cloud_ros;
     pcl::toROSMsg(registered, keyframe_cloud_ros);
     dlio::stripAcquisitionTimeFields(keyframe_cloud_ros.fields);
     keyframe_cloud_ros.header = scan.pose.header;
-    publisher->publish(keyframe_cloud_ros);
   }
-
+  return keyframe_cloud_ros;
 }
 
 float dlio::OdomNode::correctIntensity(float intensity, float range, float cos_incidence,

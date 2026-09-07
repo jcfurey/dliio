@@ -85,7 +85,10 @@ rosidl_generate_interfaces(
     ${PROJECT_NAME}
         srv/SavePCD.srv
         srv/MapArchive.srv
-    DEPENDENCIES
+        srv/ApplyPoseRevision.srv
+        srv/RestorePoseRevision.srv
+        msg/MappingObservation.msg
+    DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target
@@ -175,7 +178,7 @@ install(FILES README.md ouster.repos LICENSE THIRD_PARTY_LICENSES.md
   DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
   scripts/dlio_mapping_node.py scripts/mapping_archive.py scripts/verify_mapping.py
-  scripts/verify_mapping_replay.py
+  scripts/verify_mapping_replay.py scripts/verify_pose_revisions.py
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY scripts/dliio_mapping DESTINATION lib/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)
@@ -188,6 +191,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_handoff_launch test/test_handoff_launch.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_core test/test_mapping_core.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
+  ament_add_pytest_test(test_mapping_revisions test/test_mapping_revisions.py TIMEOUT 120)
+  ament_add_pytest_test(test_mapping_uncertainty test/test_mapping_uncertainty.py TIMEOUT 60)
   ament_add_gtest(test_imu_delivery test/test_imu_delivery.cpp)
   target_include_directories(test_imu_delivery PRIVATE include)
   find_package(Eigen3 REQUIRED)

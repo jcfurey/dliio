@@ -1,0 +1,16 @@
+# Complete ordered prefix of archive IDs 0..N; optimized poses are T_map_base.
+# Later observations receive the correction at N times their original odom
+# poses. The session is the ARCHIVE session, reported by mapping diagnostics.
+string<=36 session_id
+uint64 expected_revision
+string<=128 request_id
+string<=1024 reason
+string<=256 frame_id
+uint64[<=100000] observation_ids
+geometry_msgs/Pose[<=100000] poses
+---
+bool success
+string message
+uint64 pose_revision
+uint64 keyframes
+uint64 submaps

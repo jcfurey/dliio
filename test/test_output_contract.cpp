@@ -66,6 +66,16 @@ struct OdomNodeTestAccess {
     return n.mapping_cloud_pub->get_subscription_count() && n.mapping_pose_pub->get_subscription_count();
   }
   static void publishMapping(OdomNode& n, KeyframeOutput out) { n.publishMapping(std::move(out)); }
+  static bool observationConnected(OdomNode& n) { return n.mapping_observation_pub->get_subscription_count() > 0; }
+  static void queueMapping(OdomNode& n, pcl::PointCloud<PointType>::ConstPtr cloud, double stamp) {
+    capture(n, cloud);
+    n.scan_stamp = stamp;
+    n.lidarPose.p.x() = static_cast<float>(stamp);
+    n.deskewed_scan = cloud;
+    n.gicp_hasConverged.store(true);
+    n.queueMappingPublish();
+    if (n.publish_mapping_thread.joinable()) { n.publish_mapping_thread.join(); }
+  }
   static void initializeTarget(OdomNode& n) { n.initializeInputTarget(); }
   static size_t registrationPoints(OdomNode& n) { return n.keyframes.back().second->size(); }
   static void floorFilter(OdomNode& n) {
@@ -320,6 +330,58 @@ TEST_F(OutputContract, MappingOutputFreezesPoseCorrectionAndAllScalarChannels) {
   EXPECT_EQ(*pose, output.scan.pose);
   EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(*received, {"x"})[0], 3.f);
   checkChannels(*received);
+}
+
+TEST_F(OutputContract, AtomicMappingOutputFreezesPoseQualityAndReportsUnknownCovariance) {
+  using Observation = direct_lidar_inertial_odometry::msg::MappingObservation;
+  dlio::OdomNode node(options());
+  auto sink = std::make_shared<rclcpp::Node>("atomic_mapping_sink");
+  Observation::ConstSharedPtr received;
+  auto sub = sink->create_subscription<Observation>("mapping_observation", 8,
+      [&](Observation::ConstSharedPtr m) { received = m; });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::observationConnected(node); }));
+  auto output = Access::captureKeyframe(node, cloud(), cloud(), false);
+  output.observation_id = 17;
+  output.registration_converged = true;
+  output.degenerate_translation_modes = 1;
+  Access::advance(node);
+  Access::publishMapping(node, output);
+  ASSERT_TRUE(waitFor(exec, [&] { return bool(received); }));
+  EXPECT_EQ(received->header, output.scan.pose.header);
+  EXPECT_EQ(received->cloud.header, received->header);
+  EXPECT_EQ(received->registered_pose, output.scan.pose.pose);
+  EXPECT_EQ(received->observation_id, 17u);
+  EXPECT_TRUE(received->registration_converged);
+  EXPECT_EQ(received->degenerate_translation_modes, 1u);
+  EXPECT_EQ(received->covariance_kind, Observation::UNKNOWN);
+  for (double value : received->pose_covariance) { EXPECT_DOUBLE_EQ(value, 0.); }
+  EXPECT_FALSE(received->covariance_model.empty());
+  EXPECT_EQ(received->source_session_id.size(), 36u);
+  EXPECT_FALSE(received->base_frame_id.empty());
+  EXPECT_FLOAT_EQ(dlio::PointCloudScalarField(received->cloud, {"x"})[0], 3.f);
+  checkChannels(received->cloud);
+}
+
+TEST_F(OutputContract, AtomicMappingSequencesShareOneFrontendSession) {
+  using Observation = direct_lidar_inertial_odometry::msg::MappingObservation;
+  auto opts = options(); opts.append_parameter_override("map/observation/enabled", true);
+  dlio::OdomNode node(opts);
+  auto sink = std::make_shared<rclcpp::Node>("mapping_sequence_sink");
+  std::vector<Observation::ConstSharedPtr> received;
+  auto sub = sink->create_subscription<Observation>("mapping_observation", 8,
+      [&](Observation::ConstSharedPtr m) { received.push_back(m); });
+  rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(sink);
+  ASSERT_TRUE(waitFor(exec, [&] { return Access::observationConnected(node); }));
+  Access::queueMapping(node, cloud(), 10.05);
+  Access::queueMapping(node, cloud(), 11.05);
+  ASSERT_TRUE(waitFor(exec, [&] { return received.size() == 2; }));
+  EXPECT_EQ(received[0]->observation_id, 0u);
+  EXPECT_EQ(received[1]->observation_id, 1u);
+  EXPECT_EQ(received[0]->source_session_id, received[1]->source_session_id);
+  EXPECT_TRUE(received[0]->registration_converged);
+  EXPECT_EQ(received[0]->header.stamp.sec, 10);
+  EXPECT_EQ(received[1]->header.stamp.sec, 11);
 }
 
 TEST_F(OutputContract, OdometryTwistIsBodyFrameAndTfMatchesObserverSnapshot) {

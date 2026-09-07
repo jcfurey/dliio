@@ -17,23 +17,30 @@ import zlib
 
 import numpy as np
 
+from .revisions import RevisionStore
+from .uncertainty import observation_metadata
+
 FIELDS = ('x', 'y', 'z', 'intensity', 'reflectivity', 'intensity_corrected', 'lidar_intensity')
 APPLICATION_ID = 0x444C4D50
-VERSION = 1
+VERSION = 2
+READ_VERSIONS = (1, VERSION)
 
 
 def validate_metadata(metadata):
-    # Version 1 has no optimized trajectory; accepting a nonidentity correction
-    # here would silently display the archive in the wrong frame.
     for name in ('odom_frame', 'base_frame', 'map_frame'):
         value = metadata.get(name)
         if not isinstance(value, str) or not value or value.startswith('/'):
             raise ValueError(f'Invalid {name}')
     if metadata['map_frame'] == metadata['odom_frame']:
         raise ValueError('Map and odom frames must differ')
-    if (metadata.get('pose_revision', 0) != 0 or
-            not np.array_equal(rigid_pose(metadata.get('map_to_odom')), np.eye(4))):
+    correction = rigid_pose(metadata.get('map_to_odom'))
+    revision = metadata.get('pose_revision', 0)
+    if type(revision) is not int or revision < 0:
+        raise ValueError('Invalid pose revision')
+    if metadata.get('version', 1) == 1 and (revision != 0 or not np.array_equal(correction, np.eye(4))):
         raise ValueError('Version 1 requires an identity map-to-odom transform')
+    if revision == 0 and not np.array_equal(correction, np.eye(4)):
+        raise ValueError('Initial pose revision requires an identity map-to-odom transform')
     if not isinstance(metadata.get('calibration'), dict):
         raise ValueError('Archive must contain calibration metadata')
     encoded = json.dumps(metadata, allow_nan=False)
@@ -312,8 +319,8 @@ def fused_chunks(chunks, leaf, directory):
             db.close()
 
 
-class Store:
-    def __init__(self, path, limits, *, metadata=None):
+class Store(RevisionStore):
+    def __init__(self, path, limits, *, metadata=None, editable=False):
         self.path = Path(path).expanduser().resolve()
         self.limits = limits
         self.resident = OrderedDict()
@@ -321,9 +328,12 @@ class Store:
         self.active_count = 0
         self.active_id = None
         self.fusion = None
-        self.read_only = metadata is None
-        if self.read_only:
-            self.db = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True, isolation_level=None)
+        if editable and metadata is not None:
+            raise ValueError('Editable mode opens an existing sealed archive')
+        self.read_only = metadata is None and not editable
+        if metadata is None:
+            self.db = sqlite3.connect(self.path.as_uri() + ('?mode=rw' if editable else '?mode=ro'),
+                                      uri=True, isolation_level=None)
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -334,8 +344,15 @@ class Store:
             self.db.execute('PRAGMA temp_store=FILE')
             self.db.execute('PRAGMA mmap_size=0')
             self.db.execute('PRAGMA foreign_keys=ON')
-            if self.read_only:
+            if metadata is None:
                 self._load()
+                if editable:
+                    self._upgrade()
+                    self.db.execute('PRAGMA journal_mode=WAL')
+                    self.db.execute('PRAGMA synchronous=FULL')
+                    self.meta = dict(self.meta, sealed=False)
+                    self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(self.meta, allow_nan=False),))
+                    self._restore_active()
             else:
                 self._create(metadata)
         except BaseException:
@@ -362,11 +379,12 @@ class Store:
                 count INTEGER NOT NULL, points BLOB NOT NULL, crc INTEGER NOT NULL);
             CREATE INDEX keyframes_submap ON keyframes(submap_id);
         ''')
+        self._create_revision_tables()
         self.db.execute('INSERT INTO metadata VALUES(1, ?)', (json.dumps(self.meta, allow_nan=False),))
 
     def _load(self):
         if (self.db.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or
-                self.db.execute('PRAGMA user_version').fetchone()[0] != VERSION):
+                self.db.execute('PRAGMA user_version').fetchone()[0] not in READ_VERSIONS):
             raise ValueError('Unsupported map archive format/version')
         if self.db.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
             raise ValueError('Map archive failed SQLite integrity check')
@@ -374,7 +392,8 @@ class Store:
         if row is None or len(row[0]) > 1048576:
             raise ValueError('Invalid archive metadata')
         self.meta = json.loads(row[0])
-        if (self.meta.get('format') != 'dliio-mapping' or self.meta.get('version') != VERSION or
+        if (self.meta.get('format') != 'dliio-mapping' or
+                self.meta.get('version') != self.db.execute('PRAGMA user_version').fetchone()[0] or
                 self.meta.get('fields') != list(FIELDS) or self.meta.get('coordinates') != 'keyframe_base' or
                 self.meta.get('sealed') is not True):
             raise ValueError('Load a sealed save_map snapshot; use mapping_archive.py snapshot for a working archive')
@@ -403,6 +422,8 @@ class Store:
             count += 1
         if count != self.meta['keyframes'] or previous_stamp != self.meta['last_stamp_ns']:
             raise ValueError('Archive keyframe metadata does not match its records')
+        if self.meta['version'] >= 2:
+            self._validate_revisions()
         count = 0
         previous_last = -1
         for identifier, pose, first, last, stamp, n, blob, checksum in self.db.execute('SELECT * FROM submaps ORDER BY id'):
@@ -414,7 +435,8 @@ class Store:
                                       'WHERE submap_id=?', (identifier,)).fetchone()
             if members != (first, last, last - first + 1, stamp):
                 raise ValueError('Submap membership or timestamp is inconsistent')
-            if pose != self.db.execute('SELECT pose FROM keyframes WHERE id=?', (first,)).fetchone()[0]:
+            pose_table = 'optimized_poses' if self.meta['version'] >= 2 else 'keyframes'
+            if pose != self.db.execute(f'SELECT pose FROM {pose_table} WHERE id=?', (first,)).fetchone()[0]:
                 raise ValueError('Submap anchor differs from its first keyframe pose')
             anchor = decode_pose(pose)
             points = decode_points(blob, n, checksum, self.limits.max_voxels)
@@ -432,32 +454,42 @@ class Store:
             if self.fusion is not None:
                 self.fusion.update(transform(points, pose), remove=True)
 
-    def ingest(self, stamp_ns, pose, world_points):
+    def ingest(self, stamp_ns, pose, world_points, *, observation=None):
         if self.read_only:
             raise ValueError('A loaded map is read-only; start a new session for live input')
         if type(stamp_ns) is not int or not self.meta['last_stamp_ns'] < stamp_ns <= 2 ** 63 - 1:
             raise ValueError('Duplicate/backward keyframe timestamp; start a new session')
         pose = rigid_pose(pose)
+        provenance = observation_metadata(observation)
+        source_session, source_sequence = provenance['source_session_id'], provenance['source_sequence']
+        if self.meta['keyframes']:
+            previous = json.loads(self.db.execute('SELECT json FROM observations ORDER BY id DESC LIMIT 1').fetchone()[0])
+            if source_session != previous['source_session_id']:
+                raise ValueError('Observation source session changed; start a new mapping archive')
+            if source_sequence is not None and source_sequence <= previous['source_sequence']:
+                raise ValueError('Duplicate/backward observation source sequence')
         points = np.asarray(world_points, dtype='<f4')
         if points.ndim != 2 or points.shape[1] != 7 or not 0 < len(points) <= self.limits.max_input_points:
             raise ValueError('Invalid or oversized keyframe array')
         if not np.isfinite(points[:, :3]).all() or np.isinf(points[:, 3:]).any():
             raise ValueError('Invalid keyframe scalar values')
         local = transform(points, pose, inverse=True)
+        correction = np.asarray(self.meta['map_to_odom'])
+        corrected_pose = pose if np.array_equal(correction, np.eye(4)) else rigid_pose(correction @ pose)
         fresh = self.active is None or self.active_count >= self.limits.submap_keyframes
-        anchor = pose if fresh else self.resident[self.active_id][0]
+        anchor = corrected_pose if fresh else self.resident[self.active_id][0]
         def accumulate(values):
             return (Voxels.from_points(values, self.limits.voxel_size)
                     if self.limits.voxel_size else Samples(values))
-        incoming = accumulate(local if fresh else transform(points, anchor, inverse=True))
+        incoming = accumulate(local if fresh else transform(local, np.linalg.inv(anchor) @ corrected_pose))
         # In sample mode the exact size is known before concatenation. Roll
         # early instead of allocating a candidate beyond the configured bound.
         if not fresh and not self.limits.voxel_size and len(self.active) + len(incoming) > self.limits.max_voxels:
-            fresh, anchor = True, pose
+            fresh, anchor = True, corrected_pose
             incoming = accumulate(local)
         candidate = incoming if fresh else self.active.merged(incoming)
         if len(candidate) > self.limits.max_voxels and not fresh:
-            fresh, anchor = True, pose
+            fresh, anchor = True, corrected_pose
             candidate = accumulate(local)
         if len(candidate) > self.limits.max_voxels:
             raise ValueError('Single keyframe exceeds submap point capacity')
@@ -468,6 +500,10 @@ class Store:
         local_blob, local_crc = encode_points(local)
         map_blob, map_crc = encode_points(centers)
         updated = dict(self.meta, keyframes=identifier + 1, submaps=self.meta['submaps'] + int(fresh), last_stamp_ns=stamp_ns)
+        if source_sequence is not None:
+            gap = source_sequence - previous['source_sequence'] - 1 if self.meta['keyframes'] else 0
+            updated.update(source_session_id=source_session, last_source_sequence=source_sequence,
+                           source_sequence_gaps=self.meta.get('source_sequence_gaps', 0) + gap)
         self.db.execute('BEGIN IMMEDIATE')
         try:
             self.db.execute('INSERT INTO submaps VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET '
@@ -475,6 +511,9 @@ class Store:
                 (submap_id, anchor.astype('<f8').tobytes(), first, identifier, stamp_ns, len(centers), map_blob, map_crc))
             self.db.execute('INSERT INTO keyframes VALUES(?,?,?,?,?,?,?)',
                 (identifier, stamp_ns, submap_id, pose.astype('<f8').tobytes(), len(local), local_blob, local_crc))
+            self.db.execute('INSERT INTO optimized_poses VALUES(?,?)', (identifier, corrected_pose.astype('<f8').tobytes()))
+            self.db.execute('INSERT INTO observations VALUES(?,?)',
+                            (identifier, json.dumps(provenance, allow_nan=False)))
             self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(updated, allow_nan=False),))
             self.db.commit()
         except BaseException:
@@ -512,6 +551,8 @@ class Store:
             resident_array_bytes=sum(p.nbytes + pose.nbytes for pose, p in self.resident.values()) +
                                  (self.active.nbytes if self.active is not None else 0),
             fusion_array_bytes=self.fusion.nbytes if self.fusion is not None else 0,
+            pose_revision=self.meta['pose_revision'],
+            source_sequence_gaps=self.meta.get('source_sequence_gaps', 0),
             last_stamp_ns=self.meta['last_stamp_ns'], read_only=self.read_only, archive=str(self.path))
 
     def save(self, destination):
@@ -559,7 +600,7 @@ def snapshot_database(source, destination):
         dst = sqlite3.connect(path, isolation_level=None)
         try:
             if (src.execute('PRAGMA application_id').fetchone()[0] != APPLICATION_ID or
-                    src.execute('PRAGMA user_version').fetchone()[0] != VERSION):
+                    src.execute('PRAGMA user_version').fetchone()[0] not in READ_VERSIONS):
                 raise ValueError('Not a dliio mapping archive')
             src.backup(dst, pages=256)
             dst.execute('PRAGMA journal_mode=DELETE')

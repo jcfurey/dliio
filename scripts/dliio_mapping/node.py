@@ -9,6 +9,7 @@ import resource
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 import numpy as np
@@ -22,11 +23,12 @@ from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import PointCloud2, PointField
-from tf2_ros import StaticTransformBroadcaster
-from direct_lidar_inertial_odometry.srv import MapArchive
+from tf2_ros import TransformBroadcaster
+from direct_lidar_inertial_odometry.msg import MappingObservation
+from direct_lidar_inertial_odometry.srv import MapArchive, ApplyPoseRevision, RestorePoseRevision
 
 from .core import FIELDS, Limits, Store, validate_leaf
-from .input import Pairer, decode_cloud, decode_pose, stamp_ns
+from .input import Pairer, decode_cloud, decode_pose, decode_observation, pose_message, stamp_ns
 
 
 def cloud_message(points, stamp, frame):
@@ -74,6 +76,10 @@ class MappingNode(Node):
         self.load_path = parameter('mapping/load_path', '')
         self.storage_directory = Path(parameter('mapping/storage_directory', 'dliio_run/mapping')).expanduser().resolve()
         self.viewer = bool(self.load_path)
+        self.transport = parameter('mapping/transport', 'paired')
+        if self.transport not in ('paired', 'observation'):
+            raise ValueError('mapping/transport must be paired or observation')
+        self.publish_tf = parameter('mapping/publish_tf', True)
         self.max_bytes = parameter('mapping/max_cloud_bytes', 16777216)
         if type(self.max_bytes) is not int or not 1024 <= self.max_bytes <= 67108864:
             raise ValueError('mapping/max_cloud_bytes must be in [1024, 67108864]')
@@ -92,6 +98,7 @@ class MappingNode(Node):
         self.last_error = ''
         self.storage_failed = False
         self.cached_map = None
+        self.cached_correction = np.eye(4)
         self.revision = 0
         self.published_revision = -1
         self.refresh_interval = 1. / rate
@@ -104,9 +111,9 @@ class MappingNode(Node):
         self.map_pub = self.create_publisher(PointCloud2, 'map',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.diagnostics = self.create_publisher(DiagnosticArray, '/dlio/mapping/diagnostics', 10)
-        # Recording and a loaded viewer both use map coordinates initialized to
-        # odom. This milestone has no global corrections or feedback to the LIO.
-        self.tf = StaticTransformBroadcaster(self)
+        # One dynamic authority owns map -> odom. Corrections and cloud caches
+        # are swapped together after a complete revision rebuild.
+        self.tf = TransformBroadcaster(self) if self.publish_tf else None
         self.ready = Future()
         self.worker = threading.Thread(target=self._work, name='dliio-mapping-storage', daemon=True)
         self.worker.start()
@@ -116,23 +123,27 @@ class MappingNode(Node):
             self.stopping.set()
             self.worker.join(timeout=30)
             raise
-        transform = TransformStamped()
-        transform.header.frame_id = self.map_frame
-        transform.child_frame_id = self.odom_frame
-        transform.transform.rotation.w = 1.
-        self.tf.sendTransform(transform)
-        self.cloud_sub = self.create_subscription(PointCloud2, 'keyframes',
-            lambda msg: self._input('cloud', msg), QoSProfile(depth=self.pairer.capacity), callback_group=self.input_group)
-        self.pose_sub = self.create_subscription(PoseStamped, 'keyframe_pose',
-            lambda msg: self._input('pose', msg), QoSProfile(depth=self.pairer.capacity), callback_group=self.input_group)
+        if self.transport == 'paired':
+            self.cloud_sub = self.create_subscription(PointCloud2, 'keyframes',
+                lambda msg: self._input('cloud', msg), QoSProfile(depth=self.pairer.capacity), callback_group=self.input_group)
+            self.pose_sub = self.create_subscription(PoseStamped, 'keyframe_pose',
+                lambda msg: self._input('pose', msg), QoSProfile(depth=self.pairer.capacity), callback_group=self.input_group)
+        else:
+            self.observation_sub = self.create_subscription(MappingObservation, 'observation', self._observation,
+                QoSProfile(depth=self.pairer.capacity), callback_group=self.input_group)
         self.steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.pair_timer = self.create_timer(.1, self._expire, clock=self.steady_clock, callback_group=self.input_group)
         self.publish_timer = self.create_timer(1. / rate, self._publish, clock=self.steady_clock,
                                               callback_group=self.publish_group)
+        self.tf_timer = self.create_timer(.05, self._publish_tf, clock=self.steady_clock, callback_group=self.publish_group)
         self.diag_timer = self.create_timer(1., self._diagnose, clock=self.steady_clock, callback_group=self.publish_group)
         self.archive_services = [self.create_service(MapArchive, '/dlio/mapping/' + operation,
             lambda req, res, operation=operation: self._service(operation, req, res), callback_group=self.service_group)
             for operation in ('save_map', 'load_map', 'export_pcd')]
+        self.revision_services = [self.create_service(kind, '/dlio/mapping/' + operation,
+            lambda req, res, operation=operation: self._revision_service(operation, req, res),
+            callback_group=self.service_group) for operation, kind in
+            (('apply_pose_revision', ApplyPoseRevision), ('restore_pose_revision', RestorePoseRevision))]
         self.add_on_set_parameters_callback(self._on_parameters)
         self.get_logger().info(f'Mapping archive: {self.state["archive"]}; '
                                f'{"read-only viewer" if self.viewer else "recording paired mapping frames"}')
@@ -169,6 +180,20 @@ class MappingNode(Node):
         with self.input_lock:
             self._enqueue(self.pairer.drain())
 
+    def _observation(self, message):
+        if self.viewer or self.storage_failed:
+            self._increment('input_ignored')
+            return
+        if (len(message.cloud.data) > self.max_bytes or
+                message.cloud.width * message.cloud.height > self.limits.max_input_points):
+            self._increment('invalid_input')
+            return
+        try:
+            self.jobs.put_nowait(('observation', message, None))
+            self._increment('observations_received')
+        except queue.Full:
+            self._increment('queue_dropped')
+
     def _enqueue(self, pairs):
         for pair in pairs:
             try:
@@ -180,7 +205,8 @@ class MappingNode(Node):
 
     def _open(self, path):
         store = Store(path, self.limits)
-        if store.meta['odom_frame'] != self.odom_frame or store.meta['map_frame'] != self.map_frame:
+        if (store.meta['odom_frame'] != self.odom_frame or store.meta['map_frame'] != self.map_frame or
+                store.meta['base_frame'] != self.base_frame):
             store.close()
             raise ValueError('Archive map/odom frames differ from the configured frames')
         return store
@@ -191,7 +217,9 @@ class MappingNode(Node):
         message = cloud_message(points, store.meta['last_stamp_ns'], self.map_frame)
         with self.lock:
             self.cached_map = message
+            self.cached_correction = np.asarray(store.meta['map_to_odom']).copy()
             self.state = store.stats()
+            self.state['cached_pose_revision'] = store.meta['pose_revision']
             self.state['cached_map_bytes'] = len(message.data)
             self.state['published_points'] = len(points)
             self.state['fusion_size'] = self.fusion_size
@@ -222,14 +250,19 @@ class MappingNode(Node):
                 try:
                     if future is not None and not future.set_running_or_notify_cancel():
                         continue
-                    if operation == 'frame':
+                    if operation in ('frame', 'observation'):
                         if self.viewer or self.storage_failed:
                             self._increment('input_ignored')
                             continue
                         start = time.monotonic()
-                        stamp, pose, cloud = data
-                        store.ingest(stamp, decode_pose(pose),
-                                     decode_cloud(cloud, self.limits.max_input_points, self.max_bytes))
+                        if operation == 'observation':
+                            stamp, pose, points, provenance = decode_observation(data, self.odom_frame, self.base_frame,
+                                self.limits.max_input_points, self.max_bytes)
+                            store.ingest(stamp, pose, points, observation=provenance)
+                        else:
+                            stamp, pose, cloud = data
+                            store.ingest(stamp, decode_pose(pose),
+                                         decode_cloud(cloud, self.limits.max_input_points, self.max_bytes))
                         dirty = True
                         elapsed = (time.monotonic() - start) * 1000
                         with self.lock:
@@ -241,6 +274,18 @@ class MappingNode(Node):
                         store.save(data)
                     elif operation == 'export_pcd':
                         store.export_pcd(data, self.fusion_size or None)
+                    elif operation == 'apply_pose_revision':
+                        if data.frame_id != self.map_frame or len(data.observation_ids) != len(data.poses):
+                            raise ValueError('Correction frame or pose/ID array lengths are invalid')
+                        poses = [(int(identifier), decode_pose(SimpleNamespace(pose=pose)))
+                                 for identifier, pose in zip(data.observation_ids, data.poses)]
+                        store.apply_revision(data.session_id, int(data.expected_revision), poses,
+                                             request_id=data.request_id, reason=data.reason)
+                        dirty = True
+                    elif operation == 'restore_pose_revision':
+                        store.restore_revision(data.session_id, int(data.expected_revision), int(data.target_revision),
+                                               request_id=data.request_id)
+                        dirty = True
                     elif operation == 'load_map':
                         if not self.viewer:
                             raise ValueError('Loading into a recording session is disabled; start a viewer with load_map:=...')
@@ -257,8 +302,8 @@ class MappingNode(Node):
                 except Exception as error:
                     with self.lock:
                         self.last_error = str(error)
-                        self.counters['processing_errors' if operation == 'frame' else 'service_errors'] += 1
-                        if operation == 'frame' and isinstance(error, (OSError, sqlite3.Error)):
+                        self.counters['processing_errors' if operation in ('frame', 'observation') else 'service_errors'] += 1
+                        if operation in ('frame', 'observation') and isinstance(error, (OSError, sqlite3.Error)):
                             self.storage_failed = True
                     if future is not None:
                         future.set_exception(error)
@@ -301,6 +346,43 @@ class MappingNode(Node):
             self.map_pub.publish(message)
             self.published_revision = revision
 
+    def _revision_service(self, operation, request, response):
+        future = Future()
+        try:
+            if not self.worker.is_alive():
+                raise RuntimeError('Mapping worker is unavailable')
+            self.jobs.put_nowait((operation, request, future))
+            stats = future.result(timeout=60)
+            response.success = True
+            response.pose_revision = stats['pose_revision']
+            response.keyframes, response.submaps = stats['keyframes'], stats['submaps']
+            response.message = 'Revision committed; map/TF publication follows cache refresh'
+        except TimeoutError:
+            cancelled = future.cancel()
+            response.message = 'Request timed out; ' + ('cancelled before execution' if cancelled else
+                'operation may still finish; retry the same request ID to determine its result')
+        except Exception as error:
+            response.message = str(error) or 'Mapping worker queue is full'
+        return response
+
+    def _publish_tf(self):
+        if self.tf is None:
+            return
+        stamp = self.get_clock().now()
+        if stamp.nanoseconds <= 0:
+            return
+        with self.lock:
+            correction = self.cached_correction.copy()
+        pose = pose_message(correction)
+        message = TransformStamped()
+        message.header.stamp = stamp.to_msg()
+        message.header.frame_id, message.child_frame_id = self.map_frame, self.odom_frame
+        message.transform.translation.x = pose.position.x
+        message.transform.translation.y = pose.position.y
+        message.transform.translation.z = pose.position.z
+        message.transform.rotation = pose.orientation
+        self.tf.sendTransform(message)
+
     def _diagnose(self):
         with self.lock:
             values = dict(self.state, **self.counters, queue_depth=self.jobs.qsize())
@@ -311,7 +393,7 @@ class MappingNode(Node):
         values['rss_peak_kib'] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         drops = sum(values.get(name, 0) for name in
                     ('missing_cloud', 'missing_pose', 'queue_dropped', 'processing_errors', 'invalid_input',
-                     'late_or_duplicate', 'duplicate_pending'))
+                     'late_or_duplicate', 'duplicate_pending', 'source_sequence_gaps'))
         status = DiagnosticStatus(name='DLIO Mapping', hardware_id=values.get('session_id', ''))
         status.level = DiagnosticStatus.ERROR if failed else DiagnosticStatus.WARN if drops else DiagnosticStatus.OK
         status.message = ('Storage failed; recording stopped: ' + error) if failed else (

@@ -125,6 +125,7 @@ def build_actions(args, package):
             ('kf_cloud', '/dlio/odom_node/pointcloud/keyframe'),
             ('mapping_cloud', '/dlio/odom_node/pointcloud/mapping'),
             ('mapping_pose', '/dlio/odom_node/mapping_pose'),
+            ('mapping_observation', '/dlio/odom_node/mapping_observation'),
             ('deskewed', '/dlio/odom_node/pointcloud/deskewed')], extra_arguments=intra))
     if boolean(args['map']) and args['mapper'] == 'preview':
         components.append(ComposableNode(
@@ -141,8 +142,10 @@ def build_actions(args, package):
         actions.append(Node(package='direct_lidar_inertial_odometry', executable='dlio_mapping_node.py',
             name='dlio_mapping_node', parameters=[*params, str(mapping_config),
                 {'mapping/storage_directory': str(directory.resolve()), 'mapping/load_path': '',
-                 'mapping/input_source': args['mapping_input']}],
+                 'mapping/input_source': args['mapping_input'],
+                 'mapping/transport': 'observation' if observations else 'paired'}],
             remappings=[('keyframes', '/dlio/odom_node/pointcloud/' + ('mapping' if observations else 'keyframe')),
+                        ('observation', '/dlio/odom_node/mapping_observation'),
                         ('keyframe_pose', '/dlio/odom_node/' + ('mapping_pose' if observations else 'keyframe_pose')),
                         ('map', '/dlio/map_node/map')],
             output='screen'))

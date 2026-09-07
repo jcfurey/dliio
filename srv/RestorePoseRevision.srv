@@ -1,0 +1,11 @@
+# Restore a committed trajectory as a NEW revision, preserving history.
+string<=36 session_id
+uint64 expected_revision
+uint64 target_revision
+string<=128 request_id
+---
+bool success
+string message
+uint64 pose_revision
+uint64 keyframes
+uint64 submaps
