@@ -20,6 +20,15 @@ establish live pipeline stability. The workspace
 records the saved map prefix, timing evidence, remaining uncertainties, and
 the recovered BNO80 streams for a separate fusion experiment.
 
+The subsequent [covariance and dual-IMU follow-up](../../../docs/dliio-dual-imu-covariance.md)
+adds a coherent live observer state/time snapshot, raw midpoint position and
+quaternion innovations (with a separate innovation stamp), IMU biases, and
+registration priors/results to `/diagnostics`. These are read-only fields;
+the observer and measurement gains are unchanged. The covariance-model
+fields explicitly identify the configured diagonal and optional held-axis
+inflation: **no observer covariance is propagated**. A full 6×6 matrix on the
+ROS message must not be confused with a tracked joint uncertainty estimate.
+
 Research documentation was committed at dliio `86cebfc` and workspace
 `e10419f` before this implementation. The input, retained parameter profile,
 and original results are described in the workspace

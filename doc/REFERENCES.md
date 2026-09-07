@@ -165,3 +165,14 @@ Its raw gyro and onboard attitude estimate also share sensor information.
 An EKF needs explicit frame and uncertainty treatment; adding a second
 physical IMU does not create an independent position reference or repair
 DLIO's internal registration and deskew feedback automatically.
+
+The [subsequent covariance experiments](../../../docs/dliio-dual-imu-covariance.md)
+also checked the installed EKF core against the official
+[EKF implementation](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/src/ekf.cpp)
+and [filter base](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/src/filter_base.cpp):
+measurement selection, angle wrapping, Mahalanobis rejection, prediction,
+initialization, and covariance update. The standalone probe uses the installed
+library, with declared experimental noise; it does not reproduce the ROS
+frontend or establish statistical consistency. `bonnabel2016covariance`
+remains an abstract/publication-record citation for rematching caveats,
+not a derived covariance model for this observer and its reused map.

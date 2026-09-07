@@ -532,6 +532,11 @@ private:
   bool time_offset_;
   bool observer_time_aligned_ = false;
   double observer_lag_seconds_ = 0.0;
+  // Raw scan-midpoint innovations, before optional attenuation. Written and
+  // published on the scan callback thread; these never affect the observer.
+  Eigen::Vector3f observer_position_innovation_ = Eigen::Vector3f::Zero();
+  Eigen::Quaternionf observer_orientation_innovation_ = Eigen::Quaternionf::Identity();
+  double observer_innovation_stamp_ = -1.0;
 
   bool adaptive_params_;
 

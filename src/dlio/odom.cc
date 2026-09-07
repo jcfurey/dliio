@@ -3460,6 +3460,9 @@ void dlio::OdomNode::updateState() {
 
   Eigen::Vector3f err = pin - predicted_position;
   Eigen::Vector3f err_body;
+  this->observer_position_innovation_ = err;
+  this->observer_orientation_innovation_ = qe;
+  this->observer_innovation_stamp_ = this->scan_stamp;
 
   // LODESTAR-flavored degeneracy-aware observer gain (default 1 = off,
   // bit-identical). On the world-frame axes the gate flagged degenerate and HELD,
@@ -4289,7 +4292,43 @@ void dlio::OdomNode::publishDiagnostics() {
   kv("Keyframes", std::to_string(this->keyframes.size()));
   kv("Deskewed Points", std::to_string(this->deskew_size.load()));
   kv("Observer Time Aligned", this->observer_time_aligned_ ? "1" : "0");
+  kv("Odometry Covariance Model", this->degen_gov_enabled_ &&
+      (this->degen_gov_cov_pos_var_ > 0.0 || this->degen_gov_cov_rot_var_ > 0.0)
+      ? "configured diagonal plus held-axis inflation" : "configured diagonal");
+  kv("Observer Covariance Propagated", "false");
   kv("Observer IMU Lead (ms)", fnum(1000.0 * this->observer_lag_seconds_, 2));
+  // Preserve a coherent state/time snapshot for live failure investigations.
+  // State propagation can advance beyond the scan midpoint before this
+  // callback publishes; keep both timestamps explicit.
+  State observed;
+  builtin_interfaces::msg::Time observed_stamp;
+  {
+    std::lock_guard<std::mutex> lock(this->geo.mtx);
+    observed = this->state;
+    observed_stamp = this->imu_stamp;
+  }
+  kv("Registration Stamp (s)", fnum(this->scan_stamp, 9));
+  kv("Observer Innovation Stamp (s)", fnum(this->observer_innovation_stamp_, 9));
+  kv("Observer State Stamp (s)", fnum(rclcpp::Time(observed_stamp).seconds(), 9));
+  Eigen::Quaternionf prior_rotation(this->T_prior.block<3, 3>(0, 0));
+  prior_rotation.normalize();
+  for (int i = 0; i < 3; ++i) {
+    const std::string axis(1, "xyz"[i]);
+    kv("Observer Position " + axis + " [m]", fnum(observed.p[i], 6));
+    kv("Observer World Velocity " + axis + " [m/s]", fnum(observed.v.lin.w[i], 6));
+    kv("Observer Accel Bias " + axis + " [m/s^2]", fnum(observed.b.accel[i], 9));
+    kv("Observer Gyro Bias " + axis + " [rad/s]", fnum(observed.b.gyro[i], 9));
+    kv("Observer Position Innovation " + axis + " [m]", fnum(this->observer_position_innovation_[i], 6));
+    kv("Registration Prior Position " + axis + " [m]", fnum(this->T_prior(i, 3), 6));
+    kv("Registration Position " + axis + " [m]", fnum(this->lidarPose.p[i], 6));
+  }
+  for (int i = 0; i < 4; ++i) {
+    const std::string axis(1, "xyzw"[i]);
+    kv("Observer Quaternion " + axis, fnum(observed.q.coeffs()[i], 9));
+    kv("Observer Innovation Quaternion " + axis, fnum(this->observer_orientation_innovation_.coeffs()[i], 9));
+    kv("Registration Prior Quaternion " + axis, fnum(prior_rotation.coeffs()[i], 9));
+    kv("Registration Quaternion " + axis, fnum(this->lidarPose.q.coeffs()[i], 9));
+  }
   kv("Sub-floor Points Rejected", std::to_string(this->last_subfloor_rejected_));
   kv("GICP Converged", this->gicp_hasConverged.load() ? "1" : "0");
   // CPU starvation: realtime factor (>1 = slower than real time), cumulative
