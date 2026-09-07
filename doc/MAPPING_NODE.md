@@ -4,12 +4,14 @@
 registered mapping observation with its exact registered pose, builds bounded
 submaps, and saves local keyframes and poses to a versioned archive. Geometry
 and disk work run in a worker in a separate process from odometry. NumPy and
-SQLite are the only additional implementation libraries; there is no external
-mapping, transform, database, or fusion node.
+SQLite implement storage/reconstruction; the graph uses GTSAM and SciPy geometry
+checks. The mapper owns its map output, database, and correction transform.
 
 The mapper accepts externally supplied, versioned pose corrections and rebuilds
-geometry from its original local observations. It does not yet detect loop
-closures or optimize poses itself. It owns dynamic `map -> odom`, initially
+geometry from its original local observations. Its [pose graph](POSE_GRAPH.md)
+also validates supplied loop measurements and optimizes poses, with reversible
+factor removal. Automatic place retrieval/registration are not connected.
+It owns dynamic `map -> odom`, initially
 identity; set `mapping/publish_tf:=false` when another backend owns this transform.
 See [pose revisions](POSE_REVISIONS.md) for the correction services, uncertainty
 contract, offline reconstruction, and rollback.
@@ -191,8 +193,8 @@ filtered before ingestion. These are processed keyframes, not lossless raw
 Ouster returns: ring, ambient/near-IR, range, and acquisition offsets are not
 present on the frontend's processed keyframe topic.
 
-Version 2 retains the original three tables and adds correction/provenance
-tables. Version 1 archives remain readable and can be upgraded through the
+Version 3 retains the original tables, version 2 correction/provenance tables,
+and [pose-graph history](POSE_GRAPH.md). Version 1/2 archives remain readable and can be upgraded through the
 offline copy workflow in [POSE_REVISIONS.md](POSE_REVISIONS.md).
 
 | Table | Retained data |
@@ -204,6 +206,9 @@ offline copy workflow in [POSE_REVISIONS.md](POSE_REVISIONS.md).
 | `optimized_poses` | Current map pose for every archived observation |
 | `pose_revisions` | Revision number, request identity/digest, optimized prefix extent, correction, and provenance |
 | `revision_poses` | Immutable optimized pose snapshots used for validation and rollback |
+| `graph_state` | Declared odometry noise/validation settings, solution revision, observation coverage |
+| `graph_loops` | Full relative measurements/covariances, verification provenance, insertion/removal revisions |
+| `graph_requests` | Request identity/digest, complete request, acceptance/rejection reasons and metrics |
 
 Poses are float64 rigid 4x4 matrices. Reload checks the SQLite format and
 integrity, sizes before fetching point blobs, CRCs, proper rotations, finite

@@ -32,15 +32,17 @@ class RevisionStore:
     def _upgrade(self):
         from .core import VERSION
         from .uncertainty import observation_metadata
-        if self.meta['version'] != 1:
+        if self.meta['version'] == VERSION:
             return
         updated = dict(self.meta, version=VERSION)
         self.db.execute('BEGIN IMMEDIATE')
         try:
-            self._create_revision_tables()
-            self.db.execute('INSERT INTO optimized_poses SELECT id,pose FROM keyframes')
-            self.db.execute('INSERT INTO observations SELECT id,? FROM keyframes',
-                            (json.dumps(observation_metadata(), allow_nan=False),))
+            if self.meta['version'] == 1:
+                self._create_revision_tables()
+                self.db.execute('INSERT INTO optimized_poses SELECT id,pose FROM keyframes')
+                self.db.execute('INSERT INTO observations SELECT id,? FROM keyframes',
+                                (json.dumps(observation_metadata(), allow_nan=False),))
+            self._create_graph_tables()
             self.db.execute(f'PRAGMA user_version={VERSION}')
             self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(updated, allow_nan=False),))
             self.db.commit()
@@ -148,7 +150,7 @@ class RevisionStore:
             self.active_count = self.db.execute('SELECT count(*) FROM keyframes WHERE submap_id=?',
                                                (self.active_id,)).fetchone()[0]
 
-    def apply_revision(self, session_id, expected_revision, poses, *, request_id, reason):
+    def apply_revision(self, session_id, expected_revision, poses, *, request_id, reason, _graph_commit=None):
         """Apply complete optimized poses for IDs 0..N, with an odometric tail.
 
         poses is an ordered sequence of (archive_id, T_map_base). Retries with
@@ -216,6 +218,12 @@ class RevisionStore:
                 while len(resident) > self.limits.resident_submaps:
                     resident.popitem(last=False)
             self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(updated, allow_nan=False),))
+            if _graph_commit is not None:
+                _graph_commit(revision)
+            else:
+                # An external correction/rollback does not remove factors. An
+                # explicit graph optimize is required before using them again.
+                self.db.execute('UPDATE graph_state SET pose_revision=NULL WHERE id=1')
             self.db.commit()
         except BaseException:
             self.db.rollback()

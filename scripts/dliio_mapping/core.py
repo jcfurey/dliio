@@ -18,12 +18,13 @@ import zlib
 import numpy as np
 
 from .revisions import RevisionStore
+from .graph import GraphStore
 from .uncertainty import observation_metadata
 
 FIELDS = ('x', 'y', 'z', 'intensity', 'reflectivity', 'intensity_corrected', 'lidar_intensity')
 APPLICATION_ID = 0x444C4D50
-VERSION = 2
-READ_VERSIONS = (1, VERSION)
+VERSION = 3
+READ_VERSIONS = (1, 2, VERSION)
 
 
 def validate_metadata(metadata):
@@ -319,7 +320,7 @@ def fused_chunks(chunks, leaf, directory):
             db.close()
 
 
-class Store(RevisionStore):
+class Store(RevisionStore, GraphStore):
     def __init__(self, path, limits, *, metadata=None, editable=False):
         self.path = Path(path).expanduser().resolve()
         self.limits = limits
@@ -380,6 +381,7 @@ class Store(RevisionStore):
             CREATE INDEX keyframes_submap ON keyframes(submap_id);
         ''')
         self._create_revision_tables()
+        self._create_graph_tables()
         self.db.execute('INSERT INTO metadata VALUES(1, ?)', (json.dumps(self.meta, allow_nan=False),))
 
     def _load(self):
@@ -424,6 +426,8 @@ class Store(RevisionStore):
             raise ValueError('Archive keyframe metadata does not match its records')
         if self.meta['version'] >= 2:
             self._validate_revisions()
+        if self.meta['version'] >= 3:
+            self._validate_graph()
         count = 0
         previous_last = -1
         for identifier, pose, first, last, stamp, n, blob, checksum in self.db.execute('SELECT * FROM submaps ORDER BY id'):
@@ -553,7 +557,7 @@ class Store(RevisionStore):
             fusion_array_bytes=self.fusion.nbytes if self.fusion is not None else 0,
             pose_revision=self.meta['pose_revision'],
             source_sequence_gaps=self.meta.get('source_sequence_gaps', 0),
-            last_stamp_ns=self.meta['last_stamp_ns'], read_only=self.read_only, archive=str(self.path))
+            last_stamp_ns=self.meta['last_stamp_ns'], read_only=self.read_only, archive=str(self.path), **self.graph_stats())
 
     def save(self, destination):
         snapshot_database(self.path, destination)

@@ -2,9 +2,10 @@
 
 This implements the first backend milestone: an atomic observation interface,
 explicit covariance semantics, and reconstruction from corrected poses. An
-external caller supplies the corrections. Automatic place recognition, loop
-validation, and graph optimization are still separate work; applying a pose
-revision does not certify that a loop match is correct.
+external caller can supply corrections; the [pose-graph backend](POSE_GRAPH.md)
+can now validate supplied loop measurements, optimize, and commit corrections
+with its factor history. Automatic place recognition/registration remain
+separate work; applying an external pose revision does not certify a loop.
 
 ## Observation delivery and uncertainty
 
@@ -44,7 +45,8 @@ recording; the mapper never double-ingests both representations.
 
 ## Corrected poses and map ownership
 
-Version 2 retains original registered poses and base-local clouds unchanged.
+Version 2 introduced immutable original registered poses and base-local clouds;
+version 3 additionally retains graph state and loop/request history.
 Current optimized poses and correction history are stored separately.
 `submaps` contains derived geometry and corrected anchor poses.
 
@@ -116,7 +118,7 @@ the original odometric trajectory. Read-only viewers reject correction writes.
 
 The CLI works on a **new copy** and atomically publishes a sealed result. It
 never overwrites its source or an existing destination. It can also snapshot
-a working WAL archive and upgrade a version 1 archive in the temporary copy.
+a working WAL archive and upgrade a version 1/2 archive in the temporary copy.
 
 ```bash
 ros2 run direct_lidar_inertial_odometry mapping_archive.py inspect /data/original.dliomap
@@ -182,7 +184,8 @@ covariance correlations, lever arms, and rotations at pi. C++ output-contract
 tests verify the real frontend publisher's frozen snapshot, quality fields,
 session/sequence, and UNKNOWN covariance representation.
 
-The next milestone is a graph consuming these observation/uncertainty
-contracts and producing validated revision requests. Covariance calibration,
-automatic loop validation, robust factor insertion/removal, and real tunnel
-replay remain required before claiming a complete loop-closure backend.
+The [graph milestone](POSE_GRAPH.md) now consumes these contracts, validates
+externally registered loop candidates, optimizes, and inserts/removes factors
+atomically with the map rebuild. Covariance calibration, automatic retrieval
+and registration, and real tunnel replay remain required before claiming a
+complete loop-closure backend.

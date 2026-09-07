@@ -1,0 +1,9 @@
+# See doc/POSE_GRAPH.md. Archive session, expected pose revision and request ID
+# are mandatory in the JSON. A retry with the identical request is idempotent.
+string<=1048576 request_json
+---
+bool success
+string message
+uint64 pose_revision
+# Accepted and rejected well-formed trials both return a durable audit report.
+string report_json

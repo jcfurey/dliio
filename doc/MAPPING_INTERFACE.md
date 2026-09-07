@@ -133,7 +133,9 @@ sequences may have transport gaps and differ from the archive's contiguous IDs.
 
 The mapper's [pose revision interface](POSE_REVISIONS.md) accepts corrected
 poses, reconstructs archived geometry, and updates dynamic `map -> odom`.
-Automatic loop detection and graph optimization are not yet connected.
+The [pose graph](POSE_GRAPH.md) validates externally registered loop candidates
+and optimizes with full relative covariance. Automatic retrieval/registration
+are not yet connected.
 
 Keep these responsibilities outside the odometry callback:
 

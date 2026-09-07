@@ -25,8 +25,9 @@ full PCD export. It selects full-resolution deskewed mapping observations indepe
 odometry keyframes and fuses their overlap on a shared configurable grid (2 cm by default). Source retention,
 output fusion, and odometry downsampling are separate. The mapper supports
 [versioned pose corrections and reconstruction](doc/POSE_REVISIONS.md), including
-rollback, while automatic loop detection and graph optimization remain the next
-stage. The original
+rollback, plus a [GTSAM pose graph with validated loop injection](doc/POSE_GRAPH.md)
+and reversible factor removal. Automatic place retrieval and registration are
+not yet connected. The original
 `dlio_ouster.launch.py` retains the legacy accumulated-map preview by default.
 
 # Modifications
@@ -125,7 +126,7 @@ A *stripped* cloud (xyz-only, unorganized, no time field) reduces DLIO to plain 
 |---|---|---|
 | Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; constant diagonal covariance from `odom/covariance/*` (tune for your EKF) |
 | Pose | `dlio/odom_node/pose` (`PoseStamped`) | same state, no twist |
-| TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` (only in `extrinsics/source: yaml`; in `tf` mode the node *consumes* those static transforms instead) | follows REP-105; no `map` frame is published — DLIO is odometry, not SLAM with loop closure |
+| TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` (only in `extrinsics/source: yaml`; in `tf` mode the node *consumes* those static transforms instead) | Frontend TF; the [persistent mapper](doc/POSE_GRAPH.md) additionally owns dynamic `map` → `odom` |
 | Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; raw `intensity` and `reflectivity` remain separate; correction is in `intensity_corrected` |
 | Keyframes / map | `dlio/odom_node/keyframes`, `dlio/map_node/map` | map is keyframe accumulation (unbounded; for visualization/export) |
 | Save map | `/save_pcd` service | absolute existing directory required |

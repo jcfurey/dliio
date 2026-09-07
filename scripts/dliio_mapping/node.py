@@ -2,6 +2,7 @@
 from array import array
 from collections import Counter
 from concurrent.futures import Future, TimeoutError
+import json
 import math
 from pathlib import Path
 import queue
@@ -25,7 +26,7 @@ from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import PointCloud2, PointField
 from tf2_ros import TransformBroadcaster
 from direct_lidar_inertial_odometry.msg import MappingObservation
-from direct_lidar_inertial_odometry.srv import MapArchive, ApplyPoseRevision, RestorePoseRevision
+from direct_lidar_inertial_odometry.srv import MapArchive, ApplyPoseRevision, RestorePoseRevision, UpdatePoseGraph
 
 from .core import FIELDS, Limits, Store, validate_leaf
 from .input import Pairer, decode_cloud, decode_pose, decode_observation, pose_message, stamp_ns
@@ -144,6 +145,8 @@ class MappingNode(Node):
             lambda req, res, operation=operation: self._revision_service(operation, req, res),
             callback_group=self.service_group) for operation, kind in
             (('apply_pose_revision', ApplyPoseRevision), ('restore_pose_revision', RestorePoseRevision))]
+        self.graph_service = self.create_service(UpdatePoseGraph, '/dlio/mapping/update_pose_graph',
+                                                 self._graph_service, callback_group=self.service_group)
         self.add_on_set_parameters_callback(self._on_parameters)
         self.get_logger().info(f'Mapping archive: {self.state["archive"]}; '
                                f'{"read-only viewer" if self.viewer else "recording paired mapping frames"}')
@@ -274,6 +277,9 @@ class MappingNode(Node):
                         store.save(data)
                     elif operation == 'export_pcd':
                         store.export_pcd(data, self.fusion_size or None)
+                    elif operation == 'update_pose_graph':
+                        report = store.update_graph(data)
+                        dirty = dirty or report['status'] == 'accepted'
                     elif operation == 'apply_pose_revision':
                         if data.frame_id != self.map_frame or len(data.observation_ids) != len(data.poses):
                             raise ValueError('Correction frame or pose/ID array lengths are invalid')
@@ -298,7 +304,8 @@ class MappingNode(Node):
                         store.close()
                         store = candidate
                     if future is not None:
-                        future.set_result(store.stats())
+                        future.set_result(dict(store.stats(), graph_report=report) if operation == 'update_pose_graph'
+                                          else store.stats())
                 except Exception as error:
                     with self.lock:
                         self.last_error = str(error)
@@ -361,6 +368,30 @@ class MappingNode(Node):
             cancelled = future.cancel()
             response.message = 'Request timed out; ' + ('cancelled before execution' if cancelled else
                 'operation may still finish; retry the same request ID to determine its result')
+        except Exception as error:
+            response.message = str(error) or 'Mapping worker queue is full'
+        return response
+
+    def _graph_service(self, request, response):
+        from .graph import MAX_REQUEST_BYTES, encoded
+        future = Future()
+        try:
+            if len(request.request_json.encode('utf8')) > MAX_REQUEST_BYTES:
+                raise ValueError('Graph request exceeds 1 MiB')
+            data = json.loads(request.request_json)
+            if not self.worker.is_alive():
+                raise RuntimeError('Mapping worker is unavailable')
+            self.jobs.put_nowait(('update_pose_graph', data, future))
+            stats = future.result(timeout=60)
+            report = stats['graph_report']
+            response.success = report['status'] == 'accepted'
+            response.pose_revision = stats['pose_revision']
+            response.message = report['reason']
+            response.report_json = encoded(report)
+        except TimeoutError:
+            cancelled = future.cancel()
+            response.message = 'Request timed out; ' + ('cancelled before execution' if cancelled else
+                'operation may still finish; retry the identical request ID to determine its result')
         except Exception as error:
             response.message = str(error) or 'Mapping worker queue is full'
         return response

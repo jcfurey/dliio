@@ -9,7 +9,7 @@ from dliio_mapping.core import Limits, Store, snapshot_database
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=['inspect', 'snapshot', 'export', 'revise', 'restore'])
+    parser.add_argument('operation', choices=['inspect', 'snapshot', 'export', 'revise', 'restore', 'graph'])
     parser.add_argument('source', type=Path)
     parser.add_argument('destination', type=Path, nargs='?')
     parser.add_argument('--max-voxels', type=int, default=Limits().max_voxels,
@@ -18,26 +18,32 @@ def main():
     parser.add_argument('--fusion-size', type=float, default=0.,
                         help='Global export fusion spacing in metres; 0 exports the stored samples')
     parser.add_argument('--revision', type=Path, help='JSON revision request; required for revise/restore')
+    parser.add_argument('--request', type=Path, help='JSON graph request; required for graph')
     args = parser.parse_args()
-    if args.operation in ('snapshot', 'export', 'revise', 'restore') and args.destination is None:
+    if args.operation in ('snapshot', 'export', 'revise', 'restore', 'graph') and args.destination is None:
         parser.error('This operation requires an absolute destination filename')
     if args.operation == 'snapshot':
         snapshot_database(args.source, args.destination)
         return
-    if args.operation in ('revise', 'restore'):
-        if args.revision is None:
-            parser.error('revise/restore requires --revision request.json')
+    if args.operation in ('revise', 'restore', 'graph'):
+        request_path = args.request if args.operation == 'graph' else args.revision
+        if request_path is None:
+            parser.error('graph requires --request; revise/restore requires --revision')
         if not args.destination.is_absolute() or not args.destination.parent.is_dir() or args.destination.exists():
             parser.error('Destination must be a new absolute filename in an existing directory')
-        if args.revision.stat().st_size > 64 * 1024 * 1024:
-            parser.error('Revision JSON exceeds 64 MiB')
-        request = json.loads(args.revision.read_text())
+        maximum = 1024 * 1024 if args.operation == 'graph' else 64 * 1024 * 1024
+        if request_path.stat().st_size > maximum:
+            parser.error('Request JSON exceeds its size limit')
+        request = json.loads(request_path.read_text())
         with tempfile.TemporaryDirectory(prefix='.dliio-revision-', dir=args.destination.parent) as temporary:
             working = Path(temporary) / 'working.dliomap'
             snapshot_database(args.source, working)
             store = Store(working, Limits(max_voxels=args.max_voxels, max_input_points=args.max_input_points), editable=True)
             try:
-                if args.operation == 'revise':
+                report = None
+                if args.operation == 'graph':
+                    report = store.update_graph(request)
+                elif args.operation == 'revise':
                     if request.get('frame_id') != store.meta['map_frame']:
                         raise ValueError('Revision frame_id differs from archive map frame')
                     store.apply_revision(request['session_id'], request['expected_revision'],
@@ -47,7 +53,8 @@ def main():
                     store.restore_revision(request['session_id'], request['expected_revision'], request['target_revision'],
                                            request_id=request['request_id'])
                 store.save(args.destination)
-                print(json.dumps(dict(destination=str(args.destination), pose_revision=store.meta['pose_revision'])))
+                print(json.dumps(dict(destination=str(args.destination), pose_revision=store.meta['pose_revision'],
+                                      **({'graph': report} if report else {})), allow_nan=False))
             finally:
                 store.close()
         return

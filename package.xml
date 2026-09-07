@@ -40,6 +40,9 @@
   <build_depend>libpcl-all-dev</build_depend>
   <build_depend>libjsoncpp-dev</build_depend>
   <build_depend>libomp-dev</build_depend>
+  <build_depend>gtsam</build_depend>
+  <build_depend>pybind11-dev</build_depend>
+  <build_depend>python3-dev</build_depend>
   <build_export_depend>eigen</build_export_depend>
   <build_export_depend>libpcl-all-dev</build_export_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
@@ -56,6 +59,8 @@
   <exec_depend>rmw_cyclonedds_cpp</exec_depend>
   <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>gtsam</exec_depend>
   <depend>tf2_msgs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>

@@ -200,7 +200,8 @@ def test_v1_read_compatibility_and_copy_upgrade(store, tmp_path):
     path = tmp_path / 'legacy.dliomap'
     store.save(path)
     with sqlite3.connect(path) as db:
-        for table in ('revision_poses', 'pose_revisions', 'observations', 'optimized_poses'):
+        for table in ('graph_state', 'graph_loops', 'graph_requests', 'revision_poses', 'pose_revisions',
+                      'observations', 'optimized_poses'):
             db.execute(f'DROP TABLE {table}')
         db.execute('PRAGMA user_version=1')
         db.execute("UPDATE metadata SET json=json_set(json,'$.version',1)")
@@ -213,7 +214,7 @@ def test_v1_read_compatibility_and_copy_upgrade(store, tmp_path):
         legacy.close()
     editable = Store(tmp_path / 'editable.dliomap', store.limits, editable=True)
     try:
-        assert editable.meta['version'] == 2
+        assert editable.meta['version'] == 3
         apply(editable, [pose(20+i*3.) for i in range(5)])
         editable.save(tmp_path / 'upgraded.dliomap')
     finally:

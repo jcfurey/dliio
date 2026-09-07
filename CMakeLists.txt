@@ -50,6 +50,10 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io registration kdtree search features surface filters)
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(GTSAM 4.2 REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
+set(PYBIND11_FINDPYTHON ON)
+find_package(pybind11 REQUIRED)
 # OpenCV: direct visual photometric residual (nano_gicp) + image undistort (odom)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d)
 
@@ -87,6 +91,7 @@ rosidl_generate_interfaces(
         srv/MapArchive.srv
         srv/ApplyPoseRevision.srv
         srv/RestorePoseRevision.srv
+        srv/UpdatePoseGraph.srv
         msg/MappingObservation.msg
     DEPENDENCIES std_msgs geometry_msgs sensor_msgs
 )
@@ -163,6 +168,14 @@ endif()
 rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
 # Standalone executables
+pybind11_add_module(_dliio_pose_graph MODULE src/dlio/pose_graph.cc)
+target_link_libraries(_dliio_pose_graph PRIVATE gtsam Eigen3::Eigen)
+# ROSIDL already registers this Python directory in the package environment.
+# Installing next to script symlinks would not be importable: Python resolves
+# their source directory when constructing sys.path.
+ament_get_python_install_dir(DLIIO_PYTHON_INSTALL_DIR)
+install(TARGETS _dliio_pose_graph LIBRARY DESTINATION ${DLIIO_PYTHON_INSTALL_DIR})
+
 ament_auto_add_executable(dlio_odom_node src/dlio/odom_node.cc)
 target_compile_definitions(dlio_odom_node PRIVATE PCL_NO_PRECOMPILE)
 target_link_libraries(dlio_odom_node dlio_components)
@@ -179,6 +192,7 @@ install(FILES README.md ouster.repos LICENSE THIRD_PARTY_LICENSES.md
 install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
   scripts/dlio_mapping_node.py scripts/mapping_archive.py scripts/verify_mapping.py
   scripts/verify_mapping_replay.py scripts/verify_pose_revisions.py
+  scripts/verify_pose_graph.py
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY scripts/dliio_mapping DESTINATION lib/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE)
@@ -193,6 +207,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_revisions test/test_mapping_revisions.py TIMEOUT 120)
   ament_add_pytest_test(test_mapping_uncertainty test/test_mapping_uncertainty.py TIMEOUT 60)
+  ament_add_pytest_test(test_mapping_graph test/test_mapping_graph.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_loop_validation test/test_loop_validation.py TIMEOUT 60)
   ament_add_gtest(test_imu_delivery test/test_imu_delivery.cpp)
   target_include_directories(test_imu_delivery PRIVATE include)
   find_package(Eigen3 REQUIRED)
