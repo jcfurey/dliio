@@ -209,6 +209,16 @@ development headers, and SciPy at runtime. The native module installs into
 the ROS package's Python path and does not require GTSAM's Python bindings.
 The current host validation uses GTSAM 4.3 and ROS 2 Lyrical.
 
+`package.xml` declares `gtsam` >= 4.2 for build and runtime, matching CMake's
+minimum version; `pybind11-dev` and `python3-dev` are build dependencies, and
+`python3-scipy` is a runtime dependency. On a ROS 2 Lyrical Ubuntu installation,
+the corresponding packages can be installed with:
+
+```bash
+sudo apt-get install --no-install-recommends \
+  ros-lyrical-gtsam python3-scipy pybind11-dev python3-dev
+```
+
 ```bash
 colcon build --packages-select direct_lidar_inertial_odometry --symlink-install
 source install/setup.bash
