@@ -39,10 +39,12 @@ def apply(store, poses, **kwargs):
                                 reason='known-transform fixture', **kwargs)
 
 
-@pytest.fixture(params=[0., .05])
+@pytest.fixture(params=[('python', 0.), ('python', .05), ('native', 0.), ('native', .05)])
 def store(tmp_path, request):
+    backend, leaf = request.param
     value = Store(tmp_path / 'live.dliomap',
-                  Limits(voxel_size=request.param, submap_keyframes=2, resident_submaps=1), metadata=META)
+                  Limits(voxel_size=leaf, submap_keyframes=2, resident_submaps=1), metadata=META,
+                  reconstruction_backend=backend)
     for i in range(5):
         value.ingest(i+1, pose(i*3.), placed(LOCAL, pose(i*3.)))
     yield value
@@ -140,7 +142,7 @@ def test_abrupt_worker_exit_recovers_last_committed_revision(store, tmp_path):
 import os, sys
 import numpy as np
 from dliio_mapping.core import Store, Limits
-store = Store(sys.argv[1], Limits(), editable=True)
+store = Store(sys.argv[1], Limits(), editable=True, reconstruction_backend=sys.argv[2])
 store.db.create_function('exit_worker', 0, lambda: os._exit(23))
 store.db.execute('CREATE TRIGGER fail_mid_rebuild BEFORE UPDATE ON submaps WHEN OLD.id=1 '
                  'BEGIN SELECT exit_worker(); END')
@@ -151,7 +153,7 @@ for i in range(store.meta['keyframes']):
     poses.append((i, pose))
 store.apply_revision(store.meta['session_id'], 0, poses, request_id='interrupted', reason='crash fixture')
 '''
-    completed = subprocess.run([sys.executable, '-c', script, str(working)],
+    completed = subprocess.run([sys.executable, '-c', script, str(working), store.reconstruction_backend],
                                cwd=Path(__file__).resolve().parents[1] / 'scripts',
                                capture_output=True, text=True, timeout=15)
     assert completed.returncode == 23, completed.stderr

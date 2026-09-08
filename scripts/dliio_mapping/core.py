@@ -321,7 +321,12 @@ def fused_chunks(chunks, leaf, directory):
 
 
 class Store(RevisionStore, GraphStore):
-    def __init__(self, path, limits, *, metadata=None, editable=False):
+    def __init__(self, path, limits, *, metadata=None, editable=False, reconstruction_backend='python'):
+        if reconstruction_backend not in ('python', 'native'):
+            raise ValueError('reconstruction_backend must be python or native')
+        if reconstruction_backend == 'native':
+            from _dliio_pose_graph import reconstruct_dense_submap  # fail before opening/creating a database
+        self.reconstruction_backend = reconstruction_backend
         self.path = Path(path).expanduser().resolve()
         self.limits = limits
         self.resident = OrderedDict()
@@ -550,7 +555,7 @@ class Store(RevisionStore, GraphStore):
 
     def stats(self):
         return dict(session_id=self.meta['session_id'], keyframes=self.meta['keyframes'], submaps=self.meta['submaps'],
-            voxel_size=self.limits.voxel_size,
+            voxel_size=self.limits.voxel_size, reconstruction_backend=self.reconstruction_backend,
             resident_submaps=len(self.resident), resident_points=sum(len(p) for _, p in self.resident.values()),
             resident_array_bytes=sum(p.nbytes + pose.nbytes for pose, p in self.resident.values()) +
                                  (self.active.nbytes if self.active is not None else 0),

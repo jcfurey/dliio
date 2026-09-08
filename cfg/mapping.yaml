@@ -9,6 +9,9 @@
     # 0 keeps every received keyframe point; a positive value enables voxel means.
     # Registration has a separate filter. Full keyframes/poses remain on disk.
     mapping/voxel_size: 0.0
+    # Native dense pose-revision reconstruction; python keeps the reference path.
+    # Voxelized archives retain the sample-weighted Python reconstruction in both modes.
+    mapping/reconstruction_backend: native
     # Co-locate overlapping observations on ONE world grid for display/export.
     # Source keyframes/submaps stay dense. Set 0.0 for individual-return output.
     mapping/fusion_size: 0.02

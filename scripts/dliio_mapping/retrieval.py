@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+import time
 
 import numpy as np
 
@@ -98,6 +99,16 @@ class Windows:
         return result
 
 
+def _timed_register(*args, **kwargs):
+    started = time.monotonic()
+    result, error = None, None
+    try:
+        result = register(*args, **kwargs)
+    except ValueError as failure:
+        error = failure
+    return result, error, time.monotonic()-started
+
+
 def _registered(selected, source, windows, current, retrieval, feature_hints):
     """Only numeric registration runs concurrently; SQLite stays on its owner.
 
@@ -113,7 +124,7 @@ def _registered(selected, source, windows, current, retrieval, feature_hints):
             try:
                 target_data, source_data = windows.get(target), windows.get(source)
                 prior = np.linalg.inv(current[target]) @ current[source]
-                future = executor.submit(register, source_data[2], target_data[2], prior,
+                future = executor.submit(_timed_register, source_data[2], target_data[2], prior,
                                          ambiguity_margin=retrieval.ambiguity_margin,
                                          backend=retrieval.registration_backend,
                                          feature_hint=feature_hints.get(target))
@@ -122,12 +133,13 @@ def _registered(selected, source, windows, current, retrieval, feature_hints):
                 pending.append((target, None, None, None, error))
         for target, target_data, source_data, future, error in pending:
             result = None
+            seconds = 0.
             if error is None:
                 try:
-                    result = future.result()
+                    result, error, seconds = future.result()
                 except ValueError as failure:
                     error = failure
-            yield target, target_data, source_data, result, error
+            yield target, target_data, source_data, result, error, seconds
 
 
 def _rank_candidates(pool, source, windows, current, retrieval):
@@ -177,6 +189,7 @@ def anchor_ids(store, config):
 
 def propose(store, config, progress=None, *, start_source=0, last_anchor=None, max_sources=None, sources=None):
     """Read-only proposal and trial solve; no archive table or live TF changes."""
+    started = time.monotonic()
     config = settings(config)
     retrieval, graph, noise = Retrieval(**config['retrieval']), config['graph'], config['loop_noise']
     state = store.db.execute('SELECT configuration,pose_revision FROM graph_state WHERE id=1').fetchone()
@@ -194,7 +207,10 @@ def propose(store, config, progress=None, *, start_source=0, last_anchor=None, m
         'SELECT json FROM graph_loops WHERE removed_revision IS NULL ORDER BY id')]
     previous_ids = {row[0] for row in store.db.execute('SELECT id FROM graph_loops')}
     active_sources = {loop['to_id'] for loop in active}
+    part = time.monotonic()
     current, baseline = store._solve_graph(stamps, originals, active, graph)
+    timings = dict(baseline_graph_seconds=time.monotonic()-part, feature_ranking_seconds=0.,
+                   geometric_validation_seconds=0., held_refit_seconds=0., trial_graph_seconds=0.)
     current = np.asarray(current)
     distance_along_path = np.r_[0., np.cumsum(np.linalg.norm(np.diff(np.asarray(originals)[:, :3, 3], axis=0), axis=1))]
     windows = Windows(store, stamps, quality, graph['loop_windows'], retrieval.window_half_seconds)
@@ -227,11 +243,14 @@ def propose(store, config, progress=None, *, start_source=0, last_anchor=None, m
             selected.append(int(target))
             if len(selected) >= retrieval.candidate_pool:
                 break
+        part = time.monotonic()
         selected, feature_hints = _rank_candidates(selected, source, windows, current, retrieval)
+        timings['feature_ranking_seconds'] += time.monotonic()-part
         candidates = []
-        for target, target_data, source_data, registration_result, error in _registered(
+        for target, target_data, source_data, registration_result, error, registration_seconds in _registered(
                 selected, source, windows, current, retrieval, feature_hints):
-            detail = dict(from_id=target, to_id=source, seconds=[float(times[target]), float(times[source])])
+            detail = dict(from_id=target, to_id=source, seconds=[float(times[target]), float(times[source])],
+                          source_stamp_ns=int(stamps[source]), registration_seconds=registration_seconds)
             try:
                 if error is not None:
                     raise error
@@ -246,9 +265,19 @@ def propose(store, config, progress=None, *, start_source=0, last_anchor=None, m
                                'Conditional geometric evidence, not independent ground truth.',
                     support=dict(from_observations=tf, to_observations=sf,
                                  held_from_observations=th, held_to_observations=sh)), len(originals))
-                checked = store._validate_candidate(candidate, current, stamps, graph)
-                held_fit = fit(voxels(source_held, .15), voxels(target_held, .15), transform,
-                               backend=retrieval.registration_backend)
+                part = time.monotonic()
+                try:
+                    checked = store._validate_candidate(candidate, current, stamps, graph)
+                finally:
+                    detail['geometric_validation_seconds'] = time.monotonic()-part
+                    timings['geometric_validation_seconds'] += detail['geometric_validation_seconds']
+                part = time.monotonic()
+                try:
+                    held_fit = fit(voxels(source_held, .15), voxels(target_held, .15), transform,
+                                   backend=retrieval.registration_backend)
+                finally:
+                    detail['held_refit_seconds'] = time.monotonic()-part
+                    timings['held_refit_seconds'] += detail['held_refit_seconds']
                 change = np.linalg.inv(transform) @ held_fit
                 if np.linalg.norm(change[:3, 3]) > retrieval.held_translation or rotation_angle(change[:3, :3]) > retrieval.held_rotation:
                     raise ValueError('Held observations disagree with fitted transform')
@@ -277,12 +306,15 @@ def propose(store, config, progress=None, *, start_source=0, last_anchor=None, m
                 detail.update(status='rejected', reason='Ambiguous retrieved places')
                 if progress: progress(detail)
                 continue
+            part = time.monotonic()
             try:
                 poses, metrics = store._solve_graph(stamps, originals, [*active, *accepted, candidate], graph)
             except RejectedLoop as error:
                 detail.update(status='rejected', reason=str(error), metrics=error.metrics)
                 if progress: progress(detail)
                 continue
+            finally:
+                timings['trial_graph_seconds'] += time.monotonic()-part
             accepted.append(candidate)
             current = np.asarray(poses)
             detail.update(status='accepted_for_batch', optimization=metrics)
@@ -290,6 +322,7 @@ def propose(store, config, progress=None, *, start_source=0, last_anchor=None, m
             break
         if len(accepted) >= retrieval.max_loops:
             break
-    return dict(configuration=config, initial_graph=baseline, candidates=reports, loops=accepted,
+    timings['total_seconds'] = time.monotonic()-started
+    return dict(configuration=config, initial_graph=baseline, candidates=reports, loops=accepted, timings=timings,
                 source_session_id=store.meta['session_id'], source_pose_revision=store.meta['pose_revision'],
                 last_anchor_id=last_anchor, processed_source_ids=processed_sources), current

@@ -8,6 +8,7 @@ arrive while an optimizer works on an earlier archive snapshot.
 from collections import OrderedDict
 import hashlib
 import json
+import time
 
 import numpy as np
 
@@ -115,6 +116,33 @@ class RevisionStore:
                 raise ValueError('Optimized pose differs from committed revision')
 
     def _reconstruct_submap(self, identifier):
+        if getattr(self, 'reconstruction_backend', 'python') == 'native' and not self.limits.voxel_size:
+            return self._reconstruct_submap_native(identifier)
+        return self._reconstruct_submap_python(identifier)
+
+    def _reconstruct_submap_native(self, identifier):
+        from _dliio_pose_graph import reconstruct_dense_submap
+        from .core import Samples, decode_points, decode_pose
+        clouds, poses, relative = [], [], []
+        total = 0
+        for pose, count, blob, crc in self.db.execute(
+                'SELECT p.pose,k.count,k.points,k.crc FROM keyframes k '
+                'JOIN optimized_poses p ON p.id=k.id WHERE k.submap_id=? ORDER BY k.id', (identifier,)):
+            if len(clouds) >= 1000 or count > self.limits.max_voxels-total:
+                raise ValueError('Corrected submap exceeds point capacity')
+            points = decode_points(blob, count, crc, self.limits.max_input_points)
+            pose = decode_pose(pose)
+            if not poses:
+                inverse_anchor = np.linalg.inv(pose)
+            relative.append(inverse_anchor @ pose if poses else np.eye(4))
+            clouds.append(points)
+            poses.append(pose)
+            total += count
+        if not poses:
+            raise ValueError('Cannot reconstruct an empty submap')
+        return poses[0], Samples(reconstruct_dense_submap(clouds, poses, relative, self.limits.max_voxels))
+
+    def _reconstruct_submap_python(self, identifier):
         from .core import Samples, Voxels, decode_points, decode_pose, transform
         anchor, accumulator = None, None
         for pose, count, blob, crc in self.db.execute(
@@ -158,6 +186,7 @@ class RevisionStore:
         current. Original clouds/poses/provenance are never modified.
         """
         from .core import decode_pose, encode_points, rigid_pose, validate_metadata
+        started = time.monotonic()
         if self.read_only:
             raise ValueError('A loaded map is read-only; revise an editable copy')
         if session_id != self.meta['session_id']:
@@ -205,6 +234,7 @@ class RevisionStore:
                 self.db.execute('UPDATE optimized_poses SET pose=? WHERE id=?', (blob, identifier))
         self.db.execute('BEGIN IMMEDIATE')
         try:
+            update_started = time.monotonic()
             self.db.execute('INSERT INTO pose_revisions VALUES(?,?,?,?,?,?)',
                             (revision, request_id, digest, last, correction.astype('<f8').tobytes(), reason))
             for identifier, blob in enumerate(checked):
@@ -216,16 +246,28 @@ class RevisionStore:
             # Exact unchanged pose bytes need no cloud reads/writes. In
             # particular, graph initialization only records its noise model
             # and history instead of rebuilding gigabytes of identical points.
+            update_seconds = time.monotonic()-update_started
+            rebuild_started = time.monotonic()
+            rebuild_seconds = encode_seconds = write_seconds = 0.
+            rebuilt_points = 0
             for identifier in sorted(changed_submaps):
+                part = time.monotonic()
                 anchor, rebuilt = self._reconstruct_submap(identifier)
                 points = rebuilt.points()
+                rebuild_seconds += time.monotonic()-part
+                rebuilt_points += len(points)
+                part = time.monotonic()
                 blob, crc = encode_points(points)
+                encode_seconds += time.monotonic()-part
+                part = time.monotonic()
                 self.db.execute('UPDATE submaps SET pose=?,count=?,points=?,crc=? WHERE id=?',
                                 (anchor.astype('<f8').tobytes(), len(points), blob, crc, identifier))
+                write_seconds += time.monotonic()-part
                 if identifier in resident:
                     resident[identifier] = (anchor, points)
                 if identifier == self.active_id:
                     active = rebuilt
+            rebuild_total = time.monotonic()-rebuild_started
             self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(updated, allow_nan=False),))
             if _graph_commit is not None:
                 _graph_commit(revision)
@@ -233,7 +275,9 @@ class RevisionStore:
                 # An external correction/rollback does not remove factors. An
                 # explicit graph optimize is required before using them again.
                 self.db.execute('UPDATE graph_state SET pose_revision=NULL WHERE id=1')
+            commit_started = time.monotonic()
             self.db.commit()
+            commit_seconds = time.monotonic()-commit_started
         except BaseException:
             self.db.rollback()
             raise
@@ -243,6 +287,13 @@ class RevisionStore:
         self.active_id = self.meta['submaps'] - 1
         self.active_count = self.db.execute('SELECT count(*) FROM keyframes WHERE submap_id=?',
                                            (self.active_id,)).fetchone()[0]
+        # Runtime diagnostics only: do not modify a persisted/idempotent graph
+        # response after its transaction has committed.
+        self.last_revision_timing = dict(total_seconds=time.monotonic()-started,
+            pose_update_seconds=update_seconds, reconstruct_seconds=rebuild_seconds,
+            encode_seconds=encode_seconds, blob_write_seconds=write_seconds,
+            rebuild_seconds=rebuild_total, sqlite_commit_seconds=commit_seconds,
+            changed_submaps=len(changed_submaps), rebuilt_points=rebuilt_points)
         return revision
 
     def restore_revision(self, session_id, expected_revision, target_revision, *, request_id):

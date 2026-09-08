@@ -171,7 +171,7 @@ rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode
 
 # Standalone executables
 pybind11_add_module(_dliio_pose_graph MODULE src/dlio/pose_graph.cc src/dlio/loop_features.cc
-  src/dlio/loop_registration.cc)
+  src/dlio/loop_registration.cc src/dlio/map_geometry.cc)
 target_include_directories(_dliio_pose_graph PRIVATE include)
 target_link_libraries(_dliio_pose_graph PRIVATE gtsam Eigen3::Eigen ${PCL_LIBRARIES})
 # ROSIDL already registers this Python directory in the package environment.
@@ -217,7 +217,10 @@ if(BUILD_TESTING)
   set_tests_properties(test_fusion_ros PROPERTIES RUN_SERIAL TRUE)
   ament_add_pytest_test(test_mapping_core test/test_mapping_core.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
-  ament_add_pytest_test(test_mapping_revisions test/test_mapping_revisions.py TIMEOUT 120)
+  ament_add_pytest_test(test_mapping_revisions test/test_mapping_revisions.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_map_geometry test/test_map_geometry.py TIMEOUT 60
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
   ament_add_pytest_test(test_mapping_uncertainty test/test_mapping_uncertainty.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_graph test/test_mapping_graph.py TIMEOUT 120
     APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)

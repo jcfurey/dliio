@@ -3,14 +3,17 @@
 `dlio_mapping_node.py` is a dedicated mapper in this package. It pairs each
 registered mapping observation with its exact registered pose, builds bounded
 submaps, and saves local keyframes and poses to a versioned archive. Geometry
-and disk work run in a worker in a separate process from odometry. NumPy and
-SQLite implement storage/reconstruction; the graph uses GTSAM and SciPy geometry
-checks. The mapper owns its map output, database, and correction transform.
+and disk work run in a worker in a separate process from odometry. SQLite holds
+the archive; dense pose-revision reconstruction uses a bounded C++ kernel.
+NumPy retains the reference and voxelized reconstruction paths; the graph uses
+GTSAM and SciPy geometry checks. The mapper owns its map output, database, and
+correction transform.
 
 The mapper accepts externally supplied, versioned pose corrections and rebuilds
 geometry from its original local observations. Its [pose graph](POSE_GRAPH.md)
 also validates supplied loop measurements and optimizes poses, with reversible
-factor removal. Automatic place retrieval/registration are not connected.
+factor removal. [Automatic loop closure](AUTOMATIC_LOOPS.md) is an optional
+separate worker that submits proposals through the same admission service.
 It owns dynamic `map -> odom`, initially
 identity; set `mapping/publish_tf:=false` when another backend owns this transform.
 See [pose revisions](POSE_REVISIONS.md) for the correction services, uncertainty
@@ -82,6 +85,27 @@ Independent controls are available:
   positive value enables the older per-submap filter; original received frames
   are still archived. With prevoxelized submaps, output weights refer to stored
   centroids rather than their original return populations.
+- `mapping/reconstruction_backend: native` selects the C++ dense revision
+  kernel. `python` selects the retained reference. Voxelized archives use the
+  sample-weighted Python path in either mode. The standalone Python `Store`
+  defaults to `python`; callers can pass `reconstruction_backend='native'`.
+  Invalid backend names or missing native bindings fail before opening a store.
+
+The native kernel copies all seven float32 fields into one bounded output,
+then releases the GIL for coordinate validation and transforms. It preserves
+point order, duplicate returns, scalar bits (including missing-channel NaNs),
+and the anchor observation's local XYZ. It reconstructs from immutable source
+observations and does not own SQLite writes. Revision validation, capacity
+limits, atomic commit, rollback and cache publication remain in the storage
+worker. Geometry changes can therefore still pause ingestion during the
+transaction; this is not an asynchronous map-write implementation.
+
+Mapper diagnostics expose the selected `reconstruction_backend` and
+`graph_queue_seconds`, `graph_service_seconds`, and `graph_revision_*` stage
+times for successful graph requests. `graph_commit_to_snapshot_seconds` ends
+at the first matching snapshot publish call, not at receipt by RViz or a camera
+subscriber. Timings are runtime diagnostics and do not change persisted graph
+responses or request-idempotence checks.
 
 The live grid updates incrementally and subtracts evicted submaps' contributions.
 Freed accumulator slots are reused. Snapshot preparation is limited by

@@ -104,6 +104,8 @@ def main():
             self.checked_count, self.checked_revision = 0, -1
             self.idle = False
             self.pending_anchors = 0
+            self.processing_source_stamp = self.accepted_source_stamp = 0
+            self.last_attempt_seconds = self.last_service_seconds = 0.
             self.stopping = threading.Event()
             self.subscription = self.create_subscription(DiagnosticArray, 'dlio/mapping/diagnostics', self.mapping, 10)
             self.timer = self.create_timer(1., self.diagnose, clock=Clock(clock_type=ClockType.STEADY_TIME))
@@ -119,10 +121,19 @@ def main():
 
         def diagnose(self):
             with self.lock:
+                now = self.get_clock().now().nanoseconds
                 values = dict(self.state, loop_status=self.status, loop_error=self.error,
                     loop_idle=self.idle, loop_checked_observations=self.checked_count,
                     loop_checked_pose_revision=self.checked_revision,
-                    loop_pending_anchors=self.pending_anchors)
+                    loop_pending_anchors=self.pending_anchors,
+                    loop_processing_source_stamp_ns=self.processing_source_stamp,
+                    loop_processing_age_seconds=(max(0, now-self.processing_source_stamp)*1.e-9
+                                                 if self.processing_source_stamp and now > 0 else -1.),
+                    loop_accepted_source_stamp_ns=self.accepted_source_stamp,
+                    loop_accepted_age_seconds=(max(0, now-self.accepted_source_stamp)*1.e-9
+                                               if self.accepted_source_stamp and now > 0 else -1.),
+                    loop_last_attempt_seconds=self.last_attempt_seconds,
+                    loop_last_service_seconds=self.last_service_seconds)
             status = DiagnosticStatus(name='DLIO Loop Closure', hardware_id='dliio',
                 level=DiagnosticStatus.WARN if self.error else DiagnosticStatus.OK,
                 message=self.status, values=[KeyValue(key=k, value=str(v)) for k, v in sorted(values.items())])
@@ -132,6 +143,7 @@ def main():
             self.diagnostics.publish(message)
 
         def call(self, payload):
+            started = time.monotonic()
             receipt = self.session_directory/f'request-{payload["request_id"]}.json'
             receipt.write_text(encoded(payload)+'\n')
             # The mapper may complete after its service response times out.
@@ -141,7 +153,10 @@ def main():
                 if response.success or not response.message.startswith('Request timed out;'):
                     receipt.with_suffix('.response.json').write_text(encoded(dict(
                         success=response.success, message=response.message,
-                        pose_revision=response.pose_revision, report_json=response.report_json))+'\n')
+                        pose_revision=response.pose_revision, report_json=response.report_json,
+                        service_seconds=time.monotonic()-started))+'\n')
+                    with self.lock:
+                        self.last_service_seconds = time.monotonic()-started
                     if not response.success:
                         raise RuntimeError('Graph request rejected: '+response.message)
                     return response
@@ -181,18 +196,26 @@ def main():
                     continue
                 attempt += 1
                 report = None
+                attempt_started = time.monotonic()
                 try:
+                    snapshot_started = time.monotonic()
                     view = LoopReadView(state['archive'])
+                    snapshot_seconds = time.monotonic()-snapshot_started
                     try:
                         session = view.meta['session_id']
                         with self.lock:
                             self.status, self.error = 'checking revisit candidates', ''
                             self.idle = False
                         pending = [i for i in anchor_ids(view, self.config) if i not in checked_sources]
+                        with self.lock:
+                            self.pending_anchors = len(pending)
+                            self.processing_source_stamp = (view.db.execute('SELECT stamp_ns FROM keyframes WHERE id=?',
+                                (pending[-1],)).fetchone()[0] if pending else 0)
                         # Fresh revisits must not wait behind minutes of old
                         # rejected corridor matches. Backfill older anchors as
                         # the frontier is checked, including after sensor EOF.
                         report, _ = propose(view, self.config, sources=pending[-2:])
+                        report['timings']['input_snapshot_seconds'] = snapshot_seconds
                         graph_stats = view.graph_stats()
                         initialized = graph_stats['graph_initialized']
                         at_capacity = graph_stats['active_loops']+len(report['loops']) >= self.config['retrieval']['max_loops']
@@ -215,6 +238,11 @@ def main():
                         revision = result.pose_revision
                         report['committed_revision'] = result.pose_revision
                         report['commit_report'] = json.loads(result.report_json)
+                        with self.lock:
+                            accepted = {item['to_id'] for item in report['loops']}
+                            self.accepted_source_stamp = max(self.accepted_source_stamp,
+                                max(item['source_stamp_ns'] for item in report['candidates']
+                                    if item['to_id'] in accepted))
                         path.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
                         self.get_logger().info(f'Committed {len(report["loops"])} loop(s), map revision {result.pose_revision}')
                     checked_sources.update(report['processed_source_ids'])
@@ -238,6 +266,10 @@ def main():
                     # Wait for a changed committed input instead of repeatedly
                     # retrying an unchanged rejection or hogging the worker.
                     completed_input = committed_input
+                finally:
+                    with self.lock:
+                        self.last_attempt_seconds = time.monotonic()-attempt_started
+                        self.processing_source_stamp = 0
 
         def close(self):
             self.stopping.set()

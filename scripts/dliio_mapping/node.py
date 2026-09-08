@@ -56,6 +56,9 @@ class MappingNode(Node):
         self.limits = Limits(**{name: parameter('mapping/' + name, getattr(Limits(), name))
                                for name in Limits.__dataclass_fields__})
         self.fusion_size = parameter('mapping/fusion_size', .02)
+        self.reconstruction_backend = parameter('mapping/reconstruction_backend', 'native')
+        if self.reconstruction_backend not in ('native', 'python'):
+            raise ValueError('mapping/reconstruction_backend must be native or python')
         validate_leaf(self.fusion_size if self.fusion_size != 0 else None)
         self.odom_frame = parameter('frames/odom', 'odom')
         self.base_frame = parameter('frames/baselink', 'base_link')
@@ -102,6 +105,7 @@ class MappingNode(Node):
         self.cached_map = None
         self.cached_path = None
         self.cached_snapshot = None
+        self.graph_timing = {}
         self.cached_correction = np.eye(4)
         self.revision = 0
         self.published_revision = -1
@@ -216,7 +220,7 @@ class MappingNode(Node):
                 self._increment('queue_dropped')
 
     def _open(self, path):
-        store = Store(path, self.limits)
+        store = Store(path, self.limits, reconstruction_backend=self.reconstruction_backend)
         if (store.meta['odom_frame'] != self.odom_frame or store.meta['map_frame'] != self.map_frame or
                 store.meta['base_frame'] != self.base_frame):
             store.close()
@@ -253,7 +257,7 @@ class MappingNode(Node):
             self.cached_path = path
             self.cached_snapshot = snapshot
             self.cached_correction = np.asarray(store.meta['map_to_odom']).copy()
-            self.state = store.stats()
+            self.state = dict(store.stats(), **self.graph_timing)
             self.state['cached_pose_revision'] = store.meta['pose_revision']
             self.state['cached_map_bytes'] = len(message.data)
             self.state['published_points'] = len(points)
@@ -268,7 +272,7 @@ class MappingNode(Node):
         try:
             store = (self._open(self.load_path) if self.viewer else
                      Store(self.storage_directory / ('session-' + uuid.uuid4().hex + '.dliomap'),
-                           self.limits, metadata=self.metadata))
+                           self.limits, metadata=self.metadata, reconstruction_backend=self.reconstruction_backend))
             self._refresh(store)
             self.ready.set_result(True)
             dirty = False
@@ -313,7 +317,21 @@ class MappingNode(Node):
                     elif operation == 'export_pcd':
                         store.export_pcd(data, self.fusion_size or None)
                     elif operation == 'update_pose_graph':
+                        graph_started = time.monotonic()
+                        previous_revision = store.meta['pose_revision']
                         report = store.update_graph(data)
+                        completed = time.monotonic()
+                        timing = dict(graph_request_id=data['request_id'], graph_pose_revision=store.meta['pose_revision'],
+                            graph_service_seconds=completed-graph_started,
+                            graph_queue_seconds=graph_started-getattr(future, 'enqueued_at', graph_started),
+                            graph_completed_monotonic=completed)
+                        if store.meta['pose_revision'] != previous_revision:
+                            timing.update({'graph_revision_'+key: value for key, value in store.last_revision_timing.items()})
+                        with self.lock:
+                            for key in self.graph_timing:
+                                self.state.pop(key, None)
+                            self.graph_timing = timing
+                            self.state.update(timing)
                         dirty = dirty or report['status'] == 'accepted'
                     elif operation == 'apply_pose_revision':
                         if data.frame_id != self.map_frame or len(data.observation_ids) != len(data.poses):
@@ -394,6 +412,12 @@ class MappingNode(Node):
         if snapshot is not None and revision != self.published_snapshot_revision and self.snapshot_pub.get_subscription_count():
             self.snapshot_pub.publish(snapshot)
             self.published_snapshot_revision = revision
+            with self.lock:
+                if (snapshot.pose_revision == self.graph_timing.get('graph_pose_revision') and
+                        'graph_commit_to_snapshot_seconds' not in self.graph_timing):
+                    elapsed = time.monotonic()-self.graph_timing['graph_completed_monotonic']
+                    self.graph_timing['graph_commit_to_snapshot_seconds'] = elapsed
+                    self.state.update(self.graph_timing)
 
     def _revision_service(self, operation, request, response):
         future = Future()
@@ -423,6 +447,7 @@ class MappingNode(Node):
             data = json.loads(request.request_json)
             if not self.worker.is_alive():
                 raise RuntimeError('Mapping worker is unavailable')
+            future.enqueued_at = time.monotonic()
             self.jobs.put_nowait(('update_pose_graph', data, future))
             stats = future.result(timeout=60)
             report = stats['graph_report']
