@@ -46,8 +46,8 @@ def cloud_message(points, stamp, frame):
 
 
 class MappingNode(Node):
-    def __init__(self):
-        super().__init__('dlio_mapping_node', automatically_declare_parameters_from_overrides=True)
+    def __init__(self, node_name='dlio_mapping_node', **kwargs):
+        super().__init__(node_name, automatically_declare_parameters_from_overrides=True, **kwargs)
         def parameter(name, default):
             if not self.has_parameter(name):
                 self.declare_parameter(name, default)
@@ -111,7 +111,7 @@ class MappingNode(Node):
         self.service_group = MutuallyExclusiveCallbackGroup()
         self.map_pub = self.create_publisher(PointCloud2, 'map',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.diagnostics = self.create_publisher(DiagnosticArray, '/dlio/mapping/diagnostics', 10)
+        self.diagnostics = self.create_publisher(DiagnosticArray, 'dlio/mapping/diagnostics', 10)
         # One dynamic authority owns map -> odom. Corrections and cloud caches
         # are swapped together after a complete revision rebuild.
         self.tf = TransformBroadcaster(self) if self.publish_tf else None
@@ -138,14 +138,14 @@ class MappingNode(Node):
                                               callback_group=self.publish_group)
         self.tf_timer = self.create_timer(.05, self._publish_tf, clock=self.steady_clock, callback_group=self.publish_group)
         self.diag_timer = self.create_timer(1., self._diagnose, clock=self.steady_clock, callback_group=self.publish_group)
-        self.archive_services = [self.create_service(MapArchive, '/dlio/mapping/' + operation,
+        self.archive_services = [self.create_service(MapArchive, 'dlio/mapping/' + operation,
             lambda req, res, operation=operation: self._service(operation, req, res), callback_group=self.service_group)
             for operation in ('save_map', 'load_map', 'export_pcd')]
-        self.revision_services = [self.create_service(kind, '/dlio/mapping/' + operation,
+        self.revision_services = [self.create_service(kind, 'dlio/mapping/' + operation,
             lambda req, res, operation=operation: self._revision_service(operation, req, res),
             callback_group=self.service_group) for operation, kind in
             (('apply_pose_revision', ApplyPoseRevision), ('restore_pose_revision', RestorePoseRevision))]
-        self.graph_service = self.create_service(UpdatePoseGraph, '/dlio/mapping/update_pose_graph',
+        self.graph_service = self.create_service(UpdatePoseGraph, 'dlio/mapping/update_pose_graph',
                                                  self._graph_service, callback_group=self.service_group)
         self.add_on_set_parameters_callback(self._on_parameters)
         self.get_logger().info(f'Mapping archive: {self.state["archive"]}; '

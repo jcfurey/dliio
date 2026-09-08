@@ -1,4 +1,8 @@
-# Standalone handoff
+# Standalone Ouster handoff
+
+For sensor-independent integration into your own robot or bringup package,
+start with [INTEGRATION.md](INTEGRATION.md). This guide adds the optional Ouster
+packet workflow and its recorded calibration profiles.
 
 This repository supplies the estimator, persistent mapper and map preview, launch files,
 profiles, RViz configuration, and replay/verification tools. The Ouster workflow
@@ -109,7 +113,8 @@ is specific to the 0705 sensor mounting; use your own YAML for other hardware.
 defaults to the accumulated-map preview. For bounded submaps, persistent local
 keyframes, save/reload, and full PCD export, use `dlio_mapping.launch.py` or add
 `mapper:=persistent`. See [MAPPING_NODE.md](MAPPING_NODE.md) for its services and
-limits. Loop closure is not implemented yet. See the
+limits. [Validated graph and loop injection](POSE_GRAPH.md) are implemented;
+automatic place retrieval and loop registration remain external. See the
 [mapping contract](MAPPING_INTERFACE.md) before consuming registered clouds.
 
 For an external player, supply `mode:=packets metadata:=/path/sensor.json`,

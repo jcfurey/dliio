@@ -58,6 +58,16 @@ jobs:
           source install/setup.bash
           ros2 run direct_lidar_inertial_odometry verify_mapping.py
 
+      - name: Verify generic integration in two robot namespaces
+        shell: bash
+        run: |
+          source /opt/ros/$ROS_DISTRO/setup.bash
+          source install/setup.bash
+          cd /tmp
+          ros2 run direct_lidar_inertial_odometry verify_integration.py
+          ros2 run direct_lidar_inertial_odometry verify_install.py \
+            --launch dlio_composed.launch.py --output dliio_run/generic-components.json
+
       - name: Compile and exercise the enabled Livox adapter
         shell: bash
         run: |
@@ -76,7 +86,7 @@ jobs:
         run: |
           source /opt/ros/$ROS_DISTRO/setup.bash
           source install/setup.bash
-          cmake -S src/direct_lidar_inertial_odometry/test/installed_consumer -B consumer_build
+          cmake -S "$(ros2 pkg prefix --share direct_lidar_inertial_odometry)/test/installed_consumer" -B consumer_build
           cmake --build consumer_build --parallel 2
           ./consumer_build/consumer
 

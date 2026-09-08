@@ -8,115 +8,127 @@
 #   Contact: {kennyjchen, ryguyn, btlopez}@ucla.edu
 #
 
+"""Sensor-independent DLIO bringup for existing PointCloud2 and IMU publishers."""
+from pathlib import Path
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
-from launch_ros.substitutions import FindPackageShare
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
+
+
+PACKAGE = 'direct_lidar_inertial_odometry'
+DEFAULTS = {
+    'namespace': '', 'pointcloud_topic': 'points_raw', 'imu_topic': 'imu_raw',
+    'camera_topic': 'image_raw', 'robot_config': '', 'params_file': '',
+    'use_sim_time': 'false', 'composed': 'false', 'mapper': 'preview',
+    'mapping_config': '', 'archive_directory': '',
+    'rviz': 'false', 'rviz_config': '', 'rviz_frame': '',
+}
+DESCRIPTIONS = {
+    'namespace': 'ROS namespace for all DLIO nodes, topics and services; TF frame IDs come from robot_config.',
+    'robot_config': 'Robot calibration and frames, applied after algorithm defaults. Empty retains cfg/dlio.yaml.',
+    'params_file': 'Algorithm configuration; empty uses cfg/params.yaml.',
+    'mapper': 'none: odometry only; preview: accumulated map; persistent: archive and pose graph services.',
+    'archive_directory': 'Required with mapper:=persistent. Directory for a new recording database.',
+    'mapping_config': 'Persistent mapper limits and publication settings; empty uses cfg/mapping.yaml.',
+    'composed': 'Load the C++ nodes in one container. The persistent Python mapper stays in its own process.',
+    'use_sim_time': 'Use /clock from simulation or an external ros2 bag play --clock.',
+    'rviz_frame': 'RViz fixed frame; empty uses map for persistent mapping, otherwise odom.',
+}
+OUTPUTS = {
+    'odom': 'dlio/odom_node/odom', 'pose': 'dlio/odom_node/pose',
+    'scan_pose': 'dlio/odom_node/scan_pose', 'kf_pose_stamped': 'dlio/odom_node/keyframe_pose',
+    'path': 'dlio/odom_node/path', 'kf_pose': 'dlio/odom_node/keyframes',
+    'kf_cloud': 'dlio/odom_node/pointcloud/keyframe',
+    'deskewed': 'dlio/odom_node/pointcloud/deskewed',
+    'mapping_cloud': 'dlio/odom_node/pointcloud/mapping',
+    'mapping_pose': 'dlio/odom_node/mapping_pose',
+    'mapping_observation': 'dlio/odom_node/mapping_observation',
+}
+
+
+def boolean(value):
+    if value.lower() not in ('true', 'false'):
+        raise ValueError('Boolean launch arguments must be true or false')
+    return value.lower() == 'true'
+
+
+def build_actions(args, package):
+    mapper = args['mapper']
+    if mapper not in ('none', 'preview', 'persistent'):
+        raise ValueError('mapper must be none, preview, or persistent')
+    sim, composed, rviz = (boolean(args[name]) for name in ('use_sim_time', 'composed', 'rviz'))
+    persistent = mapper == 'persistent'
+    if persistent and not args['archive_directory'].strip():
+        raise ValueError('mapper:=persistent requires archive_directory:=/path/to/a/recording')
+
+    def configuration(argument, default):
+        path = Path(args[argument]).expanduser() if args[argument] else package / default
+        if not path.is_file():
+            raise ValueError(f'{argument}: configuration file does not exist: {path}')
+        return str(path.resolve())
+
+    # Algorithm defaults contain frame defaults too. Apply robot calibration
+    # last so names and extrinsics supplied by the integrating robot take effect.
+    parameters = [configuration('params_file', 'cfg/params.yaml'),
+                  configuration('robot_config', 'cfg/dlio.yaml')]
+    overrides = {'use_sim_time': sim}
+    if persistent:
+        overrides.update({'map/observation/enabled': True, 'map/keyframe/filtered': False})
+    if composed:
+        overrides['odom/debug/dashboard'] = False
+    parameters.append(overrides)
+    namespace = args['namespace']
+    odom_remaps = [('pointcloud', args['pointcloud_topic']), ('imu', args['imu_topic']),
+                   ('camera', args['camera_topic']), *OUTPUTS.items()]
+    map_remaps = [('keyframes', OUTPUTS['kf_cloud']), ('map', 'dlio/map_node/map')]
+    if composed:
+        components = [ComposableNode(package=PACKAGE, plugin='dlio::OdomNode',
+            namespace=namespace, name='dlio_odom_node', parameters=parameters,
+            remappings=odom_remaps, extra_arguments=[{'use_intra_process_comms': True}])]
+        if mapper == 'preview':
+            components.append(ComposableNode(package=PACKAGE, plugin='dlio::MapNode',
+                namespace=namespace, name='dlio_map_node', parameters=parameters,
+                remappings=map_remaps, extra_arguments=[{'use_intra_process_comms': True}]))
+        actions = [ComposableNodeContainer(package='rclcpp_components', executable='component_container_mt',
+            namespace=namespace, name='dlio_container', output='screen',
+            composable_node_descriptions=components)]
+    else:
+        actions = [Node(package=PACKAGE, executable='dlio_odom_node', namespace=namespace,
+                        parameters=parameters, remappings=odom_remaps, output='screen')]
+        if mapper == 'preview':
+            actions.append(Node(package=PACKAGE, executable='dlio_map_node', namespace=namespace,
+                                parameters=parameters, remappings=map_remaps, output='screen'))
+    if persistent:
+        mapping_config = configuration('mapping_config', 'cfg/mapping.yaml')
+        actions.append(Node(package=PACKAGE, executable='dlio_mapping_node.py', namespace=namespace,
+            parameters=[mapping_config, *parameters, {
+                'mapping/storage_directory': str(Path(args['archive_directory']).expanduser().resolve()),
+                'mapping/load_path': '', 'mapping/input_source': 'observations',
+                'mapping/transport': 'observation'}],
+            remappings=[('observation', OUTPUTS['mapping_observation']), ('map', 'dlio/map_node/map')],
+            output='screen'))
+    if rviz:
+        config = configuration('rviz_config', 'launch/dlio_mapping.rviz' if persistent else 'launch/dlio.rviz')
+        topics = set(OUTPUTS.values()) | {'dlio/map_node/map'}
+        actions.append(Node(package='rviz2', executable='rviz2', name='dlio_rviz', namespace=namespace,
+            arguments=['-d', config, '-f', args['rviz_frame'] or ('map' if persistent else 'odom')],
+            parameters=[{'use_sim_time': sim}], remappings=[('/'+topic, topic) for topic in sorted(topics)],
+            output='screen'))
+    return actions
+
+
+def setup(context):
+    args = {name: LaunchConfiguration(name).perform(context) for name in DEFAULTS}
+    return build_actions(args, Path(get_package_share_directory(PACKAGE)))
 
 
 def generate_launch_description():
-    current_pkg = FindPackageShare('direct_lidar_inertial_odometry')
-
-    # Arguments
-    declare_rviz_arg = DeclareLaunchArgument(
-        'rviz', default_value='false',
-        description='Launch RViz'
-    )
-    declare_pointcloud_topic_arg = DeclareLaunchArgument(
-        'pointcloud_topic', default_value='points_raw',
-        description='Pointcloud topic name'
-    )
-    declare_imu_topic_arg = DeclareLaunchArgument(
-        'imu_topic', default_value='imu_raw',
-        description='IMU topic name'
-    )
-    declare_camera_topic_arg = DeclareLaunchArgument(
-        'camera_topic', default_value='image_raw',
-        description='Camera image topic (only used when odom/visual/enabled)'
-    )
-    declare_use_sim_time_arg = DeclareLaunchArgument(
-        'use_sim_time', default_value='false',
-        description='Use simulation (/clock) time. Set true under Gazebo or '
-                    'rosbag play --clock.'
-    )
-    declare_robot_config_arg = DeclareLaunchArgument(
-        'robot_config',
-        default_value=PathJoinSubstitution([current_pkg, 'cfg', 'dlio.yaml']),
-        description='Per-robot configuration (extrinsics, IMU intrinsics).'
-    )
-    declare_params_file_arg = DeclareLaunchArgument(
-        'params_file',
-        default_value=PathJoinSubstitution([current_pkg, 'cfg', 'params.yaml']),
-        description='Algorithm parameters.'
-    )
-
-    use_sim_time = ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)
-
-    # Parameters: robot config first, algorithm params second, launch-level
-    # overrides last (later entries win).
-    parameters = [
-        LaunchConfiguration('robot_config'),
-        LaunchConfiguration('params_file'),
-        {'use_sim_time': use_sim_time},
-    ]
-
-    # DLIO Odometry Node
-    dlio_odom_node = Node(
-        package='direct_lidar_inertial_odometry',
-        executable='dlio_odom_node',
-        output='screen',
-        parameters=parameters,
-        remappings=[
-            ('pointcloud', LaunchConfiguration('pointcloud_topic')),
-            ('imu', LaunchConfiguration('imu_topic')),
-            ('camera', LaunchConfiguration('camera_topic')),
-            ('odom', 'dlio/odom_node/odom'),
-            ('pose', 'dlio/odom_node/pose'),
-            ('scan_pose', 'dlio/odom_node/scan_pose'),
-            ('kf_pose_stamped', 'dlio/odom_node/keyframe_pose'),
-            ('path', 'dlio/odom_node/path'),
-            ('kf_pose', 'dlio/odom_node/keyframes'),
-            ('kf_cloud', 'dlio/odom_node/pointcloud/keyframe'),
-            ('deskewed', 'dlio/odom_node/pointcloud/deskewed'),
-        ],
-    )
-
-    # DLIO Mapping Node
-    dlio_map_node = Node(
-        package='direct_lidar_inertial_odometry',
-        executable='dlio_map_node',
-        output='screen',
-        parameters=parameters,
-        remappings=[
-            ('keyframes', 'dlio/odom_node/pointcloud/keyframe'),
-            ('map', 'dlio/map_node/map'),
-        ],
-    )
-
-    # RViz
-    rviz_config_path = PathJoinSubstitution([current_pkg, 'launch', 'dlio.rviz'])
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='dlio_rviz',
-        arguments=['-d', rviz_config_path],
-        parameters=[{'use_sim_time': use_sim_time}],
-        output='screen',
-        condition=IfCondition(LaunchConfiguration('rviz'))
-    )
-
     return LaunchDescription([
-        declare_rviz_arg,
-        declare_pointcloud_topic_arg,
-        declare_imu_topic_arg,
-        declare_camera_topic_arg,
-        declare_use_sim_time_arg,
-        declare_robot_config_arg,
-        declare_params_file_arg,
-        dlio_odom_node,
-        dlio_map_node,
-        rviz_node
+        *[DeclareLaunchArgument(name, default_value=value, description=DESCRIPTIONS.get(name, name))
+          for name, value in DEFAULTS.items()],
+        OpaqueFunction(function=setup),
     ])

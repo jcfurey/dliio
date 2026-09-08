@@ -1,34 +1,52 @@
 # dliio: standalone LiDAR–inertial odometry
 
-The Ouster workflow is contained in this repository: odometry, persistent
-mapping, calibrated 0705 profiles, packet replay, RViz configuration, and
-validation tools. It needs no other estimator, camera, fusion, or TF helper
-node. Ouster supplies the sensor driver; RViz and the bag player are optional.
+DLIO consumes synchronized ROS 2 point clouds and IMU measurements. Use it as
+an odometry source, load its C++ nodes into a component container, or add the
+persistent mapper and pose graph backend. Sensor drivers, bags, cameras and
+robot-specific preprocessing are supplied by your application.
 
-See **[the handoff guide](doc/HANDOFF.md)** for clean builds on **Humble, Jazzy,
-Kilted, and Lyrical**, the pinned Ouster dependency, live operation, and replay.
-`DLIIO_ENABLE_LIVOX` stays **ON by default**: installing `livox_ros_driver2`
-enables its raw `CustomMsg` adapter; PointCloud2 support is always available.
+Start with the **[integration guide](doc/INTEGRATION.md)** for a clean build,
+robot calibration, input conventions, namespaces, TF ownership and an example
+that includes DLIO in your own bringup package. No Exyn workspace or Ouster
+recording is required. The ROS package name is `direct_lidar_inertial_odometry`.
 
-After building dliio and the pinned Ouster driver, the complete 0705 command is:
+After building and sourcing the package, copy
+[`cfg/examples/robot_template.yaml`](cfg/examples/robot_template.yaml) into your
+robot package and fill in its measured transforms:
 
 ```bash
-ros2 launch direct_lidar_inertial_odometry dlio_mapping.launch.py \
-  mode:=packets profile:=0705 bag:=/absolute/path/07052026_4_an \
-  rviz:=true rate:=1.0
+ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
+  robot_config:=/path/to/my_robot.yaml \
+  pointcloud_topic:=/robot/lidar/points imu_topic:=/robot/imu/data \
+  mapper:=persistent archive_directory:=/path/to/run/maps
 ```
 
-The dataset is supplied separately. The 0705 calibration is specific to that
-recording. The [persistent mapper](doc/MAPPING_NODE.md) retains local keyframes
-and poses, limits the live submap window, and supports archive save/reload and
-full PCD export. It selects full-resolution deskewed mapping observations independently of
-odometry keyframes and fuses their overlap on a shared configurable grid (2 cm by default). Source retention,
-output fusion, and odometry downsampling are separate. The mapper supports
-[versioned pose corrections and reconstruction](doc/POSE_REVISIONS.md), including
-rollback, plus a [GTSAM pose graph with validated loop injection](doc/POSE_GRAPH.md)
-and reversible factor removal. Automatic place retrieval and registration are
-not yet connected. The original
-`dlio_ouster.launch.py` retains the legacy accumulated-map preview by default.
+Use `mapper:=none` for odometry alone, `mapper:=preview` for the original
+accumulated cloud, and `composed:=true` for C++ component loading. The generic
+launch accepts live topics or an external bag player with `use_sim_time:=true`.
+`namespace:=robot1` isolates node/topic/service names; configure distinct TF
+frame IDs in the robot YAML. `rviz:=true` opens the optional viewer.
+
+The [persistent mapper](doc/MAPPING_NODE.md) retains local observations and poses,
+reconstructs maps after [pose revisions](doc/POSE_REVISIONS.md), and supports
+[GTSAM loop injection and reversible factor removal](doc/POSE_GRAPH.md).
+Automatic place retrieval and loop registration remain external.
+
+The **[Ouster handoff](doc/HANDOFF.md)** covers the optional pinned packet driver,
+0705 recording profiles and integrated playback. `dlio_mapping.launch.py`
+remains its persistent-mapping shortcut. Those calibrations are recording-specific.
+The optional raw Livox `CustomMsg` adapter is compiled when its message package
+is available; PointCloud2 input works without either driver's source repository.
+
+Validate the installed generic integration without hardware or a bag:
+
+```bash
+ROS_DOMAIN_ID=147 ros2 run direct_lidar_inertial_odometry verify_integration.py
+```
+
+It exercises two independent robot namespaces, both C++ launch modes, custom
+frames, mapping archives and the installed Python/native interfaces. Detailed
+algorithm changes and the original authors' documentation follow below.
 
 # Modifications
 
@@ -92,7 +110,7 @@ the scan thread, so it is race-free. Example:
 
 | File | Contents |
 |---|---|
-| `cfg/dlio.yaml` | Per-robot: sensor extrinsics, IMU intrinsics, preprocessing switches. Copy per robot and pass via `robot_config:=`. |
+| `cfg/dlio.yaml` | Per-robot: sensor extrinsics, IMU intrinsics, preprocessing switches. Historical Ouster example; use the robot template for a new rig and pass via `robot_config:=`. |
 | `cfg/params.yaml` | Algorithm tuning: registration, keyframing, observer gains, photometric term, degeneracy gate, published covariance. Override via `params_file:=`. |
 | `cfg/examples/ouster_reflectivity.yaml` | Overlay: Ouster calibrated-reflectivity photometric channel + plane regularization for tunnel-like environments. |
 | `cfg/examples/ouster_tunnel.yaml` | Overlay: full tunnel mode — reflectivity + plane + degeneracy gate **with photometricWeight 0.3** (strong enough to re-constrain the tunnel axis; the gate alone diverges). Supersedes `ouster_reflectivity.yaml` for tunnels. |
@@ -100,9 +118,9 @@ the scan thread, so it is race-free. Example:
 | `cfg/examples/ouster_tunnel_visual.yaml` | Overlay **on top of** `ouster_tunnel.yaml`: adds the direct camera photometric term to constrain the LiDAR-unobservable along-axis translation (needs a camera topic + intrinsics + `cam2lidar`). |
 | `cfg/examples/simulation.yaml` | Overlay: sim time, no IMU calibration wait, ideal extrinsics. |
 
-**Launch arguments** (`dlio.launch.py`): `pointcloud_topic`, `imu_topic`, `rviz`, `use_sim_time` (default **false**; set true under Gazebo or `ros2 bag play --clock`), `robot_config`, `params_file`. Overlays can be appended at run time with `--ros-args --params-file <overlay.yaml>` (later files win).
+**Generic launch** (`dlio.launch.py`): configurable sensor topics, robot/algorithm YAML, namespace, mapping mode, composition and optional RViz. Use `--show-args` for the complete list. Set `use_sim_time:=true` with an external `ros2 bag play --clock`. Parameters are supplied through the launch configuration files; the [integration guide](doc/INTEGRATION.md#launch-against-your-existing-sensor-topics) documents their precedence.
 
-**Composed launch** (`dlio_composed.launch.py`): same arguments (minus `rviz`); runs both nodes as components in one multithreaded container with intra-process communication, so keyframe clouds pass between the odometry and map nodes without serialization. The terminal dashboard is disabled automatically in this mode. Both nodes are also loadable into your own container (`dlio::OdomNode`, `dlio::MapNode`).
+**Composed launch** (`dlio_composed.launch.py`) includes the generic launch with `composed:=true`. The C++ frontend and optional preview mapper share a multithreaded container with intra-process communication; the persistent Python mapper stays in a separate process. The terminal dashboard is disabled in composed mode. The C++ plugins remain `dlio::OdomNode` and `dlio::MapNode`.
 
 **Running from a `ros2 bag`.** DLIO consumes a `sensor_msgs/PointCloud2` topic directly — there is no sensor-packet/driver stage inside the node, so a bag of recorded clouds (e.g. `/ouster/points`) is the native, fully-supported input (this is what the DLIO datasets are). Two things are non-negotiable:
 
@@ -182,6 +200,7 @@ The following has been verified to be compatible, although other configurations 
 - OpenMP >= `4.5`
 - Point Cloud Library >= `1.10.0`
 - Eigen >= `3.3.7`
+- GTSAM >= `4.2`, pybind11, Python development headers, NumPy and SciPy (declared in `package.xml`)
 
 ```sh
 sudo apt install libomp-dev libpcl-dev libeigen3-dev
@@ -197,13 +216,14 @@ Compile with `colcon`:
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 ```
 ```sh
-git clone https://github.com/jcfurey/dliio direct_lidar_inertial_odometry
+git clone --branch cam-dev https://github.com/jcfurey/dliio direct_lidar_inertial_odometry
 ```
 ```sh
 cd ~/ros2_ws
 ```
 ```sh
-colcon build --symlink-install --packages-select direct_lidar_inertial_odometry
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --base-paths src --symlink-install --packages-select direct_lidar_inertial_odometry
 ```
 
 #### Docker
@@ -234,7 +254,8 @@ Execute via:
 
 ```sh
 ros2 launch direct_lidar_inertial_odometry dlio.launch.py \
-  rviz:={true, false} \
+  robot_config:=/path/to/my_robot.yaml \
+  rviz:=true \
   pointcloud_topic:=/robot/lidar \
   imu_topic:=/robot/imu
 ```

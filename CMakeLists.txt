@@ -40,6 +40,7 @@ set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 
 # ROS deps are pulled from package.xml; non-ROS deps found explicitly below.
 find_package(ament_cmake_auto REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 # VTK::jsoncpp (pulled transitively via PCL/pcl_ros) lists JsonCpp::JsonCpp in its
 # link interface but VTK doesn't find_package(jsoncpp) itself — define the imported
 # target first so VTK-targets.cmake resolves it.
@@ -189,13 +190,14 @@ install(DIRECTORY cfg launch doc
 )
 install(FILES README.md ouster.repos LICENSE THIRD_PARTY_LICENSES.md
   DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY test/installed_consumer DESTINATION share/${PROJECT_NAME}/test)
 install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
   scripts/dlio_mapping_node.py scripts/mapping_archive.py scripts/verify_mapping.py
   scripts/verify_mapping_replay.py scripts/verify_pose_revisions.py
   scripts/verify_pose_graph.py
+  scripts/verify_integration.py
   DESTINATION lib/${PROJECT_NAME})
-install(DIRECTORY scripts/dliio_mapping DESTINATION lib/${PROJECT_NAME}
-  PATTERN "__pycache__" EXCLUDE)
+ament_python_install_package(dliio_mapping PACKAGE_DIR scripts/dliio_mapping)
 install(DIRECTORY scripts DESTINATION share/${PROJECT_NAME})
 
 # Tests

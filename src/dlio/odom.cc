@@ -532,10 +532,10 @@ dlio::OdomNode::OdomNode(const rclcpp::NodeOptions& options)
       "Livox CustomMsg ingestion ENABLED: converting 'livox' -> 'livox2dlio' "
       "(remap pointcloud:=livox2dlio to use it).");
 #endif
-  // Absolute /diagnostics (unlike the relative pubs above, this is NOT remapped
-  // by the launch file) so the standard diagnostics topic always lands at /diagnostics.
+  // Relative so multiple robot instances can isolate their diagnostics;
+  // the root namespace retains the standard /diagnostics topic.
   this->diag_pub = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
-      "/diagnostics", rclcpp::QoS(10).best_effort());
+      "diagnostics", rclcpp::QoS(10).best_effort());
 
   // Live parameter tuning (ros2 param set during a run). Registered after all
   // params are declared so initialization doesn't trip it.

@@ -97,7 +97,10 @@ RUN source "/opt/ros/${ROS_DISTRO}/setup.bash" \
     && colcon test-result --verbose \
     && ros2 run direct_lidar_inertial_odometry verify_install.py \
     && ros2 run direct_lidar_inertial_odometry verify_mapping.py \
-    && cmake -S src/direct_lidar_inertial_odometry/test/installed_consumer -B consumer_build \
+    && (cd /tmp && ros2 run direct_lidar_inertial_odometry verify_integration.py) \
+    && ros2 run direct_lidar_inertial_odometry verify_install.py \
+         --launch dlio_composed.launch.py --output dliio_run/generic-components.json \
+    && cmake -S "$(ros2 pkg prefix --share direct_lidar_inertial_odometry)/test/installed_consumer" -B consumer_build \
     && cmake --build consumer_build --parallel 2 \
     && ./consumer_build/consumer
 

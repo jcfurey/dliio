@@ -21,10 +21,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, default=Path.cwd() / 'dliio_run/installed-smoke.json')
     parser.add_argument('--require-livox', action='store_true', help='Also exercise the compiled CustomMsg adapter')
+    parser.add_argument('--launch', default='dlio_ouster.launch.py',
+        choices=('dlio_ouster.launch.py', 'dlio_composed.launch.py', 'dlio.launch.py'),
+        help='Installed preview launch to verify')
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({'passed': False, 'status': 'starting'}) + '\n')
-    expected = {'dlio_ouster_container', 'dlio_odom_node', 'dlio_map_node'}
+    expected = {'dlio_odom_node', 'dlio_map_node'}
+    if args.launch != 'dlio.launch.py':
+        expected.add('dlio_ouster_container' if args.launch == 'dlio_ouster.launch.py' else 'dlio_container')
     rclpy.init()
     node = rclpy.create_node('dlio_handoff_check')
     discovery_deadline = time.monotonic() + 1.
@@ -46,8 +51,10 @@ def main():
     cloud_pub = node.create_publisher(PointCloud2, '/dlio/odom_node/pointcloud/keyframe', 10)
     service = node.create_client(SavePCD, '/save_pcd')
     with args.output.with_suffix('.log').open('w') as log:
-        process = subprocess.Popen(['ros2', 'launch', 'direct_lidar_inertial_odometry',
-            'dlio_ouster.launch.py', 'profile:=0705', 'mode:=points', 'rviz:=false'],
+        command = ['ros2', 'launch', 'direct_lidar_inertial_odometry', args.launch, 'rviz:=false']
+        if args.launch == 'dlio_ouster.launch.py':
+            command += ['profile:=0705', 'mode:=points']
+        process = subprocess.Popen(command,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             deadline = time.monotonic() + 30

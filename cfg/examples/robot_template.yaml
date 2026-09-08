@@ -1,0 +1,34 @@
+# Copy into your robot's bringup package and fill in measured calibration.
+# Identity transforms below are placeholders, not calibration for any sensor.
+/**:
+  ros__parameters:
+    frames/odom: odom
+    frames/baselink: base_link
+    frames/lidar: lidar
+    frames/imu: imu
+    frames/map: map
+
+    # Exactly one authority per TF edge. Disable the odometry edge if an EKF
+    # owns it; disable the map edge if another localization backend owns it.
+    odom/publishTf: true
+    mapping/publish_tf: true
+
+    # yaml: DLIO publishes base-to-sensor TF from the calibrated values below.
+    # tf: consume these transforms from your robot's existing TF tree instead.
+    # TF lookup currently falls back to YAML after about 10 s; fill these in
+    # even in TF mode. See doc/INTEGRATION.md for the precise convention.
+    extrinsics/source: yaml
+    extrinsics/baselink2lidar/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2lidar/R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    extrinsics/baselink2imu/t: [0.0, 0.0, 0.0]
+    extrinsics/baselink2imu/R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+
+    # Inputs must share an acquisition clock. Acceleration includes gravity,
+    # in m/s^2 (normalized:=true is only for IMUs reporting acceleration in g).
+    imu/normalized: false
+    imu/calibration: true
+    odom/imu/calibration/time: 3.0  # remain stationary during initialization
+    odom/computeTimeOffset: false  # already synchronized sensor timestamps
+    pointcloud/deskew: true
+    odom/visual/enabled: false
+    odom/debug/dashboard: false
