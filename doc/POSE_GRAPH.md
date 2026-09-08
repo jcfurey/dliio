@@ -6,9 +6,10 @@ individual observation poses. Loop insertion/removal, solution poses, audit
 records, map caches, and the map-to-odom correction commit in one SQLite
 transaction. The frontend's continuous local odometry is independent.
 
-This is the odometry-graph/loop-injection milestone. Automatic place retrieval
-and coarse/fine registration are not connected. A caller supplies `Z_ij` and
-its full covariance plus external verification provenance. The extra geometry
+An [optional automatic worker](AUTOMATIC_LOOPS.md) now supplies bounded
+feature/geometry proposals and validates separate held observations. Manual
+callers can still supply `Z_ij`, its full covariance and verification
+provenance. The extra geometry
 and consistency gates below do not establish place identity in repetitive
 scenes; a repeated tunnel bay can remain geometrically convincing. Real
 positive/negative revisit replay and covariance calibration remain necessary.
@@ -53,7 +54,9 @@ semidefinite. Off-diagonal terms are supported. A configured time-gap ceiling
 rejects unsupported missing-data intervals. This model assumes independent
 relative increments for graph weighting; it does not make actual LIO errors
 independent or calibrated, and does not infer degenerate directions from the
-frontend's mode counts. Explicitly unconverged observations reject a solve;
+frontend's mode counts. Explicitly unconverged observations reject a solve by
+default; the optional [bounded failure policy](AUTOMATIC_LOOPS.md) adds assumed
+motion-prior uncertainty while preserving failures and bounding their motion.
 unknown quality and degenerate-observation counts are reported. Loop covariance must be positive definite and carry
 `assumed`, `conditional`, or `calibrated` plus a model description. UNKNOWN,
 zero, asymmetric, indefinite, and nonfinite matrices are rejected.
@@ -71,6 +74,7 @@ revision, a unique request ID, and an action. Diagnostics expose `session_id`,
 |---|---|---|
 | `initialize` | `configuration` | Establish the odometry chain at pose revision zero; apply its first solution |
 | `add_loop` | `loop` | Validate a new pair, trial optimize all active factors, commit on success |
+| `add_loops` | `loops` (1–64 candidates) | Sequential validation/trial solves; one atomic final revision, no accepted prefix on rejection |
 | `remove_loop` | `loop_id`, `reason` | Retain removal history, solve remaining factors, rebuild map |
 | `optimize` | none | Include newly ingested observations or explicitly reattach after an external pose revision |
 
@@ -182,8 +186,9 @@ The validator has no held-out-data guarantee: an external registration may
 already have used all supplied points. It does not calibrate covariance or
 discover geometric aliases within the consistency envelope. External
 verification provenance is required but is not machine proof of place identity.
-Automatic retrieval should remain disconnected until labeled true revisits
-and repeated-scene negatives have been assessed independently.
+The automatic worker additionally enforces disjoint fitting/held observation
+IDs, competing-basin checks and held refit agreement. It is opt-in; assess
+labeled revisits and repeated-scene negatives for the deployment scene.
 
 ## Storage, resource bounds, and validation
 

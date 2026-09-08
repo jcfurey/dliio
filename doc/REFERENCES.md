@@ -229,3 +229,36 @@ The offline tool uses OpenCV FLANN with one KD tree and unlimited checks.
 The [authoritative implementation](https://github.com/opencv/opencv/blob/4.x/modules/flann/include/opencv2/flann/kdtree_index.h)
 selects exact search for `FLANN_CHECKS_UNLIMITED`; a synthetic test compares its
 neighbors against brute force. This is an implementation citation, not new SLAM theory.
+
+## September 8 loop correction: sources and limits
+
+The [automatic loop implementation](AUTOMATIC_LOOPS.md) uses the following
+primary documentation, inspected September 8, 2026. These sources support the
+mechanisms; they do not calibrate this repository's tunnel thresholds or noise.
+
+| Source | Application and limit |
+| --- | --- |
+| [GTSAM: frames, manifolds and uncertainty](https://gtsam.org/2021/02/23/uncertainties-part2.html) | Right/local pose errors and rotation-first native tangent ordering. The Python boundary explicitly permutes translation-first covariances. A conditional inverse Hessian does not make assumed edge noise calibrated. |
+| [PCL: FPFH descriptors](https://pointclouds.org/documentation/tutorials/fpfh_estimation.html) and [prerejective alignment](https://pointclouds.org/documentation/tutorials/alignment_prerejective.html) | Local features and geometric rejection motivate registration seeds. This worker implements its own bounded deterministic correspondence sampling and retains separate held geometry checks. |
+| [Zhang, Kaess and Singh (ICRA 2016)](https://www.cs.cmu.edu/~kaess/pub/Zhang16icra.html) | Degenerate optimization directions require explicit treatment. This loop backend still rejects geometry that cannot constrain a full pose; projected/subspace loop factors are future work. |
+| [SQLite: WAL and checkpointing](https://sqlite.org/wal.html) | Long read transactions can prevent checkpoint progress. Live loop metadata is copied in a short consistent transaction; immutable observation blobs are subsequently fetched without holding the disk read transaction. |
+
+The September run also demonstrates sensitivity to rotational versus
+translational graph weights. Tightening the assumed rotational increment noise
+reduces an artificial sideways bow in a sparse-loop trial. This is an empirical
+regularization study using the same capture, not independent uncertainty
+calibration or proof of surveyed accuracy. Check full trajectories and held
+geometry instead of accepting a small endpoint residual alone.
+
+### Native loop/mapping performance follow-up
+
+The [workspace proposal](../../../docs/dliio-native-loop-backend.md) records a
+read-only real-loop profile and a proposed C++/optional-CUDA migration. The
+following primary sources were inspected September 8, 2026; no new library or
+incremental graph backend was installed or adopted in this assessment.
+
+| Source | Application and limit |
+| --- | --- |
+| [GTSAM iSAM2](https://borglab.github.io/gtsam/isam2/) and [update API](https://gtsam.org/doxygen/a04947.html) | Incremental factor/variable updates, relinearization and factor removal. An eventual persistent graph must separately preserve atomic rejection, rollback and the archive ledger. The current solver remains batch C++/GTSAM. |
+| [small_gicp author repository](https://github.com/koide3/small_gicp) | Parallel native preprocessing and registration candidate. Published benchmarks use other inputs/hardware and are not a speedup measurement for this tunnel. |
+| [gtsam_points author repository](https://github.com/koide3/gtsam_points) | CPU/CUDA VGICP factors and optimizer extensions; the inspected README lists GTSAM 4.3a1 support. GPU kernels and differing matching objectives still require local build, memory and geometric validation. |

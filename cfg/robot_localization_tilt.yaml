@@ -1,0 +1,61 @@
+# Experimental downstream 3D filter. See doc/FUSION_ARCHITECTURE.md.
+# Inputs come from dlio_ekf_inputs.py, with an explicit covariance policy.
+# Does not supply map corrections or feed the DLIO observer/submap.
+/**:
+  ros__parameters:
+    use_sim_time: true
+    frequency: 30.0
+    sensor_timeout: 0.3
+    two_d_mode: false
+    publish_tf: false
+    print_diagnostics: true
+    predict_to_current_time: false
+    smooth_lagged_data: true
+    history_length: 2.0
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # Differential XYZ is expressed as body motion by robot_localization and
+    # integrated using the filter's attitude. Preserve measured vertical motion.
+    # Do not also fuse DLIO absolute XYZ, roll/pitch, twist or accelerations.
+    odom0: dlio/ekf_inputs/odom
+    odom0_config: [true, true, true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom0_differential: true
+    odom0_relative: false
+    odom0_queue_size: 30
+    odom0_pose_rejection_threshold: 5.0
+
+    # Heading is retained absolutely so it does not become an unbounded gyro
+    # integral. XYZ increments and yaw share a source; their cross-correlation
+    # is not modeled by separate RL updates. This is an experiment, not a
+    # calibrated independent-sensor posterior.
+    odom1: dlio/ekf_inputs/odom
+    odom1_config: [false, false, false,
+                   false, false, true,
+                   false, false, false,
+                   false, false, false,
+                   false, false, false]
+    odom1_differential: false
+    odom1_relative: false
+    odom1_queue_size: 30
+    odom1_pose_rejection_threshold: 5.0
+
+    # Body-frame world-up direction converted to roll/pitch only. Yaw is not
+    # observed by gravity. No second use of the BNO gyro or acceleration.
+    imu0: dlio/ekf_inputs/tilt
+    imu0_config: [false, false, false,
+                  true, true, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 100
+    imu0_pose_rejection_threshold: 5.0
+    imu0_remove_gravitational_acceleration: false

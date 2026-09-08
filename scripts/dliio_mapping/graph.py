@@ -32,7 +32,8 @@ def _text(value, maximum, name):
 
 
 def configuration(value):
-    if not isinstance(value, dict) or set(value) != {'odometry_noise', 'validation'}:
+    if (not isinstance(value, dict) or not {'odometry_noise', 'validation'} <= set(value) or
+            set(value) - {'odometry_noise', 'validation', 'failure_policy', 'loop_windows'}):
         raise ValueError('Graph configuration requires odometry_noise and validation')
     noise = value['odometry_noise']
     if not isinstance(noise, dict) or set(noise) != {'kind', 'model', 'covariance_floor',
@@ -50,13 +51,20 @@ def configuration(value):
         settings = Validation(**value['validation'])
     except TypeError as error:
         raise ValueError('Unknown or invalid loop validation settings') from error
-    return dict(odometry_noise=noise, validation=asdict(settings))
+    result = dict(odometry_noise=noise, validation=asdict(settings))
+    from .loop_inputs import failure_policy, window_configuration
+    if 'failure_policy' in value:
+        result['failure_policy'] = failure_policy(value['failure_policy'])
+    if 'loop_windows' in value:
+        result['loop_windows'] = window_configuration(value['loop_windows'])
+    return result
 
 
 def loop_measurement(value, count):
     from .core import rigid_pose
-    if not isinstance(value, dict) or set(value) != {'id', 'from_id', 'to_id', 'transform',
-            'covariance', 'covariance_kind', 'covariance_model', 'provenance'}:
+    required = {'id', 'from_id', 'to_id', 'transform', 'covariance', 'covariance_kind',
+                'covariance_model', 'provenance'}
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {'support'}:
         raise ValueError('Loop measurement fields are incomplete or unknown')
     value = dict(value)
     _text(value['id'], 128, 'Loop ID')
@@ -69,6 +77,9 @@ def loop_measurement(value, count):
         raise ValueError('Unknown covariance cannot become a loop factor')
     _text(value['covariance_model'], 256, 'Loop covariance model')
     _text(value['provenance'], 1024, 'External loop verification provenance')
+    if 'support' in value:
+        from .loop_inputs import support_indices
+        value['support'] = support_indices(value['support'], count, a, b)
     return value
 
 
@@ -76,7 +87,7 @@ def _request(value):
     if not isinstance(value, dict):
         raise ValueError('Graph request must be a JSON object')
     required = {'session_id', 'expected_revision', 'request_id', 'action'}
-    action_fields = dict(initialize={'configuration'}, add_loop={'loop'},
+    action_fields = dict(initialize={'configuration'}, add_loop={'loop'}, add_loops={'loops'},
                          remove_loop={'loop_id', 'reason'}, optimize=set())
     action = value.get('action')
     if not isinstance(action, str) or action not in action_fields or set(value) != required | action_fields[action]:
@@ -85,6 +96,8 @@ def _request(value):
     _text(value['session_id'], 36, 'Archive session ID')
     if type(value['expected_revision']) is not int or value['expected_revision'] < 0:
         raise ValueError('Invalid expected graph/map revision')
+    if action == 'add_loops' and (not isinstance(value['loops'], list) or not 1 <= len(value['loops']) <= 64):
+        raise ValueError('A loop batch must contain 1..64 candidates')
     serialized = encoded(value)
     if len(serialized.encode('utf8')) > MAX_REQUEST_BYTES:
         raise ValueError('Graph request exceeds 1 MiB')
@@ -168,11 +181,12 @@ class GraphStore:
                 expected_config = configuration(request['configuration'])
             elif expected_config is None:
                 raise ValueError('Graph action predates initialization')
-            if action == 'add_loop':
-                loop = loop_measurement(request['loop'], self.meta['keyframes'])
-                if loop['id'] in expected_loops:
-                    raise ValueError('Loop history reuses an ID')
-                expected_loops[loop['id']] = [loop, last_solution, None]
+            if action in ('add_loop', 'add_loops'):
+                for value in ([request['loop']] if action == 'add_loop' else request['loops']):
+                    loop = loop_measurement(value, self.meta['keyframes'])
+                    if loop['id'] in expected_loops:
+                        raise ValueError('Loop history reuses an ID')
+                    expected_loops[loop['id']] = [loop, last_solution, None]
             elif action == 'remove_loop':
                 entry = expected_loops.get(request['loop_id'])
                 if entry is None or entry[2] is not None:
@@ -209,14 +223,23 @@ class GraphStore:
             raise RuntimeError('Build dliio and run its installed mapping_archive.py/ROS node to load GTSAM') from error
         settings, noise = Validation(**config['validation']), config['odometry_noise']
         degenerate, unknown_quality = 0, 0
+        policy = config.get('failure_policy')
+        failed, consecutive = set(), 0
         for identifier, payload in self.db.execute('SELECT id,json FROM observations ORDER BY id'):
             quality = json.loads(payload)['quality']
             if quality.get('registration_converged') is False:
-                raise RejectedLoop('unconverged_odometry_observation', dict(observation_id=identifier))
+                if policy is None:
+                    raise RejectedLoop('unconverged_odometry_observation', dict(observation_id=identifier))
+                failed.add(identifier)
+                consecutive += 1
+                if consecutive > policy['max_consecutive']:
+                    raise RejectedLoop('unconverged_run_limit', dict(observation_id=identifier))
+            else:
+                consecutive = 0
             unknown_quality += quality.get('registration_converged') is None
             degenerate += any(quality.get(key, 0) for key in
                 ('degenerate_translation_modes', 'degenerate_rotation_modes'))
-        from_ids, to_ids, measurements, matrices, flags = [], [], [], [], []
+        from_ids, to_ids, measurements, matrices, flags, weakened = [], [], [], [], [], []
         for i in range(1, len(originals)):
             seconds = (stamps[i] - stamps[i-1]) * 1e-9
             if seconds > noise['max_gap_seconds']:
@@ -225,6 +248,13 @@ class GraphStore:
             distance = float(np.linalg.norm(relative[:3, 3]))
             matrix = (np.asarray(noise['covariance_floor']) + seconds * np.asarray(noise['covariance_per_second']) +
                       distance * np.asarray(noise['covariance_per_metre']))
+            if i in failed or i-1 in failed:
+                translation, rotation = displacement(relative)
+                if (translation/seconds > policy['max_translation_rate'] or
+                        rotation/seconds > policy['max_rotation_rate']):
+                    raise RejectedLoop('failed_registration_motion_bound', dict(from_id=i-1, to_id=i))
+                matrix += np.asarray(policy['covariance_floor'])
+                weakened.append(i)
             from_ids.append(i-1)
             to_ids.append(i)
             measurements.append(relative)
@@ -253,10 +283,24 @@ class GraphStore:
         loop_max = float(errors[len(originals)-1:].max()) if loops else 0.
         metrics.update(max_odometry_squared_error=odom_max, max_loop_squared_error=loop_max,
                        gtsam_version=native.gtsam_version, nodes=len(originals), active_loops=len(loops),
-                       odometry_degenerate_observations=degenerate, odometry_unknown_quality_observations=unknown_quality)
+                       odometry_degenerate_observations=degenerate, odometry_unknown_quality_observations=unknown_quality,
+                       unconverged_observations=sorted(failed), assumed_motion_prior_edges=weakened)
         if odom_max > settings.max_odometry_squared_error or loop_max > settings.max_loop_squared_error:
             raise RejectedLoop('graph_residual_limit', metrics)
         poses = result['poses']
+        if not loops:
+            # The original chain satisfies every original relative increment.
+            # Preserve its exact pose bytes instead of turning numerical chart
+            # roundoff into a dense-map rewrite during initialization/removal.
+            if not np.allclose(poses, originals, atol=1e-8, rtol=0):
+                raise RejectedLoop('unexpected_unconstrained_solution', metrics)
+            poses = originals
+        for i in weakened:
+            translation, rotation = displacement(np.linalg.inv(poses[i-1]) @ poses[i])
+            seconds = (stamps[i]-stamps[i-1])*1e-9
+            if (translation/seconds > policy['max_translation_rate'] or
+                    rotation/seconds > policy['max_rotation_rate']):
+                raise RejectedLoop('postfit_motion_prior_bound', dict(metrics, from_id=i-1, to_id=i))
         for loop in loops:
             error = np.linalg.inv(loop['transform']) @ np.linalg.inv(poses[loop['from_id']]) @ poses[loop['to_id']]
             translation, rotation = displacement(error)
@@ -271,6 +315,28 @@ class GraphStore:
         if maximum_translation > settings.max_solution_translation or maximum_rotation > settings.max_solution_rotation:
             raise RejectedLoop('solution_displacement_limit', metrics)
         return poses, metrics
+
+    def _validate_candidate(self, candidate, current, stamps, config):
+        settings = Validation(**config['validation'])
+        a, b = candidate['from_id'], candidate['to_id']
+        if b-a < settings.min_separation_observations or (stamps[b]-stamps[a])*1e-9 < settings.min_separation_seconds:
+            raise RejectedLoop('temporal_exclusion')
+        for identifier in (a, b):
+            quality = json.loads(self.db.execute('SELECT json FROM observations WHERE id=?',
+                                                 (identifier,)).fetchone()[0])['quality']
+            if quality.get('registration_converged') is False:
+                raise RejectedLoop('unconverged_loop_anchor', dict(observation_id=identifier))
+        if 'support' in candidate:
+            from .loop_inputs import validate_support
+            if 'loop_windows' not in config:
+                raise ValueError('Window loops require an explicit loop_windows validation configuration')
+            window_settings = Validation(**config['loop_windows']['validation'])
+            metrics = check_cycle(candidate['transform'], np.linalg.inv(current[a]) @ current[b], window_settings)
+            metrics.update(validate_support(self, candidate, config['loop_windows']))
+        else:
+            metrics = check_cycle(candidate['transform'], np.linalg.inv(current[a]) @ current[b], settings)
+            metrics.update(validate_geometry(self._graph_cloud(a), self._graph_cloud(b), candidate['transform'], settings))
+        return metrics
 
     def update_graph(self, request):
         from .core import decode_pose
@@ -306,14 +372,20 @@ class GraphStore:
         stamps, originals = self._graph_originals()
         loops = [json.loads(row[0]) for row in self.db.execute(
             'SELECT json FROM graph_loops WHERE removed_revision IS NULL ORDER BY id')]
-        candidate, metrics = None, {}
-        if action == 'add_loop':
-            candidate = loop_measurement(request['loop'], len(originals))
-            if self.db.execute('SELECT 1 FROM graph_loops WHERE id=?', (candidate['id'],)).fetchone():
-                raise ValueError('Loop ID already exists, including removed loop history')
-            if any((value['from_id'], value['to_id']) == (candidate['from_id'], candidate['to_id']) for value in loops):
-                raise ValueError('An active loop already connects these observations')
-            if self.db.execute('SELECT count(*) FROM graph_loops').fetchone()[0] >= MAX_LOOPS:
+        candidates, metrics = [], {}
+        if action in ('add_loop', 'add_loops'):
+            candidates = [loop_measurement(value, len(originals)) for value in
+                          ([request['loop']] if action == 'add_loop' else request['loops'])]
+            identifiers, pairs = set(), {(value['from_id'], value['to_id']) for value in loops}
+            for candidate in candidates:
+                if (candidate['id'] in identifiers or
+                        self.db.execute('SELECT 1 FROM graph_loops WHERE id=?', (candidate['id'],)).fetchone()):
+                    raise ValueError('Loop ID already exists, including removed loop history')
+                pair = candidate['from_id'], candidate['to_id']
+                if pair in pairs:
+                    raise ValueError('An active loop already connects these observations')
+                identifiers.add(candidate['id']); pairs.add(pair)
+            if self.db.execute('SELECT count(*) FROM graph_loops').fetchone()[0] + len(candidates) > MAX_LOOPS:
                 raise ValueError('Graph loop ledger is full')
         if action == 'remove_loop':
             _text(request['loop_id'], 128, 'Loop ID')
@@ -323,16 +395,18 @@ class GraphStore:
             loops = [value for value in loops if value['id'] != request['loop_id']]
         report = dict(action=action, request_id=request['request_id'], pose_revision=self.meta['pose_revision'])
         try:
-            if candidate:
-                a, b = candidate['from_id'], candidate['to_id']
-                if b - a < settings.min_separation_observations or (stamps[b] - stamps[a]) * 1e-9 < settings.min_separation_seconds:
-                    raise RejectedLoop('temporal_exclusion')
-                current = [decode_pose(self.db.execute('SELECT pose FROM optimized_poses WHERE id=?', (i,)).fetchone()[0])
-                           for i in (a, b)]
-                metrics.update(check_cycle(candidate['transform'], np.linalg.inv(current[0]) @ current[1], settings))
-                metrics.update(validate_geometry(self._graph_cloud(a), self._graph_cloud(b), candidate['transform'], settings))
-                loops.append(candidate)
-            poses, solved = self._solve_graph(stamps, originals, loops, config)
+            if candidates:
+                current = [decode_pose(row[0]) for row in self.db.execute('SELECT pose FROM optimized_poses ORDER BY id')]
+                trials = []
+                for candidate in candidates:
+                    checked = self._validate_candidate(candidate, current, stamps, config)
+                    loops.append(candidate)
+                    current, solved = self._solve_graph(stamps, originals, loops, config)
+                    trials.append(dict(id=candidate['id'], **checked))
+                poses = current
+                metrics.update(trials[0] if action == 'add_loop' else dict(candidates=trials))
+            else:
+                poses, solved = self._solve_graph(stamps, originals, loops, config)
             metrics['optimization'] = solved
         except RejectedLoop as error:
             metrics.update(error.metrics)
@@ -353,8 +427,9 @@ class GraphStore:
             if action == 'initialize':
                 self.db.execute('INSERT INTO graph_state VALUES(1,?,?,?)', (encoded(config), revision, len(poses)))
             else:
-                self.db.execute('UPDATE graph_state SET pose_revision=?,covered_observations=? WHERE id=1', (revision, len(poses)))
-            if candidate:
+                self.db.execute('UPDATE graph_state SET pose_revision=?,covered_observations=? WHERE id=1',
+                                (revision, len(poses)))
+            for candidate in candidates:
                 self.db.execute('INSERT INTO graph_loops VALUES(?,?,?,?,?,NULL)',
                     (candidate['id'], candidate['from_id'], candidate['to_id'], encoded(candidate), revision))
             if action == 'remove_loop':

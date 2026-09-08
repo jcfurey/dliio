@@ -1,0 +1,308 @@
+{
+  "graph": {
+    "odometry_noise": {
+      "kind": "assumed",
+      "model": "Assumed independent relative increments with stronger rotational weighting (sigma floors 0.02 m / 0.0005 rad); engineering regularization, not calibrated LIO covariance",
+      "covariance_floor": [
+        [
+          0.0004,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0.0004,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0.0004,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          2.5000000000000004e-07,
+          0.0,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          2.5000000000000004e-07,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          0.0,
+          2.5000000000000004e-07
+        ]
+      ],
+      "covariance_per_second": [
+        [
+          0.01,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0.01,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0.01,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          4.000000000000001e-06,
+          0.0,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          4.000000000000001e-06,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          0.0,
+          4.000000000000001e-06
+        ]
+      ],
+      "covariance_per_metre": [
+        [
+          0.0009,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0.0009,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0.0009,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          2.5000000000000004e-07,
+          0.0,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          2.5000000000000004e-07,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0,
+          0.0,
+          2.5000000000000004e-07
+        ]
+      ],
+      "max_gap_seconds": 15.0
+    },
+    "failure_policy": {
+      "kind": "bounded_motion_prior",
+      "model": "Assumed additional uncertainty on edges incident to failed registrations; original quality is retained",
+      "covariance_floor": [
+        [
+          0.0625,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0.0625,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0.0625,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0.0064,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0.0064,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0.0064
+        ]
+      ],
+      "max_consecutive": 20,
+      "max_translation_rate": 3.0,
+      "max_rotation_rate": 2.0
+    },
+    "validation": {},
+    "loop_windows": {
+      "max_span_seconds": 6.0,
+      "validation": {
+        "min_range": 1.5,
+        "max_range": 20.0,
+        "max_points": 12000,
+        "max_cycle_translation": 18.0,
+        "max_inlier_p95": 0.35,
+        "min_overlap": 0.6,
+        "surface_validation": true,
+        "normal_neighbors": 20,
+        "max_normal_variance": 0.04,
+        "min_normal_alignment": 0.95,
+        "min_surface_fraction": 0.15,
+        "max_surface_p95": 0.1,
+        "max_surface_rms": 0.05,
+        "max_surface_translation_step": 0.1,
+        "max_surface_rotation_step": 0.02
+      }
+    }
+  },
+  "retrieval": {
+    "anchor_seconds": 5.0,
+    "anchor_distance": 2.0,
+    "exclusion_seconds": 60.0,
+    "min_path_separation": 30.0,
+    "search_radius": 18.0,
+    "candidate_separation_seconds": 10.0,
+    "candidates": 3,
+    "candidate_pool": 12,
+    "registration_workers": 2,
+    "registration_backend": "native",
+    "window_half_seconds": 3.0,
+    "max_loops": 32,
+    "ambiguity_margin": 0.02,
+    "held_translation": 0.2,
+    "held_rotation": 0.035
+  },
+  "loop_noise": {
+    "kind": "assumed",
+    "model": "Engineering floor of 0.10 m translation and 0.03 rad rotation; not inverse-ICP or calibrated covariance",
+    "covariance": [
+      [
+        0.01,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0.01,
+        0,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0.01,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0.0009,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0.0009,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0.0009
+      ]
+    ]
+  }
+}

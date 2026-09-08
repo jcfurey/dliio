@@ -94,7 +94,8 @@ rosidl_generate_interfaces(
         srv/RestorePoseRevision.srv
         srv/UpdatePoseGraph.srv
         msg/MappingObservation.msg
-    DEPENDENCIES std_msgs geometry_msgs sensor_msgs
+        msg/MappingSnapshot.msg
+    DEPENDENCIES std_msgs geometry_msgs sensor_msgs nav_msgs
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target
@@ -169,8 +170,10 @@ endif()
 rclcpp_components_register_nodes(dlio_components "dlio::OdomNode" "dlio::MapNode")
 
 # Standalone executables
-pybind11_add_module(_dliio_pose_graph MODULE src/dlio/pose_graph.cc)
-target_link_libraries(_dliio_pose_graph PRIVATE gtsam Eigen3::Eigen)
+pybind11_add_module(_dliio_pose_graph MODULE src/dlio/pose_graph.cc src/dlio/loop_features.cc
+  src/dlio/loop_registration.cc)
+target_include_directories(_dliio_pose_graph PRIVATE include)
+target_link_libraries(_dliio_pose_graph PRIVATE gtsam Eigen3::Eigen ${PCL_LIBRARIES})
 # ROSIDL already registers this Python directory in the package environment.
 # Installing next to script symlinks would not be importable: Python resolves
 # their source directory when constructing sys.path.
@@ -194,10 +197,13 @@ install(DIRECTORY test/installed_consumer DESTINATION share/${PROJECT_NAME}/test
 install(PROGRAMS scripts/inspect_replay.py scripts/verify_install.py scripts/verify_packet_replay.py
   scripts/dlio_mapping_node.py scripts/mapping_archive.py scripts/verify_mapping.py
   scripts/verify_mapping_replay.py scripts/verify_pose_revisions.py
-  scripts/verify_pose_graph.py
+  scripts/verify_pose_graph.py scripts/mapping_loop_closure.py scripts/dlio_loop_closure_node.py
+  scripts/wait_for_mapping.py
+  scripts/dlio_ekf_inputs.py
   scripts/verify_integration.py
   DESTINATION lib/${PROJECT_NAME})
 ament_python_install_package(dliio_mapping PACKAGE_DIR scripts/dliio_mapping)
+ament_python_install_package(dliio_fusion PACKAGE_DIR scripts/dliio_fusion)
 install(DIRECTORY scripts DESTINATION share/${PROJECT_NAME})
 
 # Tests
@@ -205,6 +211,10 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_handoff_launch test/test_handoff_launch.py TIMEOUT 60)
+  ament_add_pytest_test(test_fusion_inputs test/test_fusion_inputs.py TIMEOUT 60)
+  ament_add_pytest_test(test_fusion_ros test/test_fusion_ros.py TIMEOUT 90)
+  # This integration test owns /clock and checks /tf silence in its test domain.
+  set_tests_properties(test_fusion_ros PROPERTIES RUN_SERIAL TRUE)
   ament_add_pytest_test(test_mapping_core test/test_mapping_core.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_input test/test_mapping_input.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_revisions test/test_mapping_revisions.py TIMEOUT 120)
@@ -212,6 +222,14 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_mapping_graph test/test_mapping_graph.py TIMEOUT 120
     APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
   ament_add_pytest_test(test_loop_validation test/test_loop_validation.py TIMEOUT 60)
+  ament_add_pytest_test(test_loop_inputs test/test_loop_inputs.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_loop_retrieval test/test_loop_retrieval.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_loop_registration test/test_loop_registration.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_live_loop_pipeline test/test_live_loop_pipeline.py TIMEOUT 180
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
   ament_add_gtest(test_imu_delivery test/test_imu_delivery.cpp)
   target_include_directories(test_imu_delivery PRIVATE include)
   find_package(Eigen3 REQUIRED)

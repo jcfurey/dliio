@@ -22,10 +22,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import Path as PosePath
 from rcl_interfaces.msg import SetParametersResult
 from sensor_msgs.msg import PointCloud2, PointField
 from tf2_ros import TransformBroadcaster
-from direct_lidar_inertial_odometry.msg import MappingObservation
+from direct_lidar_inertial_odometry.msg import MappingObservation, MappingSnapshot
 from direct_lidar_inertial_odometry.srv import MapArchive, ApplyPoseRevision, RestorePoseRevision, UpdatePoseGraph
 
 from .core import FIELDS, Limits, Store, validate_leaf
@@ -85,8 +86,8 @@ class MappingNode(Node):
         if type(self.max_bytes) is not int or not 1024 <= self.max_bytes <= 67108864:
             raise ValueError('mapping/max_cloud_bytes must be in [1024, 67108864]')
         capacity = parameter('mapping/worker_queue', 4)
-        if type(capacity) is not int or not 1 <= capacity <= 64:
-            raise ValueError('mapping/worker_queue must be in [1, 64]')
+        if type(capacity) is not int or not 1 <= capacity <= 128:
+            raise ValueError('mapping/worker_queue must be in [1, 128]')
         rate = parameter('mapping/publish_rate', 1.)
         if not math.isfinite(rate) or not .01 <= rate <= 20:
             raise ValueError('mapping/publish_rate must be in [.01, 20] Hz')
@@ -99,9 +100,13 @@ class MappingNode(Node):
         self.last_error = ''
         self.storage_failed = False
         self.cached_map = None
+        self.cached_path = None
+        self.cached_snapshot = None
         self.cached_correction = np.eye(4)
         self.revision = 0
         self.published_revision = -1
+        self.published_path_revision = -1
+        self.published_snapshot_revision = -1
         self.refresh_interval = 1. / rate
         self.input_group = MutuallyExclusiveCallbackGroup()
         self.publish_group = MutuallyExclusiveCallbackGroup()
@@ -110,6 +115,10 @@ class MappingNode(Node):
         # executor thread and starve input or diagnostics.
         self.service_group = MutuallyExclusiveCallbackGroup()
         self.map_pub = self.create_publisher(PointCloud2, 'map',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.path_pub = self.create_publisher(PosePath, 'dlio/mapping/path',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.snapshot_pub = self.create_publisher(MappingSnapshot, 'dlio/mapping/snapshot',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.diagnostics = self.create_publisher(DiagnosticArray, 'dlio/mapping/diagnostics', 10)
         # One dynamic authority owns map -> odom. Corrections and cloud caches
@@ -215,11 +224,34 @@ class MappingNode(Node):
         return store
 
     def _refresh(self, store):
+        from .core import decode_pose as archived_pose
         start = time.monotonic()
         points = store.snapshot(self.fusion_size or None)
         message = cloud_message(points, store.meta['last_stamp_ns'], self.map_frame)
+        path = PosePath()
+        path.header = message.header
+        original_path = PosePath()
+        original_path.header.frame_id = self.odom_frame
+        original_path.header.stamp = message.header.stamp
+        for stamp, original_blob, blob in store.db.execute('SELECT k.stamp_ns,k.pose,o.pose FROM keyframes k '
+                                            'JOIN optimized_poses o ON o.id=k.id ORDER BY k.id'):
+            entry = PoseStamped()
+            entry.header.frame_id = self.map_frame
+            entry.header.stamp.sec, entry.header.stamp.nanosec = divmod(stamp, 1000000000)
+            entry.pose = pose_message(archived_pose(blob))
+            path.poses.append(entry)
+            original = PoseStamped()
+            original.header.frame_id = self.odom_frame
+            original.header.stamp = entry.header.stamp
+            original.pose = pose_message(archived_pose(original_blob))
+            original_path.poses.append(original)
+        snapshot = MappingSnapshot(header=message.header, session_id=store.meta['session_id'],
+            pose_revision=store.meta['pose_revision'], cloud=message,
+            original_trajectory=original_path, optimized_trajectory=path)
         with self.lock:
             self.cached_map = message
+            self.cached_path = path
+            self.cached_snapshot = snapshot
             self.cached_correction = np.asarray(store.meta['map_to_odom']).copy()
             self.state = store.stats()
             self.state['cached_pose_revision'] = store.meta['pose_revision']
@@ -242,7 +274,10 @@ class MappingNode(Node):
             dirty = False
             next_refresh = time.monotonic() + self.refresh_interval
             while not self.stopping.is_set() or not self.jobs.empty():
-                if dirty and (time.monotonic() >= next_refresh or self.stopping.is_set()):
+                # Shutdown drains original observations. Rebuilding a display
+                # after every queued frame made shutdown exceed launch's grace
+                # period and kill the recorder with committed WAL still open.
+                if dirty and not self.stopping.is_set() and time.monotonic() >= next_refresh:
                     self._refresh(store)
                     dirty = False
                     next_refresh = time.monotonic() + self.refresh_interval
@@ -348,10 +383,17 @@ class MappingNode(Node):
 
     def _publish(self):
         with self.lock:
-            message, revision = self.cached_map, self.revision
+            message, path, revision = self.cached_map, self.cached_path, self.revision
+            snapshot = self.cached_snapshot
         if message is not None and revision != self.published_revision and self.map_pub.get_subscription_count():
             self.map_pub.publish(message)
             self.published_revision = revision
+        if path is not None and revision != self.published_path_revision and self.path_pub.get_subscription_count():
+            self.path_pub.publish(path)
+            self.published_path_revision = revision
+        if snapshot is not None and revision != self.published_snapshot_revision and self.snapshot_pub.get_subscription_count():
+            self.snapshot_pub.publish(snapshot)
+            self.published_snapshot_revision = revision
 
     def _revision_service(self, operation, request, response):
         future = Future()

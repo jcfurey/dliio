@@ -195,28 +195,37 @@ class RevisionStore:
         revision = expected_revision + 1
         updated = dict(self.meta, pose_revision=revision, map_to_odom=correction.tolist())
         validate_metadata(updated)
-        resident, active = OrderedDict(), None
+        resident, active = self.resident.copy(), self.active
+        changed_submaps = set()
+        def update_pose(identifier, blob):
+            previous, submap = self.db.execute('SELECT p.pose,k.submap_id FROM optimized_poses p '
+                'JOIN keyframes k ON k.id=p.id WHERE p.id=?', (identifier,)).fetchone()
+            if blob != previous:
+                changed_submaps.add(submap)
+                self.db.execute('UPDATE optimized_poses SET pose=? WHERE id=?', (blob, identifier))
         self.db.execute('BEGIN IMMEDIATE')
         try:
             self.db.execute('INSERT INTO pose_revisions VALUES(?,?,?,?,?,?)',
                             (revision, request_id, digest, last, correction.astype('<f8').tobytes(), reason))
             for identifier, blob in enumerate(checked):
                 self.db.execute('INSERT INTO revision_poses VALUES(?,?,?)', (revision, identifier, blob))
-                self.db.execute('UPDATE optimized_poses SET pose=? WHERE id=?', (blob, identifier))
+                update_pose(identifier, blob)
             for identifier, blob in self.db.execute('SELECT id,pose FROM keyframes WHERE id>? ORDER BY id', (last,)):
                 pose = rigid_pose(correction @ decode_pose(blob))
-                self.db.execute('UPDATE optimized_poses SET pose=? WHERE id=?', (pose.astype('<f8').tobytes(), identifier))
-            # Rebuild every chronological submap initially. This bounded path
-            # is also the reference for a future affected-region optimization.
-            for identifier in range(self.meta['submaps']):
-                anchor, active = self._reconstruct_submap(identifier)
-                points = active.points()
+                update_pose(identifier, pose.astype('<f8').tobytes())
+            # Exact unchanged pose bytes need no cloud reads/writes. In
+            # particular, graph initialization only records its noise model
+            # and history instead of rebuilding gigabytes of identical points.
+            for identifier in sorted(changed_submaps):
+                anchor, rebuilt = self._reconstruct_submap(identifier)
+                points = rebuilt.points()
                 blob, crc = encode_points(points)
                 self.db.execute('UPDATE submaps SET pose=?,count=?,points=?,crc=? WHERE id=?',
                                 (anchor.astype('<f8').tobytes(), len(points), blob, crc, identifier))
-                resident[identifier] = (anchor, points)
-                while len(resident) > self.limits.resident_submaps:
-                    resident.popitem(last=False)
+                if identifier in resident:
+                    resident[identifier] = (anchor, points)
+                if identifier == self.active_id:
+                    active = rebuilt
             self.db.execute('UPDATE metadata SET json=? WHERE id=1', (json.dumps(updated, allow_nan=False),))
             if _graph_commit is not None:
                 _graph_commit(revision)
@@ -229,7 +238,8 @@ class RevisionStore:
             self.db.rollback()
             raise
         self.meta, self.resident, self.active = updated, resident, active
-        self.fusion = None
+        if changed_submaps.intersection(resident):
+            self.fusion = None
         self.active_id = self.meta['submaps'] - 1
         self.active_count = self.db.execute('SELECT count(*) FROM keyframes WHERE submap_id=?',
                                            (self.active_id,)).fetchone()[0]

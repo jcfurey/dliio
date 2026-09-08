@@ -199,6 +199,37 @@ def test_time_gap_rejected_and_initialization_noise_must_be_explicit(store):
     with pytest.raises(ValueError, match='assumed'): checked_configuration(config)
 
 
+def test_loop_batch_has_one_revision_and_preserves_removal_history(store, tmp_path):
+    initialize(store)
+    before_revisions = store.db.execute('SELECT count(*) FROM pose_revisions').fetchone()[0]
+    second = dict(loop(pose(-1.)), id='second-return', from_id=1, to_id=3)
+    result = store.update_graph(request(store, 'add_loops', loops=[loop(), second]))
+    assert result['status'] == 'accepted', result
+    assert store.meta['pose_revision'] == 2
+    assert store.stats()['active_loops'] == 2
+    assert store.db.execute('SELECT count(*) FROM pose_revisions').fetchone()[0] == before_revisions + 1
+    snapshot = tmp_path/'batch.dliomap'
+    store.save(snapshot)
+    loaded = Store(snapshot, store.limits)
+    assert loaded.stats()['active_loops'] == 2
+    loaded.close()
+    for identifier in (loop()['id'], second['id']):
+        assert store.update_graph(request(store, 'remove_loop', loop_id=identifier, reason='test removal'))['status'] == 'accepted'
+    for original, optimized in store.db.execute('SELECT k.pose,o.pose FROM keyframes k JOIN optimized_poses o USING(id)'):
+        np.testing.assert_allclose(decode_pose(original), decode_pose(optimized), atol=1e-7)
+
+
+def test_rejected_batch_never_commits_its_successful_prefix(store):
+    initialize(store)
+    second = dict(loop(pose(20.)), id='false-return', from_id=1, to_id=3)
+    before = database(store)
+    result = store.update_graph(request(store, 'add_loops', loops=[loop(), second]))
+    assert result['status'] == 'rejected'
+    after = database(store)
+    after.pop('graph_requests'); before.pop('graph_requests')
+    assert before == after
+
+
 def test_v2_upgrade_preserves_original_archive(store, tmp_path):
     source = tmp_path / 'version2.dliomap'
     store.save(source)

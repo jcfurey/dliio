@@ -5,7 +5,7 @@
 #   dliio            -> 6-DOF pose, DIFFERENTIAL (pose deltas), with the
 #                       degeneracy governor's per-axis covariance inflation ON
 #                       (cfg/examples/ouster_tunnel_rl.yaml) so the held/sloshing
-#                       tunnel axis arrives honestly de-weighted;
+#                       tunnel axis is de-weighted heuristically (not calibrated);
 #   rig kinematic    -> body-frame forward velocity (wheel/track odometry) — the
 #                       along-tunnel information LiDAR cannot observe;
 #   IMU              -> angular velocity.

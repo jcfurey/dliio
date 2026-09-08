@@ -17,6 +17,8 @@
 namespace py = pybind11;
 using Matrix6 = Eigen::Matrix<double, 6, 6>;
 using Vector6 = Eigen::Matrix<double, 6, 1>;
+void bindLoopFeatures(py::module_& module);
+void bindLoopRegistration(py::module_& module);
 
 namespace {
 constexpr std::size_t kMaxNodes = 5000;
@@ -161,6 +163,8 @@ py::dict optimize(const std::vector<Eigen::Matrix4d>& poses,
 }  // namespace
 
 PYBIND11_MODULE(_dliio_pose_graph, module) {
+  bindLoopFeatures(module);
+  bindLoopRegistration(module);
   module.doc() = "Bounded GTSAM batch optimizer; all inputs use right/local translation-first covariance";
   module.def("optimize", &optimize, py::arg("poses"), py::arg("from_ids"), py::arg("to_ids"),
       py::arg("measurements"), py::arg("covariances"), py::arg("loops"), py::arg("max_iterations") = 100);

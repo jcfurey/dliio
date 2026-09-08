@@ -24,7 +24,7 @@ DEFAULTS = {
     'namespace': '', 'pointcloud_topic': 'points_raw', 'imu_topic': 'imu_raw',
     'camera_topic': 'image_raw', 'robot_config': '', 'params_file': '',
     'use_sim_time': 'false', 'composed': 'false', 'mapper': 'preview',
-    'mapping_config': '', 'archive_directory': '',
+    'mapping_config': '', 'archive_directory': '', 'loop_closure_config': '',
     'rviz': 'false', 'rviz_config': '', 'rviz_frame': '',
 }
 DESCRIPTIONS = {
@@ -34,6 +34,7 @@ DESCRIPTIONS = {
     'mapper': 'none: odometry only; preview: accumulated map; persistent: archive and pose graph services.',
     'archive_directory': 'Required with mapper:=persistent. Directory for a new recording database.',
     'mapping_config': 'Persistent mapper limits and publication settings; empty uses cfg/mapping.yaml.',
+    'loop_closure_config': 'Optional automatic loop JSON with explicit assumed noise and geometry limits; requires persistent mapping.',
     'composed': 'Load the C++ nodes in one container. The persistent Python mapper stays in its own process.',
     'use_sim_time': 'Use /clock from simulation or an external ros2 bag play --clock.',
     'rviz_frame': 'RViz fixed frame; empty uses map for persistent mapping, otherwise odom.',
@@ -64,6 +65,8 @@ def build_actions(args, package):
     persistent = mapper == 'persistent'
     if persistent and not args['archive_directory'].strip():
         raise ValueError('mapper:=persistent requires archive_directory:=/path/to/a/recording')
+    if args['loop_closure_config'] and not persistent:
+        raise ValueError('loop_closure_config requires mapper:=persistent')
 
     def configuration(argument, default):
         path = Path(args[argument]).expanduser() if args[argument] else package / default
@@ -104,16 +107,25 @@ def build_actions(args, package):
                                 parameters=parameters, remappings=map_remaps, output='screen'))
     if persistent:
         mapping_config = configuration('mapping_config', 'cfg/mapping.yaml')
+        loop_config = configuration('loop_closure_config', '') if args['loop_closure_config'] else ''
         actions.append(Node(package=PACKAGE, executable='dlio_mapping_node.py', namespace=namespace,
+            sigterm_timeout='60.0', sigkill_timeout='30.0',
             parameters=[mapping_config, *parameters, {
                 'mapping/storage_directory': str(Path(args['archive_directory']).expanduser().resolve()),
                 'mapping/load_path': '', 'mapping/input_source': 'observations',
-                'mapping/transport': 'observation'}],
+                'mapping/transport': 'observation'},
+                *([{'mapping/worker_queue': 64}] if loop_config else [])],
             remappings=[('observation', OUTPUTS['mapping_observation']), ('map', 'dlio/map_node/map')],
             output='screen'))
+        if loop_config:
+            actions.append(Node(package=PACKAGE, executable='dlio_loop_closure_node.py', namespace=namespace,
+                sigterm_timeout='60.0',
+                parameters=[{'use_sim_time': sim, 'loop_closure/configuration_file': loop_config,
+                    'loop_closure/output_directory': str(Path(args['archive_directory']).expanduser().resolve()/'loops')}],
+                output='screen'))
     if rviz:
         config = configuration('rviz_config', 'launch/dlio_mapping.rviz' if persistent else 'launch/dlio.rviz')
-        topics = set(OUTPUTS.values()) | {'dlio/map_node/map'}
+        topics = set(OUTPUTS.values()) | {'dlio/map_node/map', 'dlio/mapping/path'}
         actions.append(Node(package='rviz2', executable='rviz2', name='dlio_rviz', namespace=namespace,
             arguments=['-d', config, '-f', args['rviz_frame'] or ('map' if persistent else 'odom')],
             parameters=[{'use_sim_time': sim}], remappings=[('/'+topic, topic) for topic in sorted(topics)],

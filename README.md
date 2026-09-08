@@ -30,7 +30,10 @@ frame IDs in the robot YAML. `rviz:=true` opens the optional viewer.
 The [persistent mapper](doc/MAPPING_NODE.md) retains local observations and poses,
 reconstructs maps after [pose revisions](doc/POSE_REVISIONS.md), and supports
 [GTSAM loop injection and reversible factor removal](doc/POSE_GRAPH.md).
-Automatic place retrieval and loop registration remain external.
+[Optional automatic geometric loop closure](doc/AUTOMATIC_LOOPS.md) adds
+bounded feature/geometry proposals, held-observation checks and transactional
+map corrections. Enable it with explicit assumed-noise settings; repetitive
+or unobservable geometry can still prevent closure.
 
 The **[Ouster handoff](doc/HANDOFF.md)** covers the optional pinned packet driver,
 0705 recording profiles and integrated playback. `dlio_mapping.launch.py`
@@ -142,7 +145,7 @@ A *stripped* cloud (xyz-only, unorganized, no time field) reduces DLIO to plain 
 
 | Interface | Name | Notes |
 |---|---|---|
-| Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; constant diagonal covariance from `odom/covariance/*` (tune for your EKF) |
+| Odometry | `dlio/odom_node/odom` (`nav_msgs/Odometry`) | `odom` → `base_link`, stamped with IMU time at ~IMU rate; legacy configured covariance or timed-observer conditional covariance, neither a calibrated global error estimate |
 | Pose | `dlio/odom_node/pose` (`PoseStamped`) | same state, no twist |
 | TF | `odom` → `base_link` dynamic; `base_link` → `lidar`/`imu` latched on `/tf_static` (only in `extrinsics/source: yaml`; in `tf` mode the node *consumes* those static transforms instead) | Frontend TF; the [persistent mapper](doc/POSE_GRAPH.md) additionally owns dynamic `map` → `odom` |
 | Deskewed scan | `dlio/odom_node/pointcloud/deskewed` | in `odom` frame; raw `intensity` and `reflectivity` remain separate; correction is in `intensity_corrected` |
@@ -150,6 +153,12 @@ A *stripped* cloud (xyz-only, unorganized, no time field) reduces DLIO to plain 
 | Save map | `/save_pcd` service | absolute existing directory required |
 
 Wiring into a fusion/navigation stack: feed `dlio/odom_node/odom` to `robot_localization` (or use it directly as the `odom`→`base_link` source for Nav2, in which case let DLIO own that TF and do **not** also fuse a second publisher of the same transform). The LiDAR subscription uses best-effort `SensorDataQoS`; drivers publishing reliable still match.
+
+An optional 3D tilt comparison is available via `dlio_ekf.launch.py`: it combines
+DLIO motion increments/heading with a body-frame auxiliary world-up direction
+and publishes `odometry/tilt_filtered` without TF. It declares its assumed noise
+and does not alter the frontend or historical map. See
+[fusion inputs, limits and launch arguments](doc/FUSION_ARCHITECTURE.md).
 
 ## Notes & findings
 

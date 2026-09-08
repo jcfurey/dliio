@@ -52,6 +52,7 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>launch_xml</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
   <exec_depend>ros2bag</exec_depend>
   <exec_depend>rosbag2_py</exec_depend>
   <exec_depend>rosbag2_interfaces</exec_depend>

@@ -223,6 +223,7 @@ unit and independent C++ consumer checks.
 
 The [persistent mapping guide](MAPPING_NODE.md), [wire contract](MAPPING_INTERFACE.md),
 [pose revisions](POSE_REVISIONS.md) and [graph API](POSE_GRAPH.md) document the
-backend. Validated loop injection exists; automatic place retrieval and loop
-registration remain external. The [Ouster handoff](HANDOFF.md) adds optional
+backend. [Automatic geometric loop closure](AUTOMATIC_LOOPS.md) is available
+through `loop_closure_config` with explicit noise and validation assumptions.
+The [Ouster handoff](HANDOFF.md) adds optional
 packet decoding and dataset profiles on top of this generic integration.

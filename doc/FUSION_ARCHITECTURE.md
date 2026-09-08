@@ -1,4 +1,79 @@
-# Fusion architecture — dliio + robot_localization EKF (2026-07-09)
+# Fusion architecture — dliio + robot_localization EKF
+
+## September 8: downstream 3D tilt experiment
+
+`launch/dlio_ekf.launch.py` adds an optional filter beside an existing DLIO
+session. It uses `cfg/robot_localization_tilt.yaml`, requires the declared
+`robot_localization` runtime dependency, and does not require wheel odometry
+or an Exyn package. The older `dlio_rl.launch.py` below is a separate
+wheel/track example and is not the configuration for the September tunnel bag.
+
+```bash
+ros2 launch direct_lidar_inertial_odometry dlio_ekf.launch.py \
+  use_sim_time:=true body_frame:=base_link \
+  odom_topic:=dlio/odom_node/odom gravity_topic:=dliio/auxiliary_gravity
+```
+
+Use the actual body frame (`vehicle` for the Exyn replay). The gravity input is
+`geometry_msgs/Vector3Stamped`: **world +Z expressed in that body frame**, with
+its acquisition stamp. Supply a reviewed sensor mounting transform upstream;
+the adapter rejects a different frame instead of guessing an extrinsic. It
+converts this direction to `sensor_msgs/Imu` roll/pitch with arbitrary zero yaw.
+Only roll/pitch are enabled in the EKF. Gyro and acceleration blocks are marked
+unavailable, and are not fused. Near-vertical pitch is rejected because this
+experiment uses the Euler-angle robot_localization state.
+
+The filter integrates differential DLIO XYZ and retains absolute DLIO yaw.
+All three translation axes remain measured; `two_d_mode` stays false and no
+zero-height or zero-vertical-velocity constraint is introduced. DLIO roll/pitch,
+observer twist and accelerations are excluded. Gravity tilt stays absolute
+(`imu0_differential: false`, `imu0_relative: false`). This can reduce the
+component of vertical drift caused by integrating motion with a wrong attitude;
+it cannot observe translation that the scan matcher has already lost.
+
+`dlio_ekf_inputs.py` preserves acquisition stamps and the input pose. It limits
+odometry to 5 Hz and tilt to 20 Hz, rejects duplicate/old stamps and invalid
+poses, and requires a restart on bag rewind. The EKF enables 2 seconds of
+lagged-measurement history for the slower DLIO output. The installed RL 3.10.0
+node waits for nonzero `/clock` before creating its publishers: a replay must
+publish a held clock, wait for subscribers, then release measurements. The
+workspace experiment runner exercises this sequence.
+
+Output is `odometry/tilt_filtered`, configurable with `filtered_topic:=`.
+**This launch publishes no TF.** DLIO's existing `odom → body` and the graph's
+`map → odom` retain their existing meaning. The comparison output does not
+feed the DLIO observer, alter archived poses, deform the map or change camera
+draping. Replacing a TF without correcting the historical map would mix
+incompatible trajectories. If this experiment helps, frontend gravity/bias
+work and validated graph constraints are the routes to consistent geometry.
+
+Noise is explicit and still experimental. The default `covariance_policy:=assumed`
+uses diagonal pose sigmas of 0.3 m / 0.1 rad and a tilt sigma of 5 degrees; all
+are launch arguments (`assumed_position_sigma`, `assumed_angle_sigma`,
+`assumed_tilt_sigma`, with angular values in radians). They are sensitivity
+assumptions, not calibrated errors. `covariance_policy:=published` preserves
+all 36 pose-covariance entries and rejects nonfinite, nonsymmetric or
+non-positive-definite input. Passing that numerical check does not establish
+calibration. DLIO differential XYZ and absolute yaw still share information;
+the EKF does not model their cross-correlation between separate updates.
+The BNO also shares information with DLIO when frontend auxiliary-gravity
+aiding is enabled. Neither decimation nor a full output matrix removes these
+dependencies or makes the posterior an honest full uncertainty estimate.
+
+Validation includes an actual ROS EKF test with a known 10-degree attitude
+error and true 0.05 m/s vertical motion: the filtered trajectory must preserve
+the real slope, correct the attitude-induced component, retain finite positive
+covariance and publish no TF. Captured-run comparisons, limitations and timing
+receipts are documented by the integrating workspace; they are not portable
+ground-truth fixtures in this package.
+
+The parameter choices follow the primary
+[robot_localization configuration guide](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/doc/configuring_robot_localization.rst)
+and its [differential pose implementation](https://github.com/cra-ros-pkg/robot_localization/blob/rolling-devel/src/ros_filter.cpp).
+Tests run against the locally installed version, not an assumption that a
+moving upstream branch has identical behavior.
+
+## July 9 wheel/track fusion design
 
 Response to the operational tunnel-slosh problem (the corkscrew/figure-eight
 oscillation along the tunnel axis) and the 2026-07-08 X-ICP runaway. Based on
@@ -26,10 +101,11 @@ so swapping packages is not the fix.
   admission (mirroring the visual-rescue budget) makes X-ICP fail-BOUNDED,
   matching Tuna et al.'s controlled partial update.
 
-**Layer 2 — honest per-axis output** (already existed, now load-bearing):
+**Layer 2 — heuristic per-axis output**:
 - The governor's rank-1 covariance inflation (`covPosVar`/`covRotVar`) marks
   exactly the held axes untrusted in the published `/odom` covariance — this is
-  the signal a downstream fusion layer needs to de-weight the sloshing axis.
+  a heuristic signal a downstream fusion layer can use to de-weight that axis.
+  It is not a calibrated covariance of the full estimator state or its errors.
 - `odom/publishTf: false`: the EKF owns `odom -> base_link`; dliio contributes
   odometry *messages* only.
 
