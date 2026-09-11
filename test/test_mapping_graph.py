@@ -414,3 +414,62 @@ def test_explicit_failed_registration_rejects_graph_but_keeps_original_observati
         Store(path, store.limits).close()
     finally:
         store.close()
+
+
+def noise_update(candidate, scale):
+    return dict(id=candidate['id'], covariance=(np.asarray(candidate['covariance'])*scale**2).tolist(),
+                covariance_kind='assumed', covariance_model='explicit synthetic reweighting')
+
+
+def test_noise_reweighting_is_durable_and_preserves_measurement_history(store, tmp_path):
+    initialize(store)
+    candidate = loop()
+    assert store.update_graph(request(store, 'add_loop', loop=candidate))['status'] == 'accepted'
+    originals = database(store)['keyframes']
+    update = request(store, 'reweight_loops', updates=[noise_update(candidate, .5)], reason='synthetic sensitivity test')
+    result = store.update_graph(update)
+    assert result['status'] == 'accepted' and result['pose_revision'] == 3
+    assert store.update_graph(update) == result
+    retained, added, removed = store.db.execute('SELECT json,added_revision,removed_revision FROM graph_loops').fetchone()
+    retained = json.loads(retained)
+    for key in ('id', 'from_id', 'to_id', 'transform', 'provenance'):
+        assert retained[key] == candidate[key]
+    assert (added, removed) == (2, None) and database(store)['keyframes'] == originals
+    saved = tmp_path/'reweighted.dliomap'; store.save(saved)
+    loaded = Store(saved, store.limits)
+    assert loaded.stats()['graph_attached'] and loaded.stats()['active_loops'] == 1
+    loaded.close()
+    with sqlite3.connect(saved) as db:
+        db.execute("UPDATE graph_loops SET json=json_set(json,'$.covariance_model','forged')")
+    with pytest.raises(ValueError, match='request history'):
+        Store(saved, store.limits)
+
+
+def test_rejected_noise_update_leaves_graph_and_map_unchanged(store):
+    initialize(store)
+    candidate = loop()
+    assert store.update_graph(request(store, 'add_loop', loop=candidate))['status'] == 'accepted'
+    before = database(store)
+    result = store.update_graph(request(store, 'reweight_loops', updates=[noise_update(candidate, 1e5)],
+                                        reason='intentionally invalid weakening'))
+    assert result['status'] == 'rejected' and result['reason'] == 'postfit_absolute_loop_limit'
+    after = database(store)
+    before.pop('graph_requests'); after.pop('graph_requests')
+    assert after == before
+
+
+@pytest.mark.parametrize('bad', ['unknown', 'duplicate', 'geometry', 'indefinite', 'empty_reason'])
+def test_invalid_noise_update_cannot_change_measurements(store, bad):
+    initialize(store)
+    candidate = loop()
+    assert store.update_graph(request(store, 'add_loop', loop=candidate))['status'] == 'accepted'
+    update = noise_update(candidate, .5)
+    if bad == 'unknown': update['id'] = 'missing-loop'
+    if bad == 'geometry': update['transform'] = pose(2.).tolist()
+    if bad == 'indefinite': update['covariance'][0][0] = -1.
+    changes = [update, update] if bad == 'duplicate' else [update]
+    before = database(store)
+    with pytest.raises(ValueError):
+        store.update_graph(request(store, 'reweight_loops', updates=changes,
+                                    reason='' if bad == 'empty_reason' else 'synthetic malformed update'))
+    assert database(store) == before

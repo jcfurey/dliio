@@ -76,6 +76,7 @@ revision, a unique request ID, and an action. Diagnostics expose `session_id`,
 | `add_loop` | `loop` | Validate a new pair, trial optimize all active factors, commit on success |
 | `add_loops` | `loops` (1–64 candidates) | Sequential validation/trial solves; one atomic final revision, no accepted prefix on rejection |
 | `remove_loop` | `loop_id`, `reason` | Retain removal history, solve remaining factors, rebuild map |
+| `reweight_loops` | `updates`, `reason` | Re-solve 1–64 explicit active loop noise updates, retaining original measurements and the complete request history |
 | `optimize` | none | Include newly ingested observations or explicitly reattach after an external pose revision |
 
 Initialize once before applying external pose revisions. An external
@@ -84,6 +85,10 @@ it retains factor history. `add_loop`/`remove_loop` then fail until an explicit
 `optimize` reapplies the retained active factors. To undo a bad loop and keep
 the remaining graph, use `remove_loop` directly. Removing the final loop
 recovers original odometry and its reconstructed map.
+
+Explicit partial surface factors and audited noise amendments are described in
+[observable surface constraints](SURFACE_SUBSPACE.md). These retain the original
+odometry and observation records and keep their resulting graph attached.
 
 An identical request ID and payload is idempotent while its resulting pose
 revision remains current, including rejected trials. Reusing an ID with a

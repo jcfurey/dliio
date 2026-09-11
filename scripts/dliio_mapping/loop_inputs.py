@@ -44,13 +44,14 @@ def window_configuration(value):
     return dict(max_span_seconds=span, validation=asdict(Validation(**value['validation'])))
 
 
-def support_indices(value, count, from_id, to_id):
+def support_indices(value, count, from_id, to_id, *, allow_single_fitting=False):
     if not isinstance(value, dict) or set(value) != set(SUPPORT_KEYS):
         raise ValueError('Window loops need disjoint fitting and held observation IDs for both anchors')
     result = {}
     for key in SUPPORT_KEYS:
         ids = value[key]
-        if (not isinstance(ids, list) or not 2 <= len(ids) <= MAX_SUPPORT_OBSERVATIONS or
+        minimum = 1 if allow_single_fitting and not key.startswith('held_') else 2
+        if (not isinstance(ids, list) or not minimum <= len(ids) <= MAX_SUPPORT_OBSERVATIONS or
                 any(type(i) is not int or not 0 <= i < count for i in ids) or ids != sorted(set(ids))):
             raise ValueError('Loop support IDs must be ordered, unique, bounded and known')
         result[key] = list(ids)

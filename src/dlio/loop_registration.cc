@@ -66,10 +66,13 @@ class PreparedCloud {
   template <class Box> bool kdtree_get_bbox(Box&) const { return false; }
 
   Eigen::Matrix4d fit(const PreparedCloud& target, const Eigen::Matrix4d& initial,
-                      int iterations, bool fine, int maxQueries) const {
+                      int iterations, bool fine, int maxQueries, double observableRatio) const {
     checkPose(initial);
     if (iterations < 1 || iterations > 100 || maxQueries < 100 || maxQueries > 6000)
       throw std::invalid_argument("Registration iterations/queries outside bounded limits");
+    if (!std::isfinite(observableRatio) || (observableRatio != 0. &&
+        (observableRatio < .001 || observableRatio > .1)))
+      throw std::invalid_argument("Observable registration ratio must be zero or in [.001, .1]");
     Eigen::Matrix4d result = initial;
     const auto sourceIds = queryIds(points_.rows(), maxQueries);
     const auto targetIds = queryIds(target.points_.rows(), maxQueries);
@@ -112,6 +115,12 @@ class PreparedCloud {
       Eigen::Vector3d center = Eigen::Vector3d::Zero();
       for (const auto& term : terms) center += term.a+term.b;
       center /= 2.*terms.size();
+      double length = 1.;
+      if (observableRatio > 0.) {
+        double squaredRange = 0.;
+        for (const auto& term : terms) squaredRange += (term.a-center).squaredNorm();
+        length = std::max(.15, std::sqrt(squaredRange/terms.size()));
+      }
       Matrix6 information = Matrix6::Zero();
       Vector6 gradient = Vector6::Zero();
       for (size_t i = 0; i < terms.size(); ++i) {
@@ -123,7 +132,7 @@ class PreparedCloud {
         jacobian.head<3>() = term.n;
         // Reverse residual differentiates the moving normal as well as the
         // point. Its rotational lever arm is therefore the fixed target.
-        jacobian.tail<3>() = ((i < forwardCount ? term.a : term.b)-center).cross(term.n);
+        jacobian.tail<3>() = ((i < forwardCount ? term.a : term.b)-center).cross(term.n)/length;
         information.noalias() += weight*jacobian*jacobian.transpose();
         gradient.noalias() -= (weight*residual)*jacobian;
       }
@@ -132,12 +141,13 @@ class PreparedCloud {
       const auto values = solve.eigenvalues();
       // Python reference uses singular-value rcond=1e-5. Eigenvalues of J'WJ
       // are squared singular values, so apply the squared relative cutoff.
-      const double cutoff = std::max(0., values[5])*1.e-10;
+      const double cutoff = std::max(0., values[5])*(observableRatio > 0. ? observableRatio : 1.e-10);
       Vector6 delta = Vector6::Zero();
       for (int i = 0; i < 6; ++i)
         if (values[i] > cutoff)
           delta.noalias() += solve.eigenvectors().col(i)*
             (solve.eigenvectors().col(i).dot(gradient)/values[i]);
+      delta.tail<3>() /= length;
       if (!delta.allFinite()) throw std::invalid_argument("Nonfinite registration step");
       delta *= std::min({1., .5/std::max(delta.head<3>().norm(), 1.e-12),
                         (5.*pi/180.)/std::max(delta.tail<3>().norm(), 1.e-12)});
@@ -193,6 +203,7 @@ void bindLoopRegistration(py::module_& module) {
     }), py::arg("points"))
     .def("fit", &PreparedCloud::fit, py::arg("target"), py::arg("initial"),
          py::arg("iterations") = 70, py::arg("fine") = false, py::arg("max_queries") = 6000,
+         py::arg("observable_ratio") = 0.,
          py::call_guard<py::gil_scoped_release>())
     .def("score", &PreparedCloud::score, py::arg("target"), py::arg("pose"),
          py::call_guard<py::gil_scoped_release>());

@@ -52,13 +52,26 @@ Matrix6 nativeCovariance(const Matrix6& value) {
   return result;
 }
 
+Matrix6 nativeProjection(const Matrix6& value, bool loop) {
+  if (!value.allFinite() || value.cwiseAbs().maxCoeff() > 1e4 || value.norm() < 1e-12 ||
+      (!loop && !value.isApprox(Matrix6::Identity(), 1e-12))) {
+    throw std::invalid_argument("Invalid graph residual projection; odometry must remain full rank");
+  }
+  const int order[] = {3, 4, 5, 0, 1, 2};
+  Matrix6 result;
+  for (int r = 0; r < 6; ++r)
+    for (int c = 0; c < 6; ++c) result(r, c) = value(order[r], order[c]);
+  return result;
+}
+
 // Explicit Logmap and its derivative keep residuals independent of GTSAM's
 // optional Pose3 chart and its fast BetweenFactor Jacobian approximation.
 class LogBetweenFactor final : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3> {
  public:
   LogBetweenFactor(gtsam::Key from, gtsam::Key to, const gtsam::Pose3& measured,
-                   const gtsam::SharedNoiseModel& noise)
-      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(noise, from, to), measured_(measured) {}
+                   const gtsam::SharedNoiseModel& noise, const Matrix6& projection)
+      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(noise, from, to),
+        measured_(measured), projection_(projection) {}
 
   gtsam::Vector evaluateError(const gtsam::Pose3& from, const gtsam::Pose3& to,
 #if GTSAM_VERSION_NUMERIC >= 40300
@@ -70,13 +83,14 @@ class LogBetweenFactor final : public gtsam::NoiseModelFactor2<gtsam::Pose3, gts
     Matrix6 between1, between2, logarithm;
     const auto relative = from.between(to, between1, between2);
     const auto error = gtsam::Pose3::Logmap(measured_.inverse() * relative, logarithm);
-    if (h1) *h1 = logarithm * between1;
-    if (h2) *h2 = logarithm * between2;
-    return error;
+    if (h1) *h1 = projection_ * logarithm * between1;
+    if (h2) *h2 = projection_ * logarithm * between2;
+    return projection_ * error;
   }
 
  private:
   gtsam::Pose3 measured_;
+  Matrix6 projection_;
 };
 
 Vector6 residual(const Eigen::Matrix4d& measured, const Eigen::Matrix4d& from,
@@ -93,11 +107,13 @@ py::dict optimize(const std::vector<Eigen::Matrix4d>& poses,
                   const std::vector<std::size_t>& to,
                   const std::vector<Eigen::Matrix4d>& measurements,
                   const std::vector<Matrix6>& covariances,
-                  const std::vector<bool>& loops, unsigned int maxIterations) {
+                  const std::vector<bool>& loops, unsigned int maxIterations,
+                  const std::vector<Matrix6>& projections) {
   const auto count = from.size();
   if (poses.size() < 2 || poses.size() > kMaxNodes || count > kMaxEdges ||
       count != to.size() || count != measurements.size() || count != covariances.size() ||
-      count != loops.size() || maxIterations < 1 || maxIterations > 200) {
+      count != loops.size() || (!projections.empty() && count != projections.size()) ||
+      maxIterations < 1 || maxIterations > 200) {
     throw std::invalid_argument("Invalid or oversized pose graph");
   }
   std::vector<Eigen::Matrix4d> corrected;
@@ -113,6 +129,7 @@ py::dict optimize(const std::vector<Eigen::Matrix4d>& poses,
     graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
         0, checkedPose(poses[0]), gtsam::noiseModel::Isotropic::Sigma(6, 1e-6));
     std::vector<Matrix6> nativeCovariances;
+    std::vector<Matrix6> nativeProjections;
     std::vector<bool> connected(poses.size() - 1, false);
     for (std::size_t i = 0; i < count; ++i) {
       if (from[i] >= poses.size() || to[i] >= poses.size() || from[i] >= to[i])
@@ -123,10 +140,13 @@ py::dict optimize(const std::vector<Eigen::Matrix4d>& poses,
         connected[from[i]] = true;
       }
       nativeCovariances.push_back(nativeCovariance(covariances[i]));
+      nativeProjections.push_back(nativeProjection(
+          projections.empty() ? Matrix6::Identity() : projections[i], loops[i]));
       gtsam::SharedNoiseModel noise = gtsam::noiseModel::Gaussian::Covariance(nativeCovariances.back());
       if (loops[i]) noise = gtsam::noiseModel::Robust::Create(
           gtsam::noiseModel::mEstimator::Huber::Create(2.5), noise);
-      graph.emplace_shared<LogBetweenFactor>(from[i], to[i], checkedPose(measurements[i]), noise);
+      graph.emplace_shared<LogBetweenFactor>(from[i], to[i], checkedPose(measurements[i]), noise,
+                                             nativeProjections.back());
     }
     for (bool present : connected)
       if (!present) throw std::invalid_argument("Graph odometry chain is disconnected");
@@ -145,7 +165,7 @@ py::dict optimize(const std::vector<Eigen::Matrix4d>& poses,
     for (std::size_t i = 0; i < poses.size(); ++i)
       corrected.push_back((gauge * result.at<gtsam::Pose3>(i)).matrix());
     for (std::size_t i = 0; i < count; ++i) {
-      const Vector6 error = gtsam::Pose3::Logmap(checkedPose(measurements[i]).inverse() *
+      const Vector6 error = nativeProjections[i] * gtsam::Pose3::Logmap(checkedPose(measurements[i]).inverse() *
           checkedPose(corrected[from[i]]).between(checkedPose(corrected[to[i]])));
       // Unrobustified residual: downweighting must never hide a failed loop.
       squaredErrors.push_back(error.dot(nativeCovariances[i].llt().solve(error)));
@@ -169,7 +189,9 @@ PYBIND11_MODULE(_dliio_pose_graph, module) {
   bindMapGeometry(module);
   module.doc() = "Bounded GTSAM batch optimizer; all inputs use right/local translation-first covariance";
   module.def("optimize", &optimize, py::arg("poses"), py::arg("from_ids"), py::arg("to_ids"),
-      py::arg("measurements"), py::arg("covariances"), py::arg("loops"), py::arg("max_iterations") = 100);
+      py::arg("measurements"), py::arg("covariances"), py::arg("loops"), py::arg("max_iterations") = 100,
+      py::arg("projections") = std::vector<Matrix6>{});
   module.def("residual", &residual);
   module.attr("gtsam_version") = GTSAM_VERSION_STRING;
+  module.attr("supports_projected_loops") = true;
 }

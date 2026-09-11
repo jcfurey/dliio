@@ -110,13 +110,15 @@ def _backend(value):
     return value
 
 
-def fit(source, target, initial, *, iterations=70, fine=False, max_queries=6000, backend='native'):
+def fit(source, target, initial, *, iterations=70, fine=False, max_queries=6000, backend='native', observable_ratio=0.):
     """Native bounded fit, or the retained NumPy/SciPy reference for comparison."""
     if _backend(backend) == 'python':
+        if observable_ratio != 0.:
+            raise ValueError('Observable-mode registration requires the native backend')
         return _fit_python(source, target, initial, iterations=iterations, fine=fine, max_queries=max_queries)
     from _dliio_pose_graph import PreparedLoopCloud
     return PreparedLoopCloud(source).fit(PreparedLoopCloud(target), rigid_pose(initial),
-                                         iterations, fine, max_queries)
+                                         iterations, fine, max_queries, observable_ratio)
 
 
 def rotation_angle(matrix):

@@ -224,6 +224,8 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_mapping_uncertainty test/test_mapping_uncertainty.py TIMEOUT 60)
   ament_add_pytest_test(test_mapping_graph test/test_mapping_graph.py TIMEOUT 120
     APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
+  ament_add_pytest_test(test_surface_subspace test/test_surface_subspace.py TIMEOUT 120
+    APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)
   ament_add_pytest_test(test_loop_validation test/test_loop_validation.py TIMEOUT 60)
   ament_add_pytest_test(test_loop_inputs test/test_loop_inputs.py TIMEOUT 120
     APPEND_ENV PYTHONPATH=$<TARGET_FILE_DIR:_dliio_pose_graph>)

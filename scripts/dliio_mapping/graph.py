@@ -64,7 +64,7 @@ def loop_measurement(value, count):
     from .core import rigid_pose
     required = {'id', 'from_id', 'to_id', 'transform', 'covariance', 'covariance_kind',
                 'covariance_model', 'provenance'}
-    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {'support'}:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {'support', 'surface_subspace'}:
         raise ValueError('Loop measurement fields are incomplete or unknown')
     value = dict(value)
     _text(value['id'], 128, 'Loop ID')
@@ -79,7 +79,19 @@ def loop_measurement(value, count):
     _text(value['provenance'], 1024, 'External loop verification provenance')
     if 'support' in value:
         from .loop_inputs import support_indices
-        value['support'] = support_indices(value['support'], count, a, b)
+        value['support'] = support_indices(value['support'], count, a, b,
+                                           allow_single_fitting='surface_subspace' in value)
+    if 'surface_subspace' in value:
+        from .surface_subspace import subspace
+        if 'support' not in value or value['covariance_kind'] != 'assumed':
+            raise ValueError('Projected surface loops require disjoint window support and explicitly assumed noise')
+        value['surface_subspace'] = subspace(value['surface_subspace'])
+        length = value['surface_subspace']['characteristic_length']
+        scale = np.diag([1., 1., 1., length, length, length])
+        scaled_covariance = scale @ np.asarray(value['covariance']) @ scale
+        variance = scaled_covariance.trace()/6
+        if not np.allclose(scaled_covariance, np.eye(6)*variance, atol=1e-12, rtol=1e-8):
+            raise ValueError('Projected loop noise must be isotropic in the declared length-scaled tangent')
     return value
 
 
@@ -88,7 +100,7 @@ def _request(value):
         raise ValueError('Graph request must be a JSON object')
     required = {'session_id', 'expected_revision', 'request_id', 'action'}
     action_fields = dict(initialize={'configuration'}, add_loop={'loop'}, add_loops={'loops'},
-                         remove_loop={'loop_id', 'reason'}, optimize=set())
+                         remove_loop={'loop_id', 'reason'}, reweight_loops={'updates', 'reason'}, optimize=set())
     action = value.get('action')
     if not isinstance(action, str) or action not in action_fields or set(value) != required | action_fields[action]:
         raise ValueError('Unknown graph action or unexpected/missing request fields')
@@ -98,10 +110,28 @@ def _request(value):
         raise ValueError('Invalid expected graph/map revision')
     if action == 'add_loops' and (not isinstance(value['loops'], list) or not 1 <= len(value['loops']) <= 64):
         raise ValueError('A loop batch must contain 1..64 candidates')
+    if action == 'reweight_loops':
+        _text(value['reason'], 1024, 'Loop reweighting reason')
+        if not isinstance(value['updates'], list) or not 1 <= len(value['updates']) <= 64:
+            raise ValueError('Reweight 1..64 explicit active loop IDs')
     serialized = encoded(value)
     if len(serialized.encode('utf8')) > MAX_REQUEST_BYTES:
         raise ValueError('Graph request exceeds 1 MiB')
     return hashlib.sha256(serialized.encode('utf8')).hexdigest()
+
+
+def reweighted(loops, updates, count):
+    """Change only noise; immutable measurements and support stay byte-equivalent."""
+    values = {loop['id']: loop for loop in loops}
+    seen = set()
+    for update in updates:
+        if (not isinstance(update, dict) or set(update) != {'id', 'covariance', 'covariance_kind', 'covariance_model'}
+                or not isinstance(update['id'], str) or update['id'] in seen or update['id'] not in values):
+            raise ValueError('Noise updates require unique active loop IDs and only covariance fields')
+        identifier = update['id']
+        values[identifier] = loop_measurement(dict(values[identifier], **update), count)
+        seen.add(identifier)
+    return [values[loop['id']] for loop in loops]
 
 
 class GraphStore:
@@ -192,6 +222,10 @@ class GraphStore:
                 if entry is None or entry[2] is not None:
                     raise ValueError('Loop removal history has no active factor')
                 entry[2] = last_solution
+            elif action == 'reweight_loops':
+                active = [entry[0] for entry in expected_loops.values() if entry[2] is None]
+                for loop in reweighted(active, request['updates'], self.meta['keyframes']):
+                    expected_loops[loop['id']][0] = loop
         if (state is None) != (expected_config is None):
             raise ValueError('Graph state has no matching initialization record')
         if state is not None:
@@ -266,8 +300,14 @@ class GraphStore:
             measurements.append(np.asarray(loop['transform']))
             matrices.append(np.asarray(loop['covariance']))
             flags.append(True)
+        projected = any('surface_subspace' in loop for loop in loops)
+        kwargs = {}
+        if projected:
+            from .surface_subspace import projection
+            kwargs['projections'] = [np.eye(6) for _ in range(len(originals)-1)] + [
+                projection(loop['surface_subspace']) if 'surface_subspace' in loop else np.eye(6) for loop in loops]
         try:
-            result = native.optimize(originals, from_ids, to_ids, measurements, matrices, flags)
+            result = native.optimize(originals, from_ids, to_ids, measurements, matrices, flags, **kwargs)
         except RuntimeError as error:
             raise RejectedLoop('optimizer_failure', dict(detail=str(error)[:1024])) from error
         metrics = {key: result[key] for key in ('initial_error', 'final_error', 'iterations', 'converged')}
@@ -303,6 +343,23 @@ class GraphStore:
                 raise RejectedLoop('postfit_motion_prior_bound', dict(metrics, from_id=i-1, to_id=i))
         for loop in loops:
             error = np.linalg.inv(loop['transform']) @ np.linalg.inv(poses[loop['from_id']]) @ poses[loop['to_id']]
+            if 'surface_subspace' in loop:
+                from .surface_subspace import projection
+                residual = projection(loop['surface_subspace']) @ native.residual(
+                    np.asarray(loop['transform']), poses[loop['from_id']], poses[loop['to_id']])
+                translation, rotation = np.linalg.norm(residual[:3]), np.linalg.norm(residual[3:])
+                surface_settings = Validation(**config['loop_windows']['validation'])
+                if (translation > min(settings.max_loop_translation, surface_settings.max_surface_translation_step) or
+                        rotation > min(settings.max_loop_rotation, surface_settings.max_surface_rotation_step)):
+                    raise RejectedLoop('postfit_projected_loop_limit', dict(metrics, failed_loop=loop['id']))
+                # Tangential sliding can reduce full 3D overlap without changing
+                # measured modes. Report it; a projected factor cannot certify
+                # agreement in its nullspace. Dense map evaluation is separate.
+                raw_translation, raw_rotation = displacement(error)
+                metrics.setdefault('projected_loop_residuals', {})[loop['id']] = dict(
+                    translation=float(translation), rotation=float(rotation),
+                    unprojected_translation=raw_translation, unprojected_rotation=raw_rotation)
+                continue
             translation, rotation = displacement(error)
             if translation > settings.max_loop_translation or rotation > settings.max_loop_rotation:
                 raise RejectedLoop('postfit_absolute_loop_limit', dict(metrics,
@@ -332,7 +389,11 @@ class GraphStore:
                 raise ValueError('Window loops require an explicit loop_windows validation configuration')
             window_settings = Validation(**config['loop_windows']['validation'])
             metrics = check_cycle(candidate['transform'], np.linalg.inv(current[a]) @ current[b], window_settings)
-            metrics.update(validate_support(self, candidate, config['loop_windows']))
+            if 'surface_subspace' in candidate:
+                from .surface_subspace import validate_support as validate_projected_support
+                metrics.update(validate_projected_support(self, candidate, config['loop_windows']))
+            else:
+                metrics.update(validate_support(self, candidate, config['loop_windows']))
         else:
             metrics = check_cycle(candidate['transform'], np.linalg.inv(current[a]) @ current[b], settings)
             metrics.update(validate_geometry(self._graph_cloud(a), self._graph_cloud(b), candidate['transform'], settings))
@@ -393,6 +454,8 @@ class GraphStore:
             if not any(value['id'] == request['loop_id'] for value in loops):
                 raise ValueError('Cannot remove an unknown or inactive loop')
             loops = [value for value in loops if value['id'] != request['loop_id']]
+        if action == 'reweight_loops':
+            loops = reweighted(loops, request['updates'], len(originals))
         report = dict(action=action, request_id=request['request_id'], pose_revision=self.meta['pose_revision'])
         try:
             if candidates:
@@ -434,6 +497,11 @@ class GraphStore:
                     (candidate['id'], candidate['from_id'], candidate['to_id'], encoded(candidate), revision))
             if action == 'remove_loop':
                 self.db.execute('UPDATE graph_loops SET removed_revision=? WHERE id=?', (revision, request['loop_id']))
+            if action == 'reweight_loops':
+                changed_ids = {update['id'] for update in request['updates']}
+                for loop in loops:
+                    if loop['id'] in changed_ids:
+                        self.db.execute('UPDATE graph_loops SET json=? WHERE id=?', (encoded(loop), loop['id']))
             self._record_graph_request(request, digest, report)
 
         self.apply_revision(self.meta['session_id'], request['expected_revision'], list(enumerate(poses)),
